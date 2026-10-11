@@ -6,10 +6,67 @@ import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ComfyRuntime, normalizeUrl } from '../lib/runtime.js';
+import { WorkflowSync } from '../lib/sync.js';
 
 test('validates server URLs', () => {
   assert.equal(normalizeUrl('http://127.0.0.1:8188/'), 'http://127.0.0.1:8188');
   for (const url of ['file:///C:/x', 'http://u:p@localhost/', 'http://localhost/a', 'http://localhost/?x=1']) assert.throws(() => normalizeUrl(url));
+});
+
+test('browser tab resume synchronizes into the existing workflow without duplicate tabs or repeated loads', async () => {
+  const code = (await readFile(new URL('../bridge.js', import.meta.url), 'utf8')).replace('__DSH_BRIDGE_TOKEN__', '"test-token"');
+  const sync = new WorkflowSync();
+  const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(r => setImmediate(r)); };
+  function page(clientId) {
+    const scheduled = []; const commands = []; const replies = []; const calls = [];
+    const active = { path: clientId + '.json' }; const tabs = [active];
+    const tracker = { isLoadingGraph: false };
+    let graph = { nodes: [{ id: 6, widgets_values: ['original'] }], links: [] };
+    const app = { extensionManager: { workflow: { activeWorkflow: active } }, canvas: { ds: { scale: 0.8, offset: [20, 30] } },
+      graph: { serialize: () => structuredClone(graph), setDirtyCanvas() {} },
+      async loadGraphData(data, clean, restoreView, workflow) {
+        calls.push({ clean, restoreView, workflow });
+        if (!workflow) { const created = {}; tabs.push(created); app.extensionManager.workflow.activeWorkflow = created; }
+        graph = structuredClone(data);
+        app.canvas.ds.scale = 1; app.canvas.ds.offset = [0, 0];
+        return true;
+      } };
+    const parent = { postMessage() {} };
+    const window = { parent, comfyAPI: { app: { app }, changeTracker: { ChangeTracker: tracker } }, addEventListener() {} };
+    const context = vm.createContext({ window, location: { search: '?dsh_client=' + clientId + '&dsh_session=s' },
+      document: { referrer: 'http://127.0.0.1:3080/' }, URL, URLSearchParams,
+      localStorage: { setItem() {} }, setTimeout: fn => scheduled.push(fn), fetch: async (path, options) => {
+        const data = JSON.parse(options.body);
+        if (path.endsWith('/result')) replies.push(data);
+        const reply = path.endsWith('/sync') ? sync.exchange(data) : path.endsWith('/poll') ? { commands: commands.splice(0) } : { ok: true };
+        return { ok: true, json: async () => reply };
+      } });
+    return { app, tracker, tabs, active, calls, replies, start() { vm.runInContext(code, context); },
+      edit(value) { graph.nodes[0].widgets_values[0] = value; }, value() { return graph.nodes[0].widgets_values[0]; },
+      async tick() { scheduled.shift()(); await flush(); },
+      async command(action, args = {}) { commands.push({ id: String(replies.length), action, args }); await this.tick(); return replies.at(-1); } };
+  }
+  const original = page('original'); const embedded = page('embedded');
+  original.start(); await flush(); embedded.start(); await flush();
+  assert.equal(embedded.calls.length, 0, 'identical initial sync must not reload a graph');
+  original.edit('edited while other tab was inactive'); await original.tick();
+  await embedded.tick();
+  assert.equal(embedded.value(), original.value()); assert.equal(embedded.tabs.length, 1);
+  assert.equal(embedded.calls[0].workflow, embedded.active);
+  assert.equal(embedded.calls[0].clean, false); assert.equal(embedded.calls[0].restoreView, false);
+  assert.deepEqual(embedded.app.canvas.ds, { scale: 0.8, offset: [20, 30] });
+  for (let i = 0; i < 5; i++) { await original.tick(); await embedded.tick(); }
+  assert.equal(embedded.calls.length, 1, 'tab resume with unchanged content must not repeat graph loading');
+  const next = { nodes: [{ id: 6, widgets_values: ['AI loaded graph'] }], links: [] };
+  assert.equal((await embedded.command('load_workflow', { workflow: next })).result.loaded, true);
+  assert.equal(embedded.tabs.length, 1); assert.equal(embedded.calls.at(-1).workflow, embedded.active);
+  embedded.app.extensionManager.workflow.activeWorkflow = { path: 'other.json' };
+  assert.match((await embedded.command('undo')).error, /工作流已切换/);
+  embedded.app.extensionManager.workflow.activeWorkflow = embedded.active;
+  assert.equal((await embedded.command('undo')).result.restored, true);
+  assert.equal(embedded.tabs.length, 1); assert.equal(embedded.calls.at(-1).workflow, embedded.active);
+  original.tracker.isLoadingGraph = true; original.edit('incomplete loading state'); await original.tick();
+  await embedded.tick(); assert.notEqual(embedded.value(), 'incomplete loading state');
 });
 
 test('proxy injects bridge, forwards HTTP, rejects cross-origin writes, and isolates sessions', async t => {

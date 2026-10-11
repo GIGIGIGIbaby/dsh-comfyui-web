@@ -16,6 +16,12 @@
   const undo = []; const completed = new Map();
   const appOf = () => window.comfyAPI?.app?.app;
   const apiOf = () => window.comfyAPI?.api?.api;
+  const activeWorkflowOf = app => app.extensionManager?.workflow?.activeWorkflow;
+  function graphReady(app) {
+    return !!(app?.graph && app.canvas && !app.configuringGraph &&
+      !window.comfyAPI?.changeTracker?.ChangeTracker?.isLoadingGraph &&
+      (!app.extensionManager?.workflow || activeWorkflowOf(app)));
+  }
   const notify = data => { if (embedded) window.parent.postMessage({ source: 'dsh-comfyui', clientId, ...data }, parentOrigin); };
   window.addEventListener('message', event => {
     if (!embedded || event.source !== window.parent || event.origin !== parentOrigin || event.data?.source !== 'dsh-comfyui-parent' || event.data.clientId !== clientId) return;
@@ -37,6 +43,20 @@
     if (clean.extra) delete clean.extra.ds;
     return JSON.stringify(clean);
   }
+  async function replaceCurrentWorkflow(app, workflow) {
+    if (!graphReady(app)) throw new Error('ComfyUI 当前工作流正在载入，请稍后再试');
+    const active = activeWorkflowOf(app);
+    const ds = app.canvas.ds;
+    const view = ds ? { scale: ds.scale, offset: Array.from(ds.offset) } : null;
+    try {
+      const loaded = await app.loadGraphData(clone(workflow), false, false, active ?? null,
+        { checkForRerouteMigration: false, silentAssetErrors: true });
+      if (loaded === false) throw new Error('ComfyUI 未能载入工作流');
+    } finally {
+      if (view && app.canvas.ds) { app.canvas.ds.scale = view.scale; app.canvas.ds.offset[0] = view.offset[0]; app.canvas.ds.offset[1] = view.offset[1]; }
+      app.graph.setDirtyCanvas(true, true);
+    }
+  }
   async function syncWorkflow(app) {
     const workflow = snapshot(app); const current = fingerprint(workflow);
     const changed = initialized && current !== lastFingerprint;
@@ -46,16 +66,12 @@
         try { localStorage.setItem('dsh.comfyui.sync-conflict.' + clientId, JSON.stringify(workflow)); } catch {}
         notify({ warning: '另一页也修改了工作流，已同步最新图；本页冲突副本保存在浏览器中。' });
       }
-      const ds = app.canvas.ds;
-      const view = ds ? { scale: ds.scale, offset: Array.from(ds.offset) } : null;
-      await app.loadGraphData(clone(update.workflow));
-      if (view && app.canvas.ds) { app.canvas.ds.scale = view.scale; app.canvas.ds.offset[0] = view.offset[0]; app.canvas.ds.offset[1] = view.offset[1]; }
-      app.graph.setDirtyCanvas(true, true);
+      if (fingerprint(update.workflow) !== current) await replaceCurrentWorkflow(app, update.workflow);
       lastFingerprint = fingerprint(snapshot(app));
     } else lastFingerprint = current;
     revision = update.revision; initialized = true;
   }
-  function remember(app) { undo.push(snapshot(app)); if (undo.length > 20) undo.shift(); }
+  function remember(app) { undo.push({ workflow: snapshot(app), owner: activeWorkflowOf(app) }); if (undo.length > 20) undo.shift(); }
   function nodes(app) {
     return (app.graph._nodes || []).map(n => ({ id: String(n.id), type: n.type, title: n.title, mode: n.mode,
       widgets: (n.widgets || []).filter(w => w.type !== 'button').map(w => ({ name: w.name, type: w.type, value: w.value ?? null,
@@ -67,7 +83,7 @@
   async function execute(command) {
     const app = appOf(); const args = command.args || {};
     if (!allowAI) throw new Error('此面板已关闭 AI 操作');
-    if (!app?.graph || !app.canvas) throw new Error('ComfyUI 工作流尚未就绪');
+    if (!graphReady(app)) throw new Error('ComfyUI 工作流尚未就绪');
     switch (command.action) {
       case 'list_nodes': return { nodes: nodes(app).filter(n => !args.filter || (n.type + ' ' + n.title).toLowerCase().includes(args.filter.toLowerCase())) };
       case 'get_workflow': return { workflow: snapshot(app), prompt: (await app.graphToPrompt()).output };
@@ -95,12 +111,14 @@
       case 'load_workflow': {
         if (!args.workflow || !Array.isArray(args.workflow.nodes) || !Array.isArray(args.workflow.links)) throw new Error('请提供普通 ComfyUI 工作流 JSON（包含 nodes、links），不是 API prompt');
         remember(app);
-        await app.loadGraphData(clone(args.workflow));
+        await replaceCurrentWorkflow(app, args.workflow);
         return { loaded: true, nodes: nodes(app) };
       }
       case 'undo': {
         if (!undo.length) throw new Error('没有可撤销的 AI 修改');
-        const previous = undo.at(-1); await app.loadGraphData(previous); undo.pop();
+        const previous = undo.at(-1);
+        if (previous.owner !== activeWorkflowOf(app)) throw new Error('当前工作流已切换，请返回原工作流再撤销');
+        await replaceCurrentWorkflow(app, previous.workflow); undo.pop();
         return { restored: true, nodes: nodes(app) };
       }
       case 'run': {
@@ -116,7 +134,7 @@
   async function poll() {
     if (busy) return; busy = true;
     try {
-      const ready = !!(appOf()?.graph && appOf()?.canvas);
+      const ready = graphReady(appOf());
       if (ready) await syncWorkflow(appOf());
       const response = await send('poll', { ready, allowAI, visible });
       notify({ ready, allowAI });
