@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ComfyRuntime } from '../lib/runtime.js';
+import { ComfyRuntime, BRIDGE_PROTOCOL } from '../lib/runtime.js';
 import { WorkflowSync } from '../lib/sync.js';
 import { connectMcp } from '../lib/mcp.js';
 import { apply } from '../lib/host.js';
@@ -54,7 +54,7 @@ test('dsh MCP adapter obtains runtime agent.session.id and cannot capture anothe
   const { endpoint, token } = JSON.parse(await readFile(join(dir, 'comfyui', 'connection.json'), 'utf8'));
   const base = new URL(endpoint).origin;
   async function bridge(path, extra = {}) {
-    const response = await fetch(base + '/__dsh_comfyui/' + path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Dsh-Comfy-Token': token }, body: JSON.stringify({ clientId: 'panel', sessionId: 'owned', ready: true, allowAI: true, visible: true, ...extra }) });
+    const response = await fetch(base + '/__dsh_comfyui/' + path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Dsh-Comfy-Token': token }, body: JSON.stringify({ clientId: 'panel', sessionId: 'owned', bridgeProtocol: BRIDGE_PROTOCOL, ready: true, allowAI: true, visible: true, ...extra }) });
     return response.json();
   }
   await bridge('poll');
@@ -88,7 +88,7 @@ test('MCP defaults on, disabling persists and blocks tools while preserving manu
     assert.equal(result.isError, true); assert.match(result.content[0].text, /MCP 已关闭/);
   }
   const sync = await fetch(runtime.frameOrigin + '/__dsh_comfyui/sync', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Dsh-Comfy-Token': runtime.token },
-    body: JSON.stringify({ clientId: 'manual', sessionId: 'comfyui-external', revision: 0, workflow: { nodes: [], links: [] }, fingerprint: 'empty' }) });
+    body: JSON.stringify({ clientId: 'manual', sessionId: 'comfyui-external', bridgeProtocol: BRIDGE_PROTOCOL, revision: 0, workflow: { nodes: [], links: [] }, fingerprint: 'empty' }) });
   assert.equal(sync.status, 200); assert.equal((await sync.json()).revision, 1);
   assert.equal(JSON.parse(await readFile(configFile, 'utf8')).mcpEnabled, false);
   const restarted = await new ComfyRuntime(configFile, { port: 0 }).start();

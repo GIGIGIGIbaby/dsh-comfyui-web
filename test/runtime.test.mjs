@@ -5,7 +5,7 @@ import http from 'node:http';
 import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ComfyRuntime, normalizeUrl } from '../lib/runtime.js';
+import { ComfyRuntime, normalizeUrl, BRIDGE_PROTOCOL } from '../lib/runtime.js';
 import { WorkflowSync } from '../lib/sync.js';
 
 test('validates server URLs', () => {
@@ -17,36 +17,41 @@ test('browser tab resume synchronizes into the existing workflow without duplica
   const code = (await readFile(new URL('../bridge.js', import.meta.url), 'utf8')).replace('__DSH_BRIDGE_TOKEN__', '"test-token"');
   const sync = new WorkflowSync();
   const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(r => setImmediate(r)); };
-  function page(clientId) {
+  function page(clientId, external = false) {
     const scheduled = []; const commands = []; const replies = []; const calls = [];
+    let syncGate;
     const active = { path: clientId + '.json' }; const tabs = [active];
     const tracker = { isLoadingGraph: false };
-    let graph = { nodes: [{ id: 6, widgets_values: ['original'] }], links: [] };
+    let graph = { id: clientId, revision: 1, nodes: [{ id: 6, widgets_values: ['original'] }], links: [] };
     const app = { extensionManager: { workflow: { activeWorkflow: active } }, canvas: { ds: { scale: 0.8, offset: [20, 30] } },
       graph: { serialize: () => structuredClone(graph), setDirtyCanvas() {} },
       async loadGraphData(data, clean, restoreView, workflow) {
         calls.push({ clean, restoreView, workflow });
         if (!workflow) { const created = {}; tabs.push(created); app.extensionManager.workflow.activeWorkflow = created; }
-        graph = structuredClone(data);
+        graph = structuredClone(data); graph.id = clientId; graph.revision++;
         app.canvas.ds.scale = 1; app.canvas.ds.offset = [0, 0];
         return true;
       } };
     const parent = { postMessage() {} };
     const window = { parent, comfyAPI: { app: { app }, changeTracker: { ChangeTracker: tracker } }, addEventListener() {} };
-    const context = vm.createContext({ window, location: { search: '?dsh_client=' + clientId + '&dsh_session=s' },
+    if (external) window.parent = window;
+    const context = vm.createContext({ window, crypto: { randomUUID: () => clientId }, location: { search: external ? '' : '?dsh_client=' + clientId + '&dsh_session=s' },
       document: { referrer: 'http://127.0.0.1:3080/' }, URL, URLSearchParams,
       localStorage: { setItem() {} }, setTimeout: fn => scheduled.push(fn), fetch: async (path, options) => {
         const data = JSON.parse(options.body);
         if (path.endsWith('/result')) replies.push(data);
         const reply = path.endsWith('/sync') ? sync.exchange(data) : path.endsWith('/poll') ? { commands: commands.splice(0) } : { ok: true };
+        if (path.endsWith('/sync') && syncGate) { const gate = syncGate; syncGate = null; await gate; }
         return { ok: true, json: async () => reply };
       } });
     return { app, tracker, tabs, active, calls, replies, start() { vm.runInContext(code, context); },
       edit(value) { graph.nodes[0].widgets_values[0] = value; }, value() { return graph.nodes[0].widgets_values[0]; },
+      localRevision() { graph.revision++; },
+      holdSync() { let release; syncGate = new Promise(resolve => { release = resolve; }); return release; },
       async tick() { scheduled.shift()(); await flush(); },
       async command(action, args = {}) { commands.push({ id: String(replies.length), action, args }); await this.tick(); return replies.at(-1); } };
   }
-  const original = page('original'); const embedded = page('embedded');
+  const original = page('original', true); const embedded = page('embedded');
   original.start(); await flush(); embedded.start(); await flush();
   assert.equal(embedded.calls.length, 0, 'identical initial sync must not reload a graph');
   original.edit('edited while other tab was inactive'); await original.tick();
@@ -57,6 +62,30 @@ test('browser tab resume synchronizes into the existing workflow without duplica
   assert.deepEqual(embedded.app.canvas.ds, { scale: 0.8, offset: [20, 30] });
   for (let i = 0; i < 5; i++) { await original.tick(); await embedded.tick(); }
   assert.equal(embedded.calls.length, 1, 'tab resume with unchanged content must not repeat graph loading');
+  for (let i = 0; i < 5; i++) { original.localRevision(); embedded.localRevision(); await original.tick(); await embedded.tick(); }
+  assert.equal(embedded.calls.length, 1, 'browser-local workflow IDs and revisions must not cause reload ping-pong');
+  assert.equal(original.calls.length, 0);
+  // No loader call is allowed while the workflow manager is missing or returns
+  // a temporary string identity. Both used to fall through to new-tab loading.
+  for (const missing of [undefined, { activeWorkflow: null }, { activeWorkflow: 'workflow.json' }]) {
+    original.app.extensionManager.workflow = missing;
+    embedded.edit('edit while original is initializing'); await embedded.tick(); await original.tick();
+    assert.equal(original.calls.length, 0); assert.equal(original.tabs.length, 1);
+  }
+  original.app.extensionManager.workflow = { activeWorkflow: original.active };
+  await original.tick(); assert.equal(original.value(), embedded.value()); assert.equal(original.tabs.length, 1);
+  original.edit('remote edit during workflow switch'); await original.tick();
+  const release = embedded.holdSync(); const beforeSwitch = embedded.calls.length;
+  await embedded.tick(); embedded.app.extensionManager.workflow.activeWorkflow = { path: 'new-tab.json' };
+  release(); await flush();
+  assert.equal(embedded.calls.length, beforeSwitch, 'a delayed response must not load into a different workflow tab');
+  embedded.app.extensionManager.workflow.activeWorkflow = embedded.active;
+  await embedded.tick(); assert.equal(embedded.value(), original.value()); assert.equal(embedded.tabs.length, 1);
+  original.app.rootGraph = original.app.graph;
+  original.app.graph = { serialize: () => ({ nodes: [], links: [] }), setDirtyCanvas() {} };
+  const beforeSubgraph = embedded.calls.length;
+  await original.tick(); await embedded.tick();
+  assert.equal(embedded.calls.length, beforeSubgraph, 'opening a subgraph must not replace the shared root workflow');
   const next = { nodes: [{ id: 6, widgets_values: ['AI loaded graph'] }], links: [] };
   assert.equal((await embedded.command('load_workflow', { workflow: next })).result.loaded, true);
   assert.equal(embedded.tabs.length, 1); assert.equal(embedded.calls.at(-1).workflow, embedded.active);
@@ -86,7 +115,7 @@ test('proxy injects bridge, forwards HTTP, rejects cross-origin writes, and isol
   assert.equal((await fetch(runtime.frameOrigin + '/prompt', { method: 'POST', headers: { Origin: 'https://example.com' } })).status, 403);
   assert.deepEqual(await runtime.request('/interrupt', { method: 'POST' }), {});
   async function bridge(path, data, token = runtime.token) {
-    return fetch(runtime.frameOrigin + '/__dsh_comfyui/' + path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Dsh-Comfy-Token': token }, body: JSON.stringify({ clientId: 'c', sessionId: 's', ready: true, allowAI: true, visible: true, ...data }) });
+    return fetch(runtime.frameOrigin + '/__dsh_comfyui/' + path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Dsh-Comfy-Token': token }, body: JSON.stringify({ clientId: 'c', sessionId: 's', bridgeProtocol: BRIDGE_PROTOCOL, ready: true, allowAI: true, visible: true, ...data }) });
   }
   assert.equal((await bridge('poll', {}, 'bad')).status, 403);
   await bridge('poll', {});
@@ -99,6 +128,13 @@ test('proxy injects bridge, forwards HTTP, rejects cross-origin writes, and isol
   assert.deepEqual(await result, { nodes: [] });
   await bridge('poll', { allowAI: false });
   assert.throws(() => runtime.command('s', 'run'), /MCP 设置/);
+  runtime.sync.exchange({ clientId: 'new-page', workflow: { nodes: [], links: [] }, fingerprint: 'new' });
+  const stale = await bridge('sync', { bridgeProtocol: undefined, revision: 0 });
+  assert.equal(stale.status, 409);
+  const blocked = await stale.json(); assert.equal(blocked.refreshRequired, true);
+  assert.equal(blocked.workflow, undefined, 'old pages must never receive a graph they can load into a new tab');
+  const diagnostics = runtime.status().syncClients.find(c => c.clientId === 'c');
+  assert.equal(diagnostics.refreshRequired, true); assert.equal(diagnostics.bridgeVersion, 'legacy');
 });
 
 test('browser bridge edits actual named widgets, validates whole batch and restores graph', async () => {
@@ -107,7 +143,7 @@ test('browser bridge edits actual named widgets, validates whole batch and resto
   const widget = { name: 'text', type: 'text', value: 'original' };
   const node = { id: 6, type: 'CLIPTextEncode', title: 'Prompt', widgets: [widget], inputs: [], outputs: [] };
   let dirty = false; let submitted = 0;
-  const app = { canvas: {}, graph: { _nodes: [node], serialize: () => ({ nodes: [{ id: 6, widgets_values: [widget.value] }], links: [] }),
+  const app = { extensionManager: { workflow: { activeWorkflow: { path: 'test.json' } } }, canvas: {}, graph: { _nodes: [node], serialize: () => ({ nodes: [{ id: 6, widgets_values: [widget.value] }], links: [] }),
     getNodeById: id => String(id) === '6' ? node : null, setDirtyCanvas: () => { dirty = true; } },
     graphToPrompt: async () => ({ workflow: { nodes: [] }, output: { 6: { inputs: { text: widget.value }, class_type: node.type } } }),
     loadGraphData: async graph => { widget.value = graph.nodes[0].widgets_values[0]; } };

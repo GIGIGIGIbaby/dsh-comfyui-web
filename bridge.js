@@ -2,6 +2,8 @@
   'use strict';
   if (window.__DSH_COMFYUI_BRIDGE_ACTIVE__) return;
   window.__DSH_COMFYUI_BRIDGE_ACTIVE__ = true;
+  const bridgeProtocol = 2;
+  const bridgeVersion = '0.2.2';
   const bootstrap = window.__DSH_COMFYUI_BOOTSTRAP__ || {};
   let token = bootstrap.token || __DSH_BRIDGE_TOKEN__;
   const bridgeBase = bootstrap.bridgeBase || location.origin;
@@ -16,11 +18,22 @@
   const undo = []; const completed = new Map();
   const appOf = () => window.comfyAPI?.app?.app;
   const apiOf = () => window.comfyAPI?.api?.api;
-  const activeWorkflowOf = app => app.extensionManager?.workflow?.activeWorkflow;
+  const activeWorkflowOf = app => {
+    const workflow = app?.extensionManager?.workflow?.activeWorkflow;
+    return workflow && typeof workflow === 'object' ? workflow : null;
+  };
+  const rootGraphOf = app => app?.rootGraph || app?.graph;
   function graphReady(app) {
-    return !!(app?.graph && app.canvas && !app.configuringGraph &&
+    return !!(rootGraphOf(app) && app.canvas && !app.configuringGraph &&
       !window.comfyAPI?.changeTracker?.ChangeTracker?.isLoadingGraph &&
-      (!app.extensionManager?.workflow || activeWorkflowOf(app)));
+      activeWorkflowOf(app));
+  }
+  function diagnostics() {
+    const app = appOf();
+    const tabs = app?.extensionManager?.workflow?.openWorkflows;
+    return { bridgeProtocol, bridgeVersion, ready: graphReady(app), allowAI,
+      visible: visible && document.visibilityState !== 'hidden',
+      hasActiveWorkflow: !!activeWorkflowOf(app), workflowTabs: Array.isArray(tabs) ? tabs.length : null };
   }
   const notify = data => { if (embedded) window.parent.postMessage({ source: 'dsh-comfyui', clientId, ...data }, parentOrigin); };
   window.addEventListener('message', event => {
@@ -28,7 +41,7 @@
     allowAI = event.data.allowAI === true; visible = event.data.visible === true;
   });
   const send = async (path, data) => {
-    const r = await fetch(bridgeBase + '/__dsh_comfyui/' + path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Dsh-Comfy-Token': token }, body: JSON.stringify({ clientId, sessionId, ...data }) });
+    const r = await fetch(bridgeBase + '/__dsh_comfyui/' + path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Dsh-Comfy-Token': token }, body: JSON.stringify({ clientId, sessionId, ...diagnostics(), ...data }) });
     if (r.status === 403) {
       const next = await (await fetch(bridgeBase + '/__dsh_comfyui/bootstrap')).json();
       token = next.token; revision = 0; initialized = false;
@@ -37,19 +50,30 @@
     if (!r.ok) throw new Error(await r.text()); return r.json();
   };
   const clone = value => JSON.parse(JSON.stringify(value));
-  function snapshot(app) { return clone(app.graph.serialize()); }
+  function snapshot(app) { return clone(rootGraphOf(app).serialize()); }
   function fingerprint(workflow) {
     const clean = clone(workflow);
+    // Each browser owns its workflow identity and local revision. Sharing them
+    // makes native loaders normalize the graph differently on every page.
+    delete clean.id; delete clean.revision;
     if (clean.extra) delete clean.extra.ds;
-    return JSON.stringify(clean);
+    const stable = value => Array.isArray(value) ? value.map(stable) : value && typeof value === 'object'
+      ? Object.fromEntries(Object.keys(value).sort().map(key => [key, stable(value[key])])) : value;
+    return JSON.stringify(stable(clean));
   }
   async function replaceCurrentWorkflow(app, workflow) {
     if (!graphReady(app)) throw new Error('ComfyUI 当前工作流正在载入，请稍后再试');
     const active = activeWorkflowOf(app);
+    // Never use loadGraphData's null/string fallback: it creates temporary tabs.
+    if (!active) throw new Error('ComfyUI 当前工作流尚未就绪，请稍后再试');
+    const data = clone(workflow);
+    const localId = snapshot(app).id;
+    if (localId != null) data.id = localId;
+    else delete data.id;
     const ds = app.canvas.ds;
     const view = ds ? { scale: ds.scale, offset: Array.from(ds.offset) } : null;
     try {
-      const loaded = await app.loadGraphData(clone(workflow), false, false, active ?? null,
+      const loaded = await app.loadGraphData(data, false, false, active,
         { checkForRerouteMigration: false, silentAssetErrors: true });
       if (loaded === false) throw new Error('ComfyUI 未能载入工作流');
     } finally {
@@ -58,9 +82,13 @@
     }
   }
   async function syncWorkflow(app) {
+    const owner = activeWorkflowOf(app);
     const workflow = snapshot(app); const current = fingerprint(workflow);
     const changed = initialized && current !== lastFingerprint;
     const update = await send('sync', { revision, ...(!initialized || changed ? { workflow, fingerprint: current } : {}) });
+    // A manual workflow switch can finish while the network request is pending.
+    // Defer the response rather than applying it to the new tab or a loading graph.
+    if (!graphReady(app) || activeWorkflowOf(app) !== owner) return;
     if (update.workflow) {
       if (update.conflict && changed) {
         try { localStorage.setItem('dsh.comfyui.sync-conflict.' + clientId, JSON.stringify(workflow)); } catch {}
@@ -136,7 +164,7 @@
     try {
       const ready = graphReady(appOf());
       if (ready) await syncWorkflow(appOf());
-      const response = await send('poll', { ready, allowAI, visible });
+      const response = await send('poll', {});
       notify({ ready, allowAI });
       for (const command of response.commands || []) {
         let reply = completed.get(command.id);
