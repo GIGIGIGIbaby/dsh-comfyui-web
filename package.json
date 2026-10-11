@@ -1,0 +1,22 @@
+{
+  "name": "dsh-comfyui-web",
+  "version": "0.2.0",
+  "description": "在 dsh 中编辑 ComfyUI 工作流、实时预览，并让 AI 操作当前节点图。",
+  "repository": { "type": "git", "url": "git+https://github.com/mangfufu/dsh-comfyui-web.git" },
+  "homepage": "https://github.com/mangfufu/dsh-comfyui-web#readme",
+  "bugs": { "url": "https://github.com/mangfufu/dsh-comfyui-web/issues" },
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": { ".": "./lib/index.js", "./client": "./client.js", "./package.json": "./package.json" },
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "engines": { "node": ">=22" },
+  "peerDependencies": { "@deepseek-ai/dsh-mcp-client": "0.2.0-rc.2" },
+  "dshTarget": "0.2.0-rc.2",
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": ["@deepseek-ai/dsh-client-ui-slots", "@deepseek-ai/dsh-client-ui-sidebar-right", "@deepseek-ai/dsh-client-ui-conversation"]
+    }
+  }
+}

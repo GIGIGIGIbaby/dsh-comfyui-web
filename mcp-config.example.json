@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "comfyui": {
+      "command": "node",
+      "args": ["/absolute/path/to/dsh-comfyui-web/mcp-stdio.mjs"]
+    }
+  }
+}
