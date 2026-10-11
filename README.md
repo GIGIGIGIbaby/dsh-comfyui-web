@@ -1,6 +1,6 @@
 # dsh-comfyui-web
 
-在 dsh 网页里使用 ComfyUI：编辑节点、预览生成，让 AI 直接操作当前工作流。
+来回切换页面太麻烦了，直接把 ComfyUI 嵌入 dsh 网页端，通过 MCP 操控，实时预览每个操作。
 
 ## 安装
 
@@ -10,7 +10,10 @@
 dsh plugin --profile web add github:mangfufu/dsh-comfyui-web
 ```
 
-在 `~/.dsh/comfyui/config.json` 中填写 ComfyUI 地址和前端目录；Windows 的 `~` 是你的用户目录。示例中的目录请换成自己机器上的实际路径：
+<details>
+<summary>首次安装：配置 ComfyUI 目录</summary>
+
+在 `~/.dsh/comfyui/config.json` 中填写 ComfyUI 前端目录。Windows 的 `~` 是你的用户目录，下面的路径请换成自己机器上的实际路径；Linux 同样填写实际目录。
 
 ```json
 {
@@ -19,37 +22,45 @@ dsh plugin --profile web add github:mangfufu/dsh-comfyui-web
 }
 ```
 
-启动 ComfyUI，再启动 dsh：
+首次安装或更新插件后，保存工作流，刷新已打开的 ComfyUI 原网页和 dsh 内的 ComfyUI 面板。
 
-```sh
-dsh web
-```
-
-打开 `http://127.0.0.1:3080`，进入对话，点击顶部 **ComfyUI**。首次安装后，保存工作流并刷新已打开的 ComfyUI 原网页。
-
-更新插件后，原 ComfyUI 网页按 **Ctrl+F5**，dsh 内的 ComfyUI 面板点 **刷新**；多个已打开的页面都要刷新。
+</details>
 
 ## 使用
 
-- **MCP 设置**：默认开启，可开关 MCP、修改 ComfyUI 地址、复制其他 AI 客户端的配置。
-- **刷新**：重新加载 ComfyUI 页面，刷新前保存工作流。
-- **缩放**：点击 `− / +` 调整，点击百分比恢复 100%。可拖宽右侧面板或最大化。
-- **同步**：在原网页或 dsh 面板修改工作流，另一页会同步更新。
-- **生成通知**：AI 发起的生成结束后会通知原对话。当前回复不会被打断，无需反复等待或查询。
+### 1. 打开 ComfyUI
 
-直接在同一条 dsh 对话中告诉 AI：
+1. 先启动 ComfyUI。
+2. 启动 `dsh web`，打开 `http://127.0.0.1:3080`。
+3. 进入对话，点击右上角 **ComfyUI**。
 
-> 读取当前工作流，把正向提示词改成一只橘猫，步数设为 20，先别生成。
+![在 dsh 右侧打开 ComfyUI 工作流界面](docs/images/comfyui-panel.png)
 
-> 运行当前工作流一次，查看生成结果。
+左边和 AI 对话，右边就是 ComfyUI。可以直接改节点、查看预览，不用在两个网页之间来回切换。
 
-> 撤销刚才的修改。
+### 2. 确认连接地址
 
-其他本机 AI 客户端：打开 **MCP 设置 → 其他 AI 客户端的 MCP 配置**，复制到该客户端，使用时保持 dsh 运行。
+![ComfyUI 地址与 MCP 设置](docs/images/comfyui-settings.png)
+
+地址默认是 `http://127.0.0.1:8188`。如果换了端口，打开 **MCP 设置**，重新填写地址，点击 **保存并连接**。
+
+MCP 默认开启，dsh 内不用再单独配置。需要时可以关闭，也可以复制配置给其他本机 AI 客户端使用。
+
+### 3. 直接下指令
+
+在同一条对话里告诉 AI，例如：
+
+> 读取当前工作流，优化正向提示词，把步数设为 20，生成一张图并查看结果。
+
+![AI 修改工作流并生成图片，聊天与 ComfyUI 同时显示结果](docs/images/comfyui-ai-preview.png)
+
+AI 通过 MCP 修改当前工作流，操作和生成预览都能在右侧实时看到，结果也可以直接在对话里查看。生成结束后会通知原对话，无需反复等待或查询，不会强行打断当前回复。
+
+想撤销就说「撤销刚才的修改」。顶部的 `− / +` 可以调整界面大小，**刷新** 可以重新加载 ComfyUI 页面。
 
 ## 友情链接
 
-[LINUX DO](https://linux.do/)
+[LINUX DO](https://linux.do/) · [插件介绍帖](https://linux.do/t/topic/3009797)
 
 ## Star History
 
