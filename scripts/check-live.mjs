@@ -4,6 +4,7 @@ const config = await (await fetch(base + '/dsh-comfyui/api')).json();
 const client = config.clients.find(c => c.ready && c.allowAI);
 console.log('ComfyUI target:', config.url);
 console.log('Connected panels:', config.clients.length);
+console.log('dsh completion notifications available:', config.completionNotificationsAvailable === true);
 const mcp = await connectMcp(config.frameOrigin + '/mcp', config.token);
 console.log('MCP initialized:', mcp.initialized, '; tools:', mcp.tools.length);
 if (client) {
