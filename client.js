@@ -153,25 +153,55 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
       images.map((image, index) => h(OutputImage, { key: (image.attachment?.attachmentId ?? image.preview?.url) + ':' + index,
         image, loadImage, variant, protectedImage: enabled }))));
   }
-  function ComfyImageResult({ toolName, block, loadImage, inspect }) {
-    // Only this plugin's image tool owns this renderer; other tool/image slots stay untouched.
-    if (toolName !== 'mcp__comfyui__get_image') return null;
-    const settled = block.kind === 'tool-result';
-    const content = settled && Array.isArray(block.content) ? block.content : [];
-    const text = content.filter(part => part.type === 'text').map(part => part.text).join('\n');
+  function resultImages(block) {
+    if (block.kind !== 'tool-result' || block.isError || !Array.isArray(block.content)) return [];
+    const content = block.content;
     let filename;
     for (const part of content) {
       if (part.type !== 'text') continue;
       try { const value = JSON.parse(part.text); if (typeof value.filename === 'string') { filename = value.filename; break; } } catch {}
     }
-    const images = block.isError ? [] : content.filter(part => part.type === 'image' && part.attachment)
+    return content.filter(part => part.type === 'image' && part.attachment)
       .map(part => ({ attachment: part.attachment, ...(filename ? { label: filename } : {}) }));
+  }
+  function ComfyImageResult({ toolName, block, inspect }) {
+    if (toolName !== 'mcp__comfyui__get_image') return null;
+    const settled = block.kind === 'tool-result';
+    const content = settled && Array.isArray(block.content) ? block.content : [];
+    const text = content.filter(part => part.type === 'text').map(part => part.text).join('\n');
+    const images = resultImages(block);
     return h('section', { className: 'dsh-comfy-output', 'aria-label': 'ComfyUI 图片结果' }, h('style', null, CSS),
       h('div', { className: 'dsh-comfy-output-head' }, h('strong', null, 'ComfyUI 图片'),
         h('span', { role: 'status' }, !settled ? '读取中…' : block.isError ? '读取失败' : images.length ? '已读取' : '已完成'),
         inspect ? h('button', { type: 'button', onClick: inspect }, '查看调用') : null),
-      images.length ? h(MessageImages, { images, loadImage, align: 'start' }) : null,
+      images.length ? h('span', { className: 'dsh-comfy-image-info' }, '图片将在本次回复正文的结果区显示。') : null,
       !images.length && text ? h('pre', { className: 'dsh-comfy-output-text', role: block.isError ? 'alert' : undefined }, text) : null);
+  }
+  function ComfyTurnResults({ turn, resultSource, loadImage }) {
+    const subscribe = React.useCallback(listener => resultSource.subscribe(listener), [resultSource]);
+    const read = React.useCallback(() => resultSource.getSnapshot(), [resultSource]);
+    const snapshot = useSyncExternalStore(subscribe, read, read);
+    const images = [], seenCalls = new Set(), seenImages = new Set();
+    const visit = block => {
+      if (!block || seenCalls.has(block.callId)) return;
+      seenCalls.add(block.callId);
+      if (block.call?.name === 'mcp__comfyui__get_image') {
+        for (const image of resultImages(block)) {
+          const key = image.attachment.attachmentId + ':' + (image.label ?? '');
+          if (!seenImages.has(key)) { seenImages.add(key); images.push(image); }
+        }
+      }
+      for (const child of block.subCalls ?? []) visit(child);
+    };
+    // Chat history retains the tool records even when presentation hides the process.
+    for (const key of snapshot?.locations.getTurn(turn.turn) ?? []) {
+      const node = snapshot.nodes.get(key);
+      if (node?.kind === 'tool-call') visit(node.data.root);
+    }
+    if (!images.length) return null;
+    return h('section', { className: 'dsh-comfy-output', 'aria-label': 'ComfyUI 生成结果' },
+      h('div', { className: 'dsh-comfy-output-head' }, h('strong', null, 'ComfyUI 生成结果')),
+      h(MessageImages, { images, loadImage, align: 'start' }));
   }
   async function api(body, token, signal) {
     const response = await fetch('/dsh-comfyui/api', body ? { method: 'POST', signal,
@@ -296,11 +326,19 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     ctx.effect(() => ctx.slots.inject('tool.call.toolview', () => ctx.slots.register({
       name: 'tool.call.toolview', key: 'mcp__comfyui__get_image'
     }, ComfyImageResult)));
+    ctx.effect(() => ctx.slots.inject('conversation.chat.turnTail', () => ctx.slots.register({
+      name: 'conversation.chat.turnTail', id: ID + '.images', order: 35,
+      inject: sessionId => {
+        const loadImage = attachment => ctx.uiConversation.imageUrl(sessionId, attachment);
+        loadImage.peek = attachment => ctx.uiConversation.peekImageUrl(sessionId, attachment);
+        return { resultSource: ctx.uiConversation.binding(sessionId).target('chat'), loadImage };
+      }
+    }, ComfyTurnResults)));
     ctx.effect(() => ctx.sidebarRightTabs.register({ id: ID, kind: ID, keepMounted: true, title: () => 'ComfyUI',
       guide: [{ id: 'comfyui', order: 35, title: () => 'ComfyUI', description: () => '节点编辑 · 实时预览 · AI 操作' }] }));
     ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({ name: 'sidebar.right.pane.tab', key: ID }, Body)));
     ctx.effect(() => ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({ name: 'conversation.session.header.utilities', id: ID, order: 35,
       inject: () => ({ open: () => ctx.sidebarRight.openTab(ID) }) }, Entry)));
   }
-  return { name: ID, inject: ['slots', 'sidebarRight', 'sidebarRightTabs'], apply };
+  return { name: ID, inject: ['slots', 'sidebarRight', 'sidebarRightTabs', 'uiConversation'], apply };
 } });
