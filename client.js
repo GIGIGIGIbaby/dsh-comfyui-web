@@ -211,13 +211,17 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
   function resultImages(block) {
     if (block.kind !== 'tool-result' || block.isError || !Array.isArray(block.content)) return [];
     const content = block.content;
-    let filename;
+    let file;
     for (const part of content) {
       if (part.type !== 'text') continue;
-      try { const value = JSON.parse(part.text); if (typeof value.filename === 'string') { filename = value.filename; break; } } catch {}
+      try { const value = JSON.parse(part.text); if (typeof value.filename === 'string') { file = value; break; } } catch {}
     }
     return content.filter(part => part.type === 'image' && part.attachment)
-      .map(part => ({ attachment: part.attachment, ...(filename ? { label: filename } : {}) }));
+      .map(part => ({ attachment: part.attachment, ...(file ? { label: file.filename, file } : {}) }));
+  }
+  function mediaKey(file) {
+    if (!file?.filename || !file.promptId) return null;
+    return JSON.stringify([file.promptId, file.type || 'output', file.subfolder || '', file.filename]);
   }
   function ComfyImageResult({ toolName, block, inspect }) {
     if (!['mcp__comfyui__get_image', 'mcp__comfyui__get_video'].includes(toolName)) return null;
@@ -252,21 +256,21 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     const subscribeTasks = React.useCallback(listener => generationSource?.subscribe(listener) || (() => {}), [generationSource]);
     const readTasks = React.useCallback(() => generationSource?.getSnapshot() || EMPTY_TASKS, [generationSource]);
     const tasks = useSyncExternalStore(subscribeTasks, readTasks, readTasks);
-    const images = [], runIds = new Set(), seenCalls = new Set(), seenImages = new Set(), seenFiles = new Set();
+    const images = [], runIds = new Set(), seenCalls = new Set(), seenImages = new Set(), seenMedia = new Set();
     const visit = block => {
       if (!block || seenCalls.has(block.callId)) return;
       seenCalls.add(block.callId);
       if (block.call?.name === 'mcp__comfyui__get_image') {
         for (const image of resultImages(block)) {
-          const key = image.attachment.attachmentId + ':' + (image.label ?? '');
+          const key = mediaKey(image.file) || image.attachment.attachmentId + ':' + (image.label ?? '');
           if (!seenImages.has(key)) { seenImages.add(key); images.push(image); }
-          if (image.label) seenFiles.add(image.label);
+          if (mediaKey(image.file)) seenMedia.add(mediaKey(image.file));
         }
       }
       if (block.call?.name === 'mcp__comfyui__get_video') {
         for (const video of resultVideos(block)) {
           if (!seenImages.has(video.url)) { seenImages.add(video.url); images.push(video); }
-          seenFiles.add(video.filename);
+          if (mediaKey(video)) seenMedia.add(mediaKey(video));
         }
       }
       if (block.call?.name === 'mcp__comfyui__run' && block.kind === 'tool-result' && !block.isError) {
@@ -283,8 +287,10 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     }
     const ownedTasks = tasks.filter(task => runIds.has(task.promptId));
     for (const task of ownedTasks) for (const media of task.media || []) {
-      if (seenFiles.has(media.filename) || seenImages.has(media.url)) continue;
-      seenFiles.add(media.filename); seenImages.add(media.url);
+      const key = mediaKey(media);
+      if ((key && seenMedia.has(key)) || seenImages.has(media.url)) continue;
+      if (key) seenMedia.add(key);
+      seenImages.add(media.url);
       if (media.kind === 'dsh-comfyui-web.video') images.push(media);
       else if (media.kind === 'dsh-comfyui-web.image') images.push({ label: media.filename, preview: { url: media.url, name: media.filename } });
     }

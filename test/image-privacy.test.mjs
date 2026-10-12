@@ -87,3 +87,35 @@ test('reply results recover hidden and nested ComfyUI image calls from the ownin
   assert.equal(callRow.props.children.some(child => typeof child?.type === 'function'), false,
     'the tool process must not contain a second image gallery');
 });
+
+test('AI reads and automatic results share one card without hiding identical filenames from other tasks or folders', async () => {
+  const source = await readFile(new URL('../client.js', import.meta.url), 'utf8');
+  const registrations = []; let plugin;
+  const react = { createElement(type, props, ...children) { return { type, props: { ...props, children } }; },
+    useCallback(fn) { return fn; }, useSyncExternalStore(_subscribe, read) { return read(); } };
+  vm.runInNewContext(source, { localStorage: { getItem: () => null }, window: {
+    __ModuleLoader__: { load({ factory }) { plugin = factory(() => react); } }, addEventListener() {} } });
+  plugin.apply({ effect(fn) { fn(); }, sidebarRightTabs: { register() {} }, sidebarRight: { openTab() {} },
+    slots: { inject(_name, fn) { fn(); }, register(def, component) { registrations.push({ def, component }); } } });
+  const file = { promptId: 'p', filename: 'saved.png', subfolder: '', type: 'output' };
+  const blocks = ['attachment-a', 'attachment-b'].map((attachmentId, i) => ({ kind: 'tool-result', callId: 'read-' + i,
+    call: { name: 'mcp__comfyui__get_image' }, content: [
+      { type: 'text', text: JSON.stringify(file) }, { type: 'image', attachment: { attachmentId } }
+    ] }));
+  for (const promptId of ['p', 'q']) blocks.push({ kind: 'tool-result', callId: 'run-' + promptId,
+    call: { name: 'mcp__comfyui__run' }, content: [{ type: 'text', text: JSON.stringify({ prompt_id: promptId }) }] });
+  const snapshot = { nodes: new Map(blocks.map(block => [block.callId, { kind: 'tool-call', data: { root: block } }])),
+    locations: { getTurn: () => blocks.map(block => block.callId) } };
+  const media = (promptId, subfolder = '') => ({ ...file, promptId, subfolder,
+    kind: 'dsh-comfyui-web.image', url: '/preview/' + promptId + '/' + subfolder });
+  const tasks = [{ promptId: 'p', status: 'completed', media: [media('p'), media('p', 'other')] },
+    { promptId: 'q', status: 'completed', media: [media('q')] }];
+  const tail = registrations.find(row => row.def.name === 'conversation.chat.turnTail');
+  const rendered = tail.component({ turn: { turn: 0 }, resultSource: { getSnapshot: () => snapshot },
+    generationSource: { getSnapshot: () => tasks } });
+  const gallery = rendered.props.children.find(child => typeof child?.type === 'function');
+  assert.equal(gallery.props.images.length, 3);
+  assert.equal(gallery.props.images[0].attachment.attachmentId, 'attachment-a');
+  assert.equal(gallery.props.images[1].preview.url, '/preview/p/other');
+  assert.equal(gallery.props.images[2].preview.url, '/preview/q/');
+});
