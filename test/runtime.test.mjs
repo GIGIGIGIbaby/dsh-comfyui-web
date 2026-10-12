@@ -150,6 +150,7 @@ test('browser bridge edits actual named widgets, validates whole batch and resto
   const parent = { postMessage: data => messages.push(data) };
   const window = { parent, comfyAPI: { app: { app }, api: { api: { queuePrompt: async () => { submitted++; return { prompt_id: 'test-prompt' }; } } } }, addEventListener: () => {} };
   const context = vm.createContext({ window, location: { search: '?dsh_client=c&dsh_session=s' }, document: { referrer: 'http://127.0.0.1:40000/' }, URL, URLSearchParams,
+    crypto: { randomUUID: () => 'checkpoint-' + results.length },
     setTimeout: fn => scheduled.push(fn), fetch: async (path, options) => {
       const data = JSON.parse(options.body);
       if (path.endsWith('/result')) results.push(data);

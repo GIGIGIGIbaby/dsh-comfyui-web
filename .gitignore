@@ -8,3 +8,6 @@ Thumbs.db
 coverage/
 comfyui/config.json
 comfyui/connection.json
+comfyui/media-key
+comfyui/tasks.json
+comfyui/tasks.json.*.tmp

@@ -31,6 +31,9 @@ test('queue WebSocket completion wakes event waiters once, without fixed-interva
   pending.add('image'); monitor.track('image', 'owner'); await flush();
   assert.equal(monitor.owned('image', 'owner').status, 'queued');
   const count = requests.length; await flush(); assert.equal(requests.length, count);
+  monitor.socket.emit('progress', { prompt_id: 'image', value: 1, max: 10 }); await flush();
+  assert.equal(monitor.owned('image', 'owner').progress.value, 1);
+  assert.equal(requests.length, count, 'preview progress must not trigger history polling');
   const wait = monitor.wait('image', 'owner');
   history.image = { status: { completed: true, status_str: 'success', messages: [['execution_success', {}]] },
     outputs: { 9: { images: [{ filename: 'image.png', subfolder: '', type: 'output' }] } } };
@@ -102,6 +105,12 @@ test('dsh background completion job is owned, reports once, and cancels only mon
   }, monitor);
   hooks.cancel('stop notification'); assert.equal((await hooks.done).status, 'killed');
   assert.equal(monitor.owned('still-generating', 'owner').result, undefined);
+  assert.equal(monitor.owned('still-generating', 'owner').notificationDisabled, true);
+  await runWithCompletionJob(jobs, 'owner', async () => {
+    pending.add('restart'); monitor.track('restart', 'owner'); return { structuredContent: { prompt_id: 'restart' } };
+  }, monitor);
+  hooks.cancel('owner disposed'); await hooks.done;
+  assert.notEqual(monitor.owned('restart', 'owner').notificationDisabled, true, 'process teardown must not permanently disable recovered notifications');
   let unsafeSubmissions = 0;
   assert.throws(() => runWithCompletionJob({ start() { throw new Error('no controller'); } }, 'owner', async () => { unsafeSubmissions++; }, monitor), /no controller/);
   assert.equal(unsafeSubmissions, 0, 'failed job admission must never submit a generation');

@@ -17,6 +17,30 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
   const subscribePrivacy = listener => { privacyListeners.add(listener); return () => privacyListeners.delete(listener); };
   const privacySnapshot = () => blurOutputImages;
   const useImagePrivacy = () => useSyncExternalStore(subscribePrivacy, privacySnapshot, () => false);
+  const taskSources = new Map();
+  const EMPTY_TASKS = [];
+  function taskSource(sessionId) {
+    if (!taskSources.has(sessionId)) {
+      const listeners = new Set(); let tasks = EMPTY_TASKS, stream, timer, cancelled = false, epoch = 0;
+      const publish = value => { tasks = value; for (const listener of listeners) listener(); };
+      const connect = async (lease = epoch) => {
+        try {
+          const settings = await api();
+          if (cancelled || lease !== epoch) return;
+          stream = new EventSource('/dsh-comfyui/events?' + new URLSearchParams({ sessionId, token: settings.token }));
+          stream.onmessage = event => { try { publish(JSON.parse(event.data).tasks || []); } catch {} };
+          const active = stream;
+          stream.onerror = () => { active.close(); if (!cancelled && lease === epoch) timer = setTimeout(() => connect(lease), 3000); };
+        } catch { if (!cancelled && lease === epoch) timer = setTimeout(() => connect(lease), 3000); }
+      };
+      taskSources.set(sessionId, { getSnapshot: () => tasks, subscribe(listener) {
+        listeners.add(listener);
+        if (listeners.size === 1) { cancelled = false; epoch++; connect(); }
+        return () => { listeners.delete(listener); if (!listeners.size) { cancelled = true; epoch++; stream?.close(); clearTimeout(timer); } };
+      } });
+    }
+    return taskSources.get(sessionId);
+  }
   const CSS = `
     .dsh-comfy { display:flex; flex:1 1 auto; flex-direction:column; width:100%; height:100%; min-width:0; min-height:0; box-sizing:border-box; background:var(--dsr-bg,#181a1d); color:inherit; }
     .dsh-comfy-bar { display:flex; flex:none; align-items:center; flex-wrap:wrap; gap:10px; padding:8px 12px; border-bottom:1px solid #80808030; font-size:12px; }
@@ -221,11 +245,14 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     }
     return [];
   }
-  function ComfyTurnResults({ turn, resultSource, loadImage }) {
+  function ComfyTurnResults({ turn, resultSource, loadImage, generationSource }) {
     const subscribe = React.useCallback(listener => resultSource.subscribe(listener), [resultSource]);
     const read = React.useCallback(() => resultSource.getSnapshot(), [resultSource]);
     const snapshot = useSyncExternalStore(subscribe, read, read);
-    const images = [], seenCalls = new Set(), seenImages = new Set();
+    const subscribeTasks = React.useCallback(listener => generationSource?.subscribe(listener) || (() => {}), [generationSource]);
+    const readTasks = React.useCallback(() => generationSource?.getSnapshot() || EMPTY_TASKS, [generationSource]);
+    const tasks = useSyncExternalStore(subscribeTasks, readTasks, readTasks);
+    const images = [], runIds = new Set(), seenCalls = new Set(), seenImages = new Set(), seenFiles = new Set();
     const visit = block => {
       if (!block || seenCalls.has(block.callId)) return;
       seenCalls.add(block.callId);
@@ -233,11 +260,18 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
         for (const image of resultImages(block)) {
           const key = image.attachment.attachmentId + ':' + (image.label ?? '');
           if (!seenImages.has(key)) { seenImages.add(key); images.push(image); }
+          if (image.label) seenFiles.add(image.label);
         }
       }
       if (block.call?.name === 'mcp__comfyui__get_video') {
         for (const video of resultVideos(block)) {
           if (!seenImages.has(video.url)) { seenImages.add(video.url); images.push(video); }
+          seenFiles.add(video.filename);
+        }
+      }
+      if (block.call?.name === 'mcp__comfyui__run' && block.kind === 'tool-result' && !block.isError) {
+        for (const part of block.content || []) if (part.type === 'text') {
+          try { const value = JSON.parse(part.text); if (typeof value.prompt_id === 'string') runIds.add(value.prompt_id); } catch {}
         }
       }
       for (const child of block.subCalls ?? []) visit(child);
@@ -247,9 +281,21 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
       const node = snapshot.nodes.get(key);
       if (node?.kind === 'tool-call') visit(node.data.root);
     }
-    if (!images.length) return null;
+    const ownedTasks = tasks.filter(task => runIds.has(task.promptId));
+    for (const task of ownedTasks) for (const media of task.media || []) {
+      if (seenFiles.has(media.filename) || seenImages.has(media.url)) continue;
+      seenFiles.add(media.filename); seenImages.add(media.url);
+      if (media.kind === 'dsh-comfyui-web.video') images.push(media);
+      else if (media.kind === 'dsh-comfyui-web.image') images.push({ label: media.filename, preview: { url: media.url, name: media.filename } });
+    }
+    if (!images.length && !ownedTasks.length) return null;
+    const labels = { queued: '排队中', running: '生成中', completed: '已完成', failed: '生成失败', cancelled: '已取消', interrupted: '已中断', not_found: '未找到任务', monitor_stopped: '等待重新连接' };
     return h('section', { className: 'dsh-comfy-output', 'aria-label': 'ComfyUI 生成结果' },
+      h('style', null, CSS),
       h('div', { className: 'dsh-comfy-output-head' }, h('strong', null, 'ComfyUI 生成结果')),
+      ownedTasks.map(task => h('div', { key: task.promptId, className: 'dsh-comfy-image-info', role: 'status' },
+        labels[task.status] || task.status, task.progress?.max > 0 ? ' · ' + Math.round(task.progress.value / task.progress.max * 100) + '%' : '',
+        task.result?.error?.message ? ' · ' + task.result.error.message : task.result?.message ? ' · ' + task.result.message : '')),
       h(MessageImages, { images, loadImage, align: 'start' }));
   }
   async function api(body, token, signal) {
@@ -383,7 +429,7 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
       inject: sessionId => {
         const loadImage = attachment => ctx.uiConversation.imageUrl(sessionId, attachment);
         loadImage.peek = attachment => ctx.uiConversation.peekImageUrl(sessionId, attachment);
-        return { resultSource: ctx.uiConversation.binding(sessionId).target('chat'), loadImage };
+        return { resultSource: ctx.uiConversation.binding(sessionId).target('chat'), loadImage, generationSource: taskSource(sessionId) };
       }
     }, ComfyTurnResults)));
     ctx.effect(() => ctx.sidebarRightTabs.register({ id: ID, kind: ID, keepMounted: true, title: () => 'ComfyUI',

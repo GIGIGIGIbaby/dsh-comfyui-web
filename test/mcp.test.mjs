@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, mkdir } from 'node:fs/promises';
+import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ComfyRuntime, BRIDGE_PROTOCOL } from '../lib/runtime.js';
@@ -29,7 +30,7 @@ test('MCP endpoint authenticates, lists real tools, accepts calls, interoperates
   const noAuth = await fetch(runtime.frameOrigin + '/mcp', { method: 'POST', body: '{}' }); assert.equal(noAuth.status, 401);
   const foreign = await fetch(runtime.frameOrigin + '/mcp', { method: 'POST', headers: { Origin: 'https://example.com', Authorization: 'Bearer ' + runtime.token }, body: '{}' }); assert.equal(foreign.status, 403);
   const client = await connectMcp(runtime.frameOrigin + '/mcp', runtime.token);
-  assert.equal(client.initialized, true); assert.equal(client.tools.length, 17);
+  assert.equal(client.initialized, true); assert.equal(client.tools.length, 27);
   const failure = await client.rpc('tools/call', { name: 'get_workflow', arguments: {} }); assert.equal(failure.isError, true);
   const require = createRequire(import.meta.resolve('@deepseek-ai/dsh-mcp-client'));
   const { Client, StreamableHTTPClientTransport } = await import(pathToFileURL(require.resolve('@modelcontextprotocol/client')));
@@ -95,4 +96,37 @@ test('MCP defaults on, disabling persists and blocks tools while preserving manu
   t.after(() => restarted.stop()); assert.equal(restarted.mcpEnabled, false);
   await restarted.setMcpEnabled(true); assert.equal(restarted.mcpEnabled, true);
   assert.equal(JSON.parse(await readFile(configFile, 'utf8')).mcpEnabled, true);
+});
+
+test('native reference tools fence attachment IDs to their session and protect the result event stream', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-comfy-references-')), oldHome = process.env.DSH_HOME;
+  const upstream = http.createServer((req, res) => { req.resume(); res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ name: 'own.png', type: 'input' })); });
+  await new Promise(r => upstream.listen(0, '127.0.0.1', r));
+  await mkdir(join(dir, 'comfyui')); await writeFile(join(dir, 'comfyui', 'config.json'), JSON.stringify({ url: 'http://127.0.0.1:' + upstream.address().port }));
+  process.env.DSH_HOME = dir;
+  const effects = [], tools = [], routes = [], reads = [];
+  const ctx = { effect(fn) { const dispose = fn(); if (typeof dispose === 'function') effects.push(dispose); },
+    get(service) { if (service === 'attachments') return { async readImage(ref) { reads.push(ref.attachmentId); return { data: Buffer.from('fixture') }; } }; },
+    tools: { register(tool) { tools.push(tool); } }, webServer: { register(route) { routes.push(route); } } };
+  t.after(async () => { if (oldHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = oldHome;
+    for (const dispose of effects.reverse()) await dispose(); await new Promise(r => upstream.close(r)); });
+  await apply(ctx);
+  const reference = { attachmentId: 'own-image', mediaType: 'image/png', width: 1, height: 1, bytes: 7 };
+  const exec = { agent: { session: { id: 'own', deriveMessages: () => [{ role: 'user', content: [{ type: 'image', attachment: reference }] }] } } };
+  const listing = await tools.find(tool => tool.name === 'mcp__comfyui__list_reference_images').execute({}, exec);
+  assert.equal(listing.structuredContent.images[0].attachmentId, 'own-image');
+  const upload = tools.find(tool => tool.name === 'mcp__comfyui__upload_image');
+  await assert.rejects(upload.execute({ attachmentId: 'foreign-image' }, exec), /没有该参考图/); assert.equal(reads.length, 0);
+  assert.equal((await upload.execute({ attachmentId: 'own-image' }, exec)).structuredContent.widgetValue, 'own.png');
+  assert.deepEqual(reads, ['own-image']);
+  const route = routes.find(route => route.path === '/dsh-comfyui/events');
+  const server = http.createServer(route.handler); await new Promise(r => server.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise(r => server.close(r)));
+  const base = 'http://127.0.0.1:' + server.address().port;
+  const connection = JSON.parse(await readFile(join(dir, 'comfyui', 'connection.json'), 'utf8'));
+  assert.equal((await fetch(base + '/?sessionId=own&token=bad')).status, 403);
+  const stream = await fetch(base + '/?sessionId=own&token=' + connection.token);
+  assert.equal(stream.headers.get('content-type'), 'text/event-stream');
+  const reader = stream.body.getReader(); const chunk = await reader.read(); await reader.cancel();
+  assert.match(Buffer.from(chunk.value).toString(), /"tasks":\[\]/);
 });

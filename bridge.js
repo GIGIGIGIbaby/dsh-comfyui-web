@@ -2,8 +2,8 @@
   'use strict';
   if (window.__DSH_COMFYUI_BRIDGE_ACTIVE__) return;
   window.__DSH_COMFYUI_BRIDGE_ACTIVE__ = true;
-  const bridgeProtocol = 3;
-  const bridgeVersion = '0.4.0';
+  const bridgeProtocol = 4;
+  const bridgeVersion = '0.5.0';
   const bootstrap = window.__DSH_COMFYUI_BOOTSTRAP__ || {};
   let token = bootstrap.token || __DSH_BRIDGE_TOKEN__;
   const bridgeBase = bootstrap.bridgeBase || location.origin;
@@ -14,8 +14,8 @@
   let parentOrigin;
   if (embedded) { try { parentOrigin = new URL(document.referrer).origin; } catch { return; } }
   let allowAI = embedded; let visible = true; let busy = false;
-  let revision = 0; let lastFingerprint; let initialized = false; let syncOwner;
-  const undo = []; const completed = new Map();
+  let revision = 0; let lastFingerprint; let initialized = false; let syncOwner, syncPath;
+  const histories = new Map(); const completed = new Map();
   const appOf = () => window.comfyAPI?.app?.app;
   const apiOf = () => window.comfyAPI?.api?.api;
   const activeWorkflowOf = app => {
@@ -84,7 +84,7 @@
   async function syncWorkflow(app) {
     const owner = activeWorkflowOf(app);
     if (!owner?.path) return;
-    if (owner !== syncOwner) { syncOwner = owner; revision = 0; initialized = false; lastFingerprint = undefined; }
+    if (owner !== syncOwner || owner.path !== syncPath) { syncOwner = owner; syncPath = owner.path; revision = 0; initialized = false; lastFingerprint = undefined; }
     const workflow = snapshot(app); const current = fingerprint(workflow);
     const changed = initialized && current !== lastFingerprint;
     const update = await send('sync', { workflowKey: owner.path, revision, ...(!initialized || changed ? { workflow, fingerprint: current } : {}) });
@@ -101,7 +101,34 @@
     } else lastFingerprint = current;
     revision = update.revision; initialized = true;
   }
-  function remember(app) { undo.push({ workflow: snapshot(app), owner: activeWorkflowOf(app) }); if (undo.length > 20) undo.shift(); }
+  const historyKey = app => 'dsh.comfyui.history.' + encodeURIComponent(location.origin + ':' + sessionId + ':' + activeWorkflowOf(app).path);
+  function historyOf(app) {
+    const key = historyKey(app);
+    if (!histories.has(key)) {
+      let saved;
+      try { saved = JSON.parse(globalThis.localStorage?.getItem?.(key) || 'null'); } catch {}
+      histories.set(key, saved?.version === 1 && Array.isArray(saved.undo) && Array.isArray(saved.redo) ? saved : { version: 1, undo: [], redo: [] });
+    }
+    return histories.get(key);
+  }
+  function saveHistory(app, history) {
+    const key = historyKey(app);
+    for (;;) {
+      try { globalThis.localStorage?.setItem?.(key, JSON.stringify(history)); break; }
+      catch {
+        if (history.undo.length > 1) history.undo.shift();
+        else if (history.redo.length > 1) history.redo.shift();
+        else throw new Error('工作流快照保存失败，浏览器存储空间不足；本次修改未提交，请清理空间后重试');
+      }
+    }
+    histories.set(key, history);
+  }
+  function graphHash(app) {
+    const text = fingerprint(snapshot(app)); let hash = 2166136261;
+    for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
+    return String(hash >>> 0);
+  }
+  const checkpoint = (app, label) => ({ id: crypto.randomUUID(), time: Date.now(), label, workflow: snapshot(app) });
   function workflowStore(app) {
     const store = app.extensionManager?.workflow;
     if (!store?.getWorkflowByPath || !store?.createNewTemporary) throw new Error('此 ComfyUI 前端未提供工作流标签页接口，请更新前端');
@@ -138,11 +165,91 @@
       inputs: (n.inputs || []).map((i, slot) => ({ name: i.name, type: i.type, slot, link: i.link ?? null })),
       outputs: (n.outputs || []).map((o, slot) => ({ name: o.name, type: o.type, slot, links: o.links || [] })) }));
   }
-  async function execute(command) {
+  async function executeAction(command) {
     const app = appOf(); const args = command.args || {};
     if (!allowAI) throw new Error('此面板已关闭 AI 操作');
     if (!graphReady(app)) throw new Error('ComfyUI 工作流尚未就绪');
     switch (command.action) {
+      case 'save_workflow':
+      case 'save_as_workflow': {
+        const store = workflowStore(app), active = activeWorkflowOf(app);
+        if (!store.saveWorkflow || !store.saveAs) throw new Error('当前 ComfyUI 前端没有工作流保存接口');
+        const name = args.name;
+        if (name !== undefined && (typeof name !== 'string' || !name.trim() || name.length > 180 || /[\\/:*?"<>|\x00-\x1f]/.test(name) || /^\.+$/.test(name))) throw new Error('请提供有效的工作流文件名称');
+        active.changeTracker?.prepareForSave();
+        const targetPath = name ? (active.directory || active.path.slice(0, active.path.lastIndexOf('/'))) + '/' + name.replace(/\.json$/i, '') + '.json' : active.path;
+        if (targetPath === active.path) {
+          if (command.action === 'save_as_workflow') throw new Error('另存时请使用一个新的文件名称');
+          await store.saveWorkflow(active);
+        } else {
+          await store.syncWorkflows?.();
+          if (store.getWorkflowByPath(targetPath)) throw new Error('同名工作流已存在，请使用其他名称；不会覆盖已有文件');
+          if (command.action === 'save_workflow' && !active.isPersisted) {
+            const history = historyOf(app);
+            if (!store.renameWorkflow) throw new Error('当前 ComfyUI 不支持工作流重命名保存');
+            await store.renameWorkflow(active, targetPath); saveHistory(app, history);
+            await store.saveWorkflow(active);
+          } else {
+            const target = store.saveAs(active, targetPath);
+            try { await openWorkflow(app, target, await workflowData(app, target)); target.changeTracker?.prepareForSave(); await store.saveWorkflow(target); }
+            catch (error) {
+              if (activeWorkflowOf(app) !== active) await openWorkflow(app, active, await workflowData(app, active));
+              if (!target.isPersisted) await store.closeWorkflow?.(target); throw error;
+            }
+          }
+        }
+        return { saved: true, workflow: describeWorkflow(store, store.activeWorkflow) };
+      }
+      case 'edit_graph': {
+        if (!Array.isArray(args.operations) || args.operations.length < 1 || args.operations.length > 100) throw new Error('operations 必须包含 1–100 项');
+        const graph = app.graph, aliases = new Map(), changed = [];
+        const nodeOf = id => { const node = aliases.get(String(id)) || graph.getNodeById(id); if (!node || node.graph !== graph) throw new Error('节点不存在：' + id); return node; };
+        const position = value => { if (!Array.isArray(value) || value.length !== 2 || !value.every(Number.isFinite)) throw new Error('position 必须是两个有限数字'); return value; };
+        for (const operation of args.operations) {
+          if (operation.op === 'create_node') {
+            const node = window.LiteGraph?.createNode(operation.nodeType);
+            if (!node) throw new Error('节点类型不存在：' + operation.nodeType);
+            if (operation.ref && (aliases.has(operation.ref) || graph.getNodeById(operation.ref))) throw new Error('新节点 ref 重复：' + operation.ref);
+            if (operation.position) node.pos = position(operation.position);
+            if (operation.title) node.title = operation.title;
+            graph.add(node); if (operation.ref) aliases.set(operation.ref, node);
+            changed.push({ op: operation.op, ref: operation.ref || null, nodeId: String(node.id) });
+          } else if (operation.op === 'delete_node') {
+            const node = nodeOf(operation.nodeId); graph.remove(node); changed.push({ op: operation.op, nodeId: String(node.id) });
+          } else if (operation.op === 'move_node') {
+            const node = nodeOf(operation.nodeId); node.pos = position(operation.position); changed.push({ op: operation.op, nodeId: String(node.id) });
+          } else if (operation.op === 'connect') {
+            const from = nodeOf(operation.fromNodeId), to = nodeOf(operation.toNodeId);
+            if (!Number.isInteger(operation.fromSlot) || !from.outputs?.[operation.fromSlot] || !Number.isInteger(operation.toSlot) || !to.inputs?.[operation.toSlot]) throw new Error('连接插槽不存在，请先 list_nodes');
+            const link = from.connect(operation.fromSlot, to, operation.toSlot);
+            if (!link) throw new Error('连接失败，插槽类型不兼容');
+            changed.push({ op: operation.op, linkId: link.id });
+          } else if (operation.op === 'disconnect') {
+            const node = nodeOf(operation.nodeId);
+            if (!Number.isInteger(operation.toSlot) || !node.inputs?.[operation.toSlot]) throw new Error('输入插槽不存在');
+            node.disconnectInput(operation.toSlot); changed.push({ op: operation.op, nodeId: String(node.id) });
+          } else throw new Error('未知节点操作：' + operation.op);
+        }
+        app.graph.setDirtyCanvas(true, true); return { changed, nodes: nodes(app) };
+      }
+      case 'bind_image': {
+        const node = app.graph.getNodeById(args.nodeId), widget = node?.widgets?.find(widget => widget.name === args.widget);
+        if (!widget || widget.type === 'button') throw new Error('目标图片参数不存在，请先 list_nodes 获取准确 nodeId/widget');
+        if (Array.isArray(widget.options?.values) && !widget.options.values.includes(args.value)) widget.options.values.push(args.value);
+        widget.value = args.value; widget.callback?.(args.value, app.canvas, node);
+        app.graph.setDirtyCanvas(true, true); return { nodeId: String(node.id), widget: widget.name, value: widget.value };
+      }
+      case 'list_edits': {
+        const history = historyOf(app);
+        return { workflowPath: activeWorkflowOf(app).path, checkpoints: [...history.undo].reverse().map(item => ({
+          checkpointId: item.id, time: item.time, label: item.label, nodes: item.workflow.nodes.length
+        })), canRedo: history.redo.length > 0 };
+      }
+      case 'restore_edit': {
+        const saved = historyOf(app).undo.find(item => item.id === args.checkpointId);
+        if (!saved) throw new Error('当前工作流没有该快照，请先 list_edits');
+        await replaceCurrentWorkflow(app, saved.workflow); return { restored: true, checkpointId: saved.id, nodes: nodes(app) };
+      }
       case 'list_workflows': {
         const store = workflowStore(app);
         await store.syncWorkflows?.();
@@ -187,7 +294,6 @@
           if (typeof change.value === 'number' && ((widget.options?.min != null && change.value < widget.options.min) || (widget.options?.max != null && change.value > widget.options.max))) throw new Error(widget.name + ' 超出节点允许的范围');
           return { node, widget, value: change.value, before: clone(widget.value) };
         });
-        remember(app);
         for (const edit of edits) edit.widget.value = edit.value;
         for (const edit of edits) edit.widget.callback?.(edit.value, app.canvas, edit.node);
         app.graph.setDirtyCanvas(true, true);
@@ -195,15 +301,21 @@
       }
       case 'load_workflow': {
         if (!args.workflow || !Array.isArray(args.workflow.nodes) || !Array.isArray(args.workflow.links)) throw new Error('请提供普通 ComfyUI 工作流 JSON（包含 nodes、links），不是 API prompt');
-        remember(app);
         await replaceCurrentWorkflow(app, args.workflow);
         return { loaded: true, nodes: nodes(app) };
       }
-      case 'undo': {
-        if (!undo.length) throw new Error('没有可撤销的 AI 修改');
-        const previous = undo.at(-1);
-        if (previous.owner !== activeWorkflowOf(app)) throw new Error('当前工作流已切换，请返回原工作流再撤销');
-        await replaceCurrentWorkflow(app, previous.workflow); undo.pop();
+      case 'undo':
+      case 'redo': {
+        const history = clone(historyOf(app));
+        const source = command.action === 'undo' ? history.undo : history.redo;
+        if (!source.length) throw new Error('当前工作流已切换或没有可' + (command.action === 'undo' ? '撤销' : '重做') + '的 AI 修改');
+        if (history.expectedHash && history.expectedHash !== graphHash(app)) throw new Error('工作流又被手动或其他页面修改了，请先 list_edits，再明确使用 restore_edit 恢复所需快照');
+        const before = snapshot(app), reverse = checkpoint(app, command.action);
+        try {
+          await replaceCurrentWorkflow(app, source.pop().workflow);
+          (command.action === 'undo' ? history.redo : history.undo).push(reverse);
+          history.expectedHash = graphHash(app); saveHistory(app, history);
+        } catch (error) { await replaceCurrentWorkflow(app, before); throw error; }
         return { restored: true, nodes: nodes(app) };
       }
       case 'run': {
@@ -214,6 +326,22 @@
         return { submitted: true, ...result };
       }
       default: throw new Error('未知面板操作：' + command.action);
+    }
+  }
+  async function execute(command) {
+    const writes = ['update_nodes', 'bind_image', 'load_workflow', 'edit_graph', 'restore_edit'];
+    if (!writes.includes(command.action)) return executeAction(command);
+    const app = appOf();
+    if (!allowAI || !graphReady(app)) return executeAction(command);
+    const before = snapshot(app), history = clone(historyOf(app)), pending = clone(history);
+    pending.undo.push(checkpoint(app, command.action)); pending.undo = pending.undo.slice(-20); pending.redo = [];
+    saveHistory(app, pending);
+    try {
+      const result = await executeAction(command);
+      pending.expectedHash = graphHash(app); saveHistory(app, pending); return result;
+    } catch (error) {
+      if (fingerprint(snapshot(app)) !== fingerprint(before)) await replaceCurrentWorkflow(app, before);
+      saveHistory(app, history); throw error;
     }
   }
   async function poll() {
@@ -228,7 +356,7 @@
         if (!reply) {
           try {
             reply = { id: command.id, result: await execute(command) };
-            if (['update_nodes', 'load_workflow', 'undo', 'switch_workflow', 'new_workflow'].includes(command.action)) await syncWorkflow(appOf());
+            if (['update_nodes', 'bind_image', 'load_workflow', 'undo', 'redo', 'restore_edit', 'edit_graph', 'save_workflow', 'save_as_workflow', 'switch_workflow', 'new_workflow'].includes(command.action)) await syncWorkflow(appOf());
           }
           catch (e) { reply = { id: command.id, error: e.message || String(e) }; }
           completed.set(command.id, reply);
