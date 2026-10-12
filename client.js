@@ -54,24 +54,20 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     .dsh-comfy-zoom button { padding:3px 7px; min-width:26px; }
     .dsh-comfy-note { padding:8px 12px; font-size:12px; background:#d28b3514; border-bottom:1px solid #d28b3540; overflow-wrap:anywhere; }
     .dsh-comfy-empty { padding:24px; line-height:1.7; font-size:13px; }
-    .dsh-comfy-images { display:flex; flex-wrap:wrap; gap:10px; max-width:100%; }
+    .dsh-comfy-images { display:flex; flex-wrap:wrap; align-items:flex-start; gap:16px; max-width:100%; min-width:0; }
     .dsh-comfy-images[data-align=end] { justify-content:flex-end; }
-    .dsh-comfy-image-card { position:relative; flex:none; }
-    .dsh-comfy-image { display:grid; place-items:center; position:relative; min-width:44px; min-height:44px; padding:0; overflow:hidden; border:1px solid #80808040; border-radius:16px; background:var(--dsw-alias-interactive-bg-hover,#80808018); color:inherit; cursor:zoom-in; }
-    .dsh-comfy-image[data-variant=tile] { width:64px; height:64px; }
-    .dsh-comfy-image[data-variant=thumbnail] { width:48px; height:48px; border-radius:10px; }
-    .dsh-comfy-image img { display:block; width:100%; height:100%; object-fit:cover; }
-    .dsh-comfy-image[data-variant=thumbnail] img { object-fit:contain; }
+    .dsh-comfy-image-card { position:relative; flex:none; max-width:100%; min-width:0; }
+    .dsh-comfy-image { display:block; position:relative; box-sizing:border-box; width:100%; min-width:0; min-height:0; padding:0; overflow:hidden; border:1px solid #80808040; border-radius:16px; background:var(--dsw-alias-interactive-bg-hover,#80808018); color:inherit; cursor:zoom-in; }
+    .dsh-comfy-image img { position:absolute; inset:0; display:block; width:100%; height:100%; object-fit:contain; }
     .dsh-comfy-image[data-blurred=true] img { filter:blur(28px) brightness(.65); transform:scale(1.15); }
     .dsh-comfy-image-mask { display:flex; position:absolute; inset:0; align-items:center; justify-content:center; flex-direction:column; gap:8px; background:#1b202a26; color:#fff; font-size:12px; text-shadow:0 1px 4px #0009; pointer-events:none; }
-    .dsh-comfy-image[data-variant=tile] .dsh-comfy-image-mask span,.dsh-comfy-image[data-variant=thumbnail] .dsh-comfy-image-mask span { display:none; }
     .dsh-comfy-image:focus-visible { outline:2px solid #aaa; outline-offset:3px; }
     .dsh-comfy-image-eye { display:grid; place-items:center; position:absolute; top:6px; left:6px; z-index:1; width:28px; height:28px; padding:0; border:1px solid #ffffff35; border-radius:8px; background:#35383dcc; color:#eee; cursor:pointer; backdrop-filter:blur(8px); opacity:0; pointer-events:none; }
     .dsh-comfy-image-card:hover .dsh-comfy-image-eye,.dsh-comfy-image-card:has(:focus-visible) .dsh-comfy-image-eye { opacity:1; pointer-events:auto; }
     .dsh-comfy-image-eye:hover { background:#555960e6; }
     .dsh-comfy-image-eye:focus-visible { outline:2px solid #aaa; outline-offset:2px; }
     @media (hover:none) { .dsh-comfy-image-eye { opacity:1; pointer-events:auto; } }
-    .dsh-comfy-image-info { max-width:240px; padding:6px 0 0; font-size:11px; opacity:.65; overflow-wrap:anywhere; }
+    .dsh-comfy-image-info { max-width:100%; padding:6px 0 0; font-size:11px; opacity:.65; overflow-wrap:anywhere; }
     .dsh-comfy-output { display:grid; gap:8px; padding:8px 0; }
     .dsh-comfy-output-head { display:flex; align-items:center; gap:8px; font-size:12px; }
     .dsh-comfy-output-head strong { font-weight:500; margin-right:auto; }
@@ -84,7 +80,7 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
       h('path', { d: 'M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z' }),
       h('circle', { cx: 12, cy: 12, r: 3 }), hidden ? h('path', { d: 'M3 3l18 18', strokeWidth: 2 }) : null);
   }
-  function OutputImage({ image, loadImage, variant, protectedImage }) {
+  function OutputImage({ image, loadImage, protectedImage }) {
     const attachment = image.attachment;
     const preview = image.preview;
     const imageKey = attachment ? attachment.attachmentId : preview?.url;
@@ -92,19 +88,15 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     const [attempt, setAttempt] = useState(0);
     const [open, setOpen] = useState(false);
     const [override, setOverride] = useState(null);
+    const [naturalSize, setNaturalSize] = useState(null);
     const src = preview?.url ?? (loaded.key === imageKey ? loaded.src : null);
     const error = loaded.key === imageKey && loaded.error;
     const label = image.label ?? preview?.name ?? attachment?.name ?? '图片';
-    const dimensions = attachment ?? preview;
-    let fit;
-    if (variant === 'single') {
-      const width = dimensions?.width, height = dimensions?.height;
-      const natural = width > 0 && height > 0 ? width / height : 1;
-      const ratio = Math.min(4, Math.max(.25, natural));
-      const box = ratio >= 1 ? { width: 240, height: 240 / ratio } : { width: 240 * ratio, height: 240 };
-      const scale = width > 0 && height > 0 ? Math.min(1, width / box.width, height / box.height) : 1;
-      fit = { width: Math.max(1, Math.round(box.width * scale)), height: Math.max(1, Math.round(box.height * scale)) };
-    }
+    const recordedSize = attachment ?? preview;
+    const dimensions = recordedSize?.width > 0 && recordedSize?.height > 0 ? recordedSize
+      : naturalSize?.key === imageKey ? naturalSize : { width: 360, height: 360 };
+    const scale = Math.min(1, 360 / dimensions.width, 540 / dimensions.height);
+    const cardWidth = dimensions.width * scale;
     useEffect(() => {
       let live = true;
       setOpen(false);
@@ -121,8 +113,9 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     const blurred = protectedImage && (override?.key === imageKey && override.baseline === protectedImage ? override.value : true);
     const mask = blurred && src !== null && !error;
     return h(React.Fragment, null,
-      h('div', { className: 'dsh-comfy-image-card' },
-      h('button', { type: 'button', className: 'dsh-comfy-image', 'data-variant': variant, 'data-blurred': mask ? 'true' : 'false', style: fit,
+      h('div', { className: 'dsh-comfy-image-card', style: { width: cardWidth } },
+      h('button', { type: 'button', className: 'dsh-comfy-image', 'data-blurred': mask ? 'true' : 'false',
+        style: { aspectRatio: dimensions.width + ' / ' + dimensions.height },
         title: error ? '加载失败，点击重试' : mask ? '图片已遮挡，点击显示图片' : '点击查看原图',
         'aria-label': error ? '重新加载图片' : (mask ? '显示已遮挡图片：' : '查看原图：') + label,
         'aria-busy': !error && src === null,
@@ -134,24 +127,27 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
         } },
         error ? h('span', { className: 'dsh-comfy-image-error' }, '加载失败，点击重试') : src === null
           ? h('span', { className: 'dsh-comfy-image-loading' }, '加载图片…')
-          : h('img', { src, alt: label, style: variant === 'single' ? { objectPosition: (dimensions?.width / dimensions?.height) < .25 ? 'center top' : (dimensions?.width / dimensions?.height) > 4 ? 'left center' : 'center' } : undefined }),
+          : h('img', { src, alt: label, onLoad: event => {
+            const img = event.currentTarget;
+            if (!(recordedSize?.width > 0 && recordedSize?.height > 0) && img.naturalWidth > 0 && img.naturalHeight > 0)
+              setNaturalSize({ key: imageKey, width: img.naturalWidth, height: img.naturalHeight });
+          } }),
         mask ? h('span', { className: 'dsh-comfy-image-mask', 'aria-hidden': true },
           h(Eye, { hidden: true, size: 22 }),
           h('span', null, '点击显示图片')) : null),
       protectedImage && src !== null && !error ? h('button', { type: 'button', className: 'dsh-comfy-image-eye', 'aria-pressed': mask,
         'aria-label': (mask ? '显示图片：' : '模糊图片：') + label, title: mask ? '显示这张图片' : '模糊这张图片',
         onClick: () => setOverride({ key: imageKey, baseline: protectedImage, value: !mask }) }, h(Eye, { hidden: mask })) : null,
-      variant === 'single' ? h('div', { className: 'dsh-comfy-image-info' }, label,
-        dimensions?.width && dimensions?.height ? ' · ' + dimensions.width + ' × ' + dimensions.height : '') : null),
+      h('div', { className: 'dsh-comfy-image-info' }, label,
+        dimensions?.width && dimensions?.height ? ' · ' + dimensions.width + ' × ' + dimensions.height : '')),
       open && src !== null ? h(ImageLightbox, { src, alt: label, labels: { dialog: '原图预览', close: '关闭原图预览' }, onClose: close }) : null);
   }
-  function MessageImages({ images, loadImage, align, compact = false, thumbnail = false }) {
+  function MessageImages({ images, loadImage, align }) {
     const enabled = useImagePrivacy();
-    const variant = thumbnail ? 'thumbnail' : compact || images.length > 1 ? 'tile' : 'single';
     if (!images.length) return null;
     return h(React.Fragment, null, h('style', null, CSS), h('div', { className: 'dsh-comfy-images', 'data-align': align },
       images.map((image, index) => h(OutputImage, { key: (image.attachment?.attachmentId ?? image.preview?.url) + ':' + index,
-        image, loadImage, variant, protectedImage: enabled }))));
+        image, loadImage, protectedImage: enabled }))));
   }
   function resultImages(block) {
     if (block.kind !== 'tool-result' || block.isError || !Array.isArray(block.content)) return [];
