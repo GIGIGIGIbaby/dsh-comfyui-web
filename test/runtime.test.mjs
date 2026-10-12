@@ -160,8 +160,10 @@ test('browser bridge edits actual named widgets, validates whole batch and resto
   vm.runInContext(code, context);
   const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(r => setImmediate(r)); };
   await flush();
-  async function command(action, args = {}) { commands.push({ id: String(results.length), action, args }); scheduled.shift()(); await flush(); return results.at(-1); }
+  async function command(action, args = {}, expiresAt) { commands.push({ id: String(results.length), action, args, expiresAt }); scheduled.shift()(); await flush(); return results.at(-1); }
   assert.equal(messages.at(-1).ready, true);
+  assert.match((await command('update_nodes', { changes: [{ nodeId: '6', widget: 'text', value: 'expired change' }] }, 1)).error, /过期/);
+  assert.equal(widget.value, 'original', 'a delayed expired command must not modify the graph');
   assert.equal((await command('list_nodes')).result.nodes[0].widgets[0].name, 'text');
   assert.match((await command('update_nodes', { changes: [{ nodeId: '6', widget: 'text', value: 'changed' }, { nodeId: '7', widget: 'text', value: 'bad' }] })).error, /不存在/);
   assert.equal(widget.value, 'original');

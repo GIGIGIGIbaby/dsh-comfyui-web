@@ -2,8 +2,8 @@
   'use strict';
   if (window.__DSH_COMFYUI_BRIDGE_ACTIVE__) return;
   window.__DSH_COMFYUI_BRIDGE_ACTIVE__ = true;
-  const bridgeProtocol = 4;
-  const bridgeVersion = '0.5.0';
+  const bridgeProtocol = 5;
+  const bridgeVersion = '0.5.1';
   const bootstrap = window.__DSH_COMFYUI_BOOTSTRAP__ || {};
   let token = bootstrap.token || __DSH_BRIDGE_TOKEN__;
   const bridgeBase = bootstrap.bridgeBase || location.origin;
@@ -16,6 +16,7 @@
   let allowAI = embedded; let visible = true; let busy = false;
   let revision = 0; let lastFingerprint; let initialized = false; let syncOwner, syncPath;
   const histories = new Map(); const completed = new Map();
+  const commandQueue = []; let handlingCommands = false, commandStream, reconnectTimer;
   const appOf = () => window.comfyAPI?.app?.app;
   const apiOf = () => window.comfyAPI?.api?.api;
   const activeWorkflowOf = app => {
@@ -38,7 +39,9 @@
   const notify = data => { if (embedded) window.parent.postMessage({ source: 'dsh-comfyui', clientId, ...data }, parentOrigin); };
   window.addEventListener('message', event => {
     if (!embedded || event.source !== window.parent || event.origin !== parentOrigin || event.data?.source !== 'dsh-comfyui-parent' || event.data.clientId !== clientId) return;
+    const changed = allowAI !== (event.data.allowAI === true) || visible !== (event.data.visible === true);
     allowAI = event.data.allowAI === true; visible = event.data.visible === true;
+    if (changed) send('state', {}).catch(() => {});
   });
   const send = async (path, data) => {
     const r = await fetch(bridgeBase + '/__dsh_comfyui/' + path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Dsh-Comfy-Token': token }, body: JSON.stringify({ clientId, sessionId, ...diagnostics(), ...data }) });
@@ -329,6 +332,7 @@
     }
   }
   async function execute(command) {
+    if (command.expiresAt && Date.now() > command.expiresAt) throw new Error('此指令已经过期，未执行；请恢复连接后读取当前状态再操作');
     const writes = ['update_nodes', 'bind_image', 'load_workflow', 'edit_graph', 'restore_edit'];
     if (!writes.includes(command.action)) return executeAction(command);
     const app = appOf();
@@ -345,16 +349,26 @@
     }
   }
   async function poll() {
-    if (busy) return; busy = true;
+    if (busy || handlingCommands) { setTimeout(poll, 750); return; } busy = true;
     try {
       const ready = graphReady(appOf());
       if (ready) await syncWorkflow(appOf());
       const response = await send('poll', {});
       notify({ ready, allowAI });
-      for (const command of response.commands || []) {
+      commandQueue.push(...response.commands || []);
+    } catch (e) { notify({ ready: false, error: e.message }); }
+    finally { busy = false; handleCommands(); setTimeout(poll, 750); }
+  }
+  async function handleCommands() {
+    if (busy || handlingCommands) return;
+    handlingCommands = true;
+    try {
+      while (commandQueue.length) {
+        const command = commandQueue.shift();
         let reply = completed.get(command.id);
         if (!reply) {
           try {
+            if (graphReady(appOf())) await syncWorkflow(appOf());
             reply = { id: command.id, result: await execute(command) };
             if (['update_nodes', 'bind_image', 'load_workflow', 'undo', 'redo', 'restore_edit', 'edit_graph', 'save_workflow', 'save_as_workflow', 'switch_workflow', 'new_workflow'].includes(command.action)) await syncWorkflow(appOf());
           }
@@ -365,7 +379,25 @@
         await send('result', reply);
       }
     } catch (e) { notify({ ready: false, error: e.message }); }
-    finally { busy = false; setTimeout(poll, 750); }
+    finally { handlingCommands = false; }
   }
+  async function connectCommands() {
+    if (typeof EventSource !== 'function') return;
+    clearTimeout(reconnectTimer); commandStream?.close();
+    try {
+      const response = await fetch(bridgeBase + '/__dsh_comfyui/bootstrap');
+      const data = await response.json();
+      if (!response.ok || data.bridgeProtocol !== bridgeProtocol) throw new Error('同步代码已更新，请刷新 ComfyUI 页面');
+      if (token !== data.token) { token = data.token; initialized = false; revision = 0; }
+      const stream = commandStream = new EventSource(bridgeBase + '/__dsh_comfyui/commands?' + new URLSearchParams({ token, clientId, sessionId, bridgeProtocol }));
+      stream.onopen = () => { send('state', {}).catch(() => {}); };
+      stream.onmessage = event => { try { commandQueue.push(...JSON.parse(event.data).commands || []); handleCommands(); } catch {} };
+      stream.onerror = () => { stream.close(); reconnectTimer = setTimeout(connectCommands, 2000); };
+    } catch (error) { notify({ ready: false, error: error.message }); reconnectTimer = setTimeout(connectCommands, 2000); }
+  }
+  document.addEventListener?.('visibilitychange', () => { send('state', {}).catch(() => {}); handleCommands(); });
+  window.addEventListener('pagehide', () => { commandStream?.close(); clearTimeout(reconnectTimer); });
+  window.addEventListener('pageshow', event => { if (event.persisted) connectCommands(); });
+  connectCommands();
   poll();
 })();
