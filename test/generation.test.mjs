@@ -115,3 +115,56 @@ test('dsh background completion job is owned, reports once, and cancels only mon
   assert.throws(() => runWithCompletionJob({ start() { throw new Error('no controller'); } }, 'owner', async () => { unsafeSubmissions++; }, monitor), /no controller/);
   assert.equal(unsafeSubmissions, 0, 'failed job admission must never submit a generation');
 });
+
+test('minimal agents submit once without a job controller and retain event-driven completion results', async t => {
+  const { runtime, monitor, pending, history } = fixture(t);
+  let submissions = 0, starts = 0;
+  runtime.command = async () => {
+    submissions++; pending.add('minimal'); return { submitted: true, prompt_id: 'minimal' };
+  };
+  const jobs = { start() {
+    starts++;
+    throw new Error('background jobs unavailable: no job controller serves this agent (load @deepseek-ai/dsh-tool-jobs in its composition)');
+  } };
+  const result = await runWithCompletionJob(jobs, 'owner',
+    signal => callComfyTool(runtime, 'run', {}, { dshSessionId: 'owner' }, signal), monitor);
+  assert.equal(submissions, 1); assert.equal(starts, 1);
+  assert.equal(result.structuredContent.submitted, true);
+  assert.equal(result.structuredContent.completionEvents, true);
+  assert.equal(result.structuredContent.completionNotification, false);
+  assert.match(result.structuredContent.completionNotificationReason, /不会自动唤醒 AI/);
+  assert.equal(JSON.parse(result.content[0].text).completionNotification, false);
+  assert.equal(result.structuredContent.job_id, undefined);
+  const waiting = monitor.wait('minimal', 'owner');
+  history.minimal = { status: { status_str: 'success' }, outputs: { 9: { images: [{ filename: 'minimal.png' }] } } };
+  pending.clear(); monitor.socket.emit('status', {});
+  assert.equal((await waiting).images[0].filename, 'minimal.png');
+  assert.equal(submissions, 1, 'completion must not submit another generation');
+});
+
+test('an absent jobs service uses the same submission, preserves abort and returns original failures', async () => {
+  const controller = new AbortController(); let submissions = 0;
+  const result = await runWithCompletionJob(undefined, 'owner', async signal => {
+    submissions++; assert.equal(signal, controller.signal);
+    return { content: [], structuredContent: { submitted: true, prompt_id: 'no-service' } };
+  }, {}, controller.signal);
+  assert.equal(submissions, 1); assert.equal(result.structuredContent.completionNotification, false);
+  const failure = { isError: true, content: [{ type: 'text', text: '面板连接已断开' }] };
+  assert.equal(await runWithCompletionJob(undefined, 'owner', async () => failure, {}), failure);
+});
+
+test('capacity failures and exceptions after the producer starts never trigger a second submission', async () => {
+  let submissions = 0;
+  const invoke = async () => { submissions++; return { isError: true, content: [{ type: 'text', text: 'fixture' }] }; };
+  assert.throws(() => runWithCompletionJob({ start() { throw new Error('background job limit reached for this owner'); } },
+    'owner', invoke, {}), /job limit/);
+  assert.equal(submissions, 0);
+  let hooks;
+  const jobs = { start(spec) {
+    hooks = spec.run({ id: 'fixture-job' });
+    throw new Error('background jobs unavailable: no job controller serves this agent');
+  } };
+  assert.throws(() => runWithCompletionJob(jobs, 'owner', invoke, {}), /no job controller/);
+  await hooks.done;
+  assert.equal(submissions, 1, 'an invoked producer must never fall back and run again');
+});

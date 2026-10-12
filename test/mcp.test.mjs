@@ -4,12 +4,81 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { mkdtemp, readFile, writeFile, mkdir } from 'node:fs/promises';
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ComfyRuntime, BRIDGE_PROTOCOL } from '../lib/runtime.js';
 import { WorkflowSync } from '../lib/sync.js';
 import { connectMcp } from '../lib/mcp.js';
 import { apply } from '../lib/host.js';
+
+test('native MCP run works with a global jobs service but no controller in the minimal agent', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-comfy-minimal-')), previousHome = process.env.DSH_HOME;
+  const effects = [], tools = [], sockets = new Set();
+  let completed = false, runCommands = 0;
+  const upstream = http.createServer((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify(req.url === '/queue' ? { queue_running: [], queue_pending: completed ? [] : [[0, 'minimal-prompt']] }
+      : req.url.startsWith('/history') ? completed ? { 'minimal-prompt': { status: { status_str: 'success' },
+        outputs: { 9: { images: [{ filename: 'minimal.png', type: 'output', subfolder: '' }] } } } } : {}
+      : { system: {} }));
+  });
+  upstream.on('upgrade', (req, socket) => {
+    sockets.add(socket); socket.on('close', () => sockets.delete(socket));
+    const accept = createHash('sha1').update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n');
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  t.after(async () => {
+    for (const dispose of effects.reverse()) await dispose();
+    for (const socket of sockets) socket.destroy();
+    await new Promise(resolve => upstream.close(resolve));
+    if (previousHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = previousHome;
+  });
+  process.env.DSH_HOME = directory;
+  await mkdir(join(directory, 'comfyui'));
+  await writeFile(join(directory, 'comfyui', 'config.json'), JSON.stringify({ url: 'http://127.0.0.1:' + upstream.address().port }));
+  const jobs = { start() { throw new Error('background jobs unavailable: no job controller serves this agent (load @deepseek-ai/dsh-tool-jobs in its composition)'); } };
+  await apply({ get(name) { if (name === 'jobs') return jobs; },
+    effect(fn) { const dispose = fn(); if (typeof dispose === 'function') effects.push(dispose); return dispose; },
+    tools: { register(tool) { tools.push(tool); } }, webServer: { register() {} } });
+  const { endpoint, token } = JSON.parse(await readFile(join(directory, 'comfyui', 'connection.json'), 'utf8'));
+  const base = new URL(endpoint).origin;
+  async function bridge(path, extra = {}) {
+    const response = await fetch(base + '/__dsh_comfyui/' + path, { method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Dsh-Comfy-Token': token },
+      body: JSON.stringify({ clientId: 'minimal-panel', sessionId: 'owner', bridgeProtocol: BRIDGE_PROTOCOL,
+        ready: true, allowAI: true, visible: true, ...extra }) });
+    return response.json();
+  }
+  await bridge('poll');
+  const execution = { agent: { session: { id: 'owner' }, ctx: { get: () => jobs } }, signal: new AbortController().signal };
+  const submitted = tools.find(tool => tool.name === 'mcp__comfyui__run').execute({}, execution);
+  let commands = [];
+  for (let attempt = 0; attempt < 60 && !commands.length; attempt++) {
+    commands = (await bridge('poll')).commands;
+    if (!commands.length) await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(commands.length, 1); assert.equal(commands[0].action, 'run'); runCommands++;
+  await bridge('result', { id: commands[0].id, result: { submitted: true, prompt_id: 'minimal-prompt' } });
+  const result = await submitted;
+  assert.equal(result.structuredContent.completionNotification, false);
+  assert.equal(result.structuredContent.prompt_id, 'minimal-prompt');
+  const status = await tools.find(tool => tool.name === 'mcp__comfyui__server_info').execute({}, execution);
+  assert.equal(status.structuredContent.completionNotificationsAvailable, false);
+  completed = true;
+  const message = Buffer.from(JSON.stringify({ type: 'status', data: {} }));
+  for (const socket of sockets) socket.write(Buffer.concat([Buffer.from([0x81, message.length]), message]));
+  let tasks;
+  for (let attempt = 0; attempt < 60; attempt++) {
+    tasks = (await tools.find(tool => tool.name === 'mcp__comfyui__list_tasks').execute({}, execution)).structuredContent.tasks;
+    if (tasks[0]?.status === 'completed') break;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(tasks[0].status, 'completed'); assert.equal(tasks[0].media[0].filename, 'minimal.png');
+  assert.equal((await bridge('poll')).commands.length, 0);
+  assert.equal(runCommands, 1);
+});
 
 test('shared canvas accepts changes, delivers them to other tabs, and preserves conflicting edit', () => {
   const sync = new WorkflowSync();
