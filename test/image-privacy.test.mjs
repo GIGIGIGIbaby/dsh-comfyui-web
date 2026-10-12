@@ -25,8 +25,9 @@ test('image privacy only owns the ComfyUI image tool and leaves dsh image slots 
   assert.equal(registrations.some(row => globalImageSlots.includes(row.def.name)), false,
     'privacy must not replace renderers for unrelated dsh images');
   const toolViews = registrations.filter(row => row.def.name === 'tool.call.toolview');
-  assert.equal(toolViews.length, 1);
+  assert.equal(toolViews.length, 2);
   assert.equal(toolViews[0].def.key, 'mcp__comfyui__get_image');
+  assert.equal(toolViews[1].def.key, 'mcp__comfyui__get_video');
   for (const toolName of ['read_image', 'mcp__other__get_image', 'mcp__comfyui__history']) {
     assert.equal(toolViews[0].component({ toolName, block: {} }), null,
       'an unrelated tool must not enter the ComfyUI image renderer');

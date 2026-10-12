@@ -59,7 +59,11 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     .dsh-comfy-image-card { position:relative; flex:none; max-width:100%; min-width:0; }
     .dsh-comfy-image { display:block; position:relative; box-sizing:border-box; width:100%; min-width:0; min-height:0; padding:0; overflow:hidden; border:1px solid #80808040; border-radius:16px; background:var(--dsw-alias-interactive-bg-hover,#80808018); color:inherit; cursor:zoom-in; }
     .dsh-comfy-image img { position:absolute; inset:0; display:block; width:100%; height:100%; object-fit:contain; }
+    .dsh-comfy-image video { position:absolute; inset:0; display:block; width:100%; height:100%; object-fit:contain; }
     .dsh-comfy-image[data-blurred=true] img { filter:blur(28px) brightness(.65); transform:scale(1.15); }
+    .dsh-comfy-image[data-blurred=true] video { filter:blur(28px) brightness(.65); transform:scale(1.15); }
+    .dsh-comfy-video { cursor:default; }
+    .dsh-comfy-video-reveal { position:absolute; inset:0; width:100%; height:100%; border:0; padding:0; background:transparent; color:inherit; cursor:pointer; }
     .dsh-comfy-image-mask { display:flex; position:absolute; inset:0; align-items:center; justify-content:center; flex-direction:column; gap:8px; background:#1b202a26; color:#fff; font-size:12px; text-shadow:0 1px 4px #0009; pointer-events:none; }
     .dsh-comfy-image:focus-visible { outline:2px solid #aaa; outline-offset:3px; }
     .dsh-comfy-image-eye { display:grid; place-items:center; position:absolute; top:6px; left:6px; z-index:1; width:28px; height:28px; padding:0; border:1px solid #ffffff35; border-radius:8px; background:#35383dcc; color:#eee; cursor:pointer; backdrop-filter:blur(8px); opacity:0; pointer-events:none; }
@@ -142,11 +146,42 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
         dimensions?.width && dimensions?.height ? ' · ' + dimensions.width + ' × ' + dimensions.height : '')),
       open && src !== null ? h(ImageLightbox, { src, alt: label, labels: { dialog: '原图预览', close: '关闭原图预览' }, onClose: close }) : null);
   }
+  function OutputVideo({ image, protectedImage }) {
+    const [override, setOverride] = useState(null);
+    const [size, setSize] = useState(null);
+    const [error, setError] = useState(false);
+    const [attempt, setAttempt] = useState(0);
+    const videoRef = useRef(null);
+    const blurred = protectedImage && (override?.key === image.url && override.baseline === protectedImage ? override.value : true);
+    useEffect(() => { setOverride(null); setError(false); }, [image.url, protectedImage]);
+    useEffect(() => { if (blurred) videoRef.current?.pause(); }, [blurred]);
+    const dimensions = size?.key === image.url ? size : { width: 360, height: 240 };
+    const scale = Math.min(1, 360 / dimensions.width, 540 / dimensions.height);
+    const reveal = () => setOverride({ key: image.url, baseline: protectedImage, value: false });
+    return h('div', { className: 'dsh-comfy-image-card', style: { width: dimensions.width * scale } },
+      h('div', { className: 'dsh-comfy-image dsh-comfy-video', 'data-blurred': blurred ? 'true' : 'false',
+        style: { aspectRatio: dimensions.width + ' / ' + dimensions.height } },
+        h('video', { key: image.url + ':' + attempt, ref: videoRef, src: image.url, controls: !blurred,
+          preload: 'metadata', playsInline: true, 'aria-label': image.filename, onError: () => setError(true),
+          onLoadedMetadata: event => {
+            const video = event.currentTarget;
+            if (video.videoWidth > 0 && video.videoHeight > 0)
+              setSize({ key: image.url, width: video.videoWidth, height: video.videoHeight });
+          } }),
+        error ? h('button', { type: 'button', className: 'dsh-comfy-video-reveal', onClick: () => { setError(false); setAttempt(v => v + 1); } }, '视频加载失败，点击重试')
+          : blurred ? h('button', { type: 'button', className: 'dsh-comfy-video-reveal', onClick: reveal, 'aria-label': '显示已遮挡视频：' + image.filename },
+            h('span', { className: 'dsh-comfy-image-mask', 'aria-hidden': true }, h(Eye, { hidden: true, size: 22 }), h('span', null, '点击显示视频'))) : null),
+      protectedImage && !error ? h('button', { type: 'button', className: 'dsh-comfy-image-eye', 'aria-pressed': blurred,
+        'aria-label': (blurred ? '显示视频：' : '模糊视频：') + image.filename, title: blurred ? '显示这个视频' : '模糊这个视频',
+        onClick: () => setOverride({ key: image.url, baseline: protectedImage, value: !blurred }) }, h(Eye, { hidden: blurred })) : null,
+      h('div', { className: 'dsh-comfy-image-info' }, image.filename,
+        size?.key === image.url ? ' · ' + size.width + ' × ' + size.height : ''));
+  }
   function MessageImages({ images, loadImage, align }) {
     const enabled = useImagePrivacy();
     if (!images.length) return null;
     return h(React.Fragment, null, h('style', null, CSS), h('div', { className: 'dsh-comfy-images', 'data-align': align },
-      images.map((image, index) => h(OutputImage, { key: (image.attachment?.attachmentId ?? image.preview?.url) + ':' + index,
+      images.map((image, index) => h(image.kind === 'dsh-comfyui-web.video' ? OutputVideo : OutputImage, { key: (image.url ?? image.attachment?.attachmentId ?? image.preview?.url) + ':' + index,
         image, loadImage, protectedImage: enabled }))));
   }
   function resultImages(block) {
@@ -161,17 +196,30 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
       .map(part => ({ attachment: part.attachment, ...(filename ? { label: filename } : {}) }));
   }
   function ComfyImageResult({ toolName, block, inspect }) {
-    if (toolName !== 'mcp__comfyui__get_image') return null;
+    if (!['mcp__comfyui__get_image', 'mcp__comfyui__get_video'].includes(toolName)) return null;
+    const video = toolName === 'mcp__comfyui__get_video';
     const settled = block.kind === 'tool-result';
     const content = settled && Array.isArray(block.content) ? block.content : [];
     const text = content.filter(part => part.type === 'text').map(part => part.text).join('\n');
-    const images = resultImages(block);
-    return h('section', { className: 'dsh-comfy-output', 'aria-label': 'ComfyUI 图片结果' }, h('style', null, CSS),
-      h('div', { className: 'dsh-comfy-output-head' }, h('strong', null, 'ComfyUI 图片'),
+    const images = video ? resultVideos(block) : resultImages(block);
+    return h('section', { className: 'dsh-comfy-output', 'aria-label': video ? 'ComfyUI 视频结果' : 'ComfyUI 图片结果' }, h('style', null, CSS),
+      h('div', { className: 'dsh-comfy-output-head' }, h('strong', null, video ? 'ComfyUI 视频' : 'ComfyUI 图片'),
         h('span', { role: 'status' }, !settled ? '读取中…' : block.isError ? '读取失败' : images.length ? '已读取' : '已完成'),
         inspect ? h('button', { type: 'button', onClick: inspect }, '查看调用') : null),
-      images.length ? h('span', { className: 'dsh-comfy-image-info' }, '图片将在本次回复正文的结果区显示。') : null,
+      images.length ? h('span', { className: 'dsh-comfy-image-info' }, (video ? '视频' : '图片') + '将在本次回复正文的结果区显示。') : null,
       !images.length && text ? h('pre', { className: 'dsh-comfy-output-text', role: block.isError ? 'alert' : undefined }, text) : null);
+  }
+  function resultVideos(block) {
+    if (block.kind !== 'tool-result' || block.isError) return [];
+    for (const part of block.content ?? []) {
+      if (part.type !== 'text') continue;
+      try {
+        const value = JSON.parse(part.text);
+        if (value.kind === 'dsh-comfyui-web.video' && typeof value.filename === 'string'
+          && typeof value.url === 'string' && /^\/dsh-comfyui\/media\?ticket=[A-Za-z0-9_.-]+$/.test(value.url)) return [value];
+      } catch {}
+    }
+    return [];
   }
   function ComfyTurnResults({ turn, resultSource, loadImage }) {
     const subscribe = React.useCallback(listener => resultSource.subscribe(listener), [resultSource]);
@@ -185,6 +233,11 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
         for (const image of resultImages(block)) {
           const key = image.attachment.attachmentId + ':' + (image.label ?? '');
           if (!seenImages.has(key)) { seenImages.add(key); images.push(image); }
+        }
+      }
+      if (block.call?.name === 'mcp__comfyui__get_video') {
+        for (const video of resultVideos(block)) {
+          if (!seenImages.has(video.url)) { seenImages.add(video.url); images.push(video); }
         }
       }
       for (const child of block.subCalls ?? []) visit(child);
@@ -283,7 +336,7 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
           h('button', { type: 'button', onClick: () => setZoom(1), title: '恢复 100% 大小', 'aria-label': '当前缩放 ' + Math.round(zoom * 100) + '%，点击恢复 100%' }, Math.round(zoom * 100) + '%'),
           h('button', { type: 'button', onClick: () => changeZoom(0.05), disabled: zoom >= 1.25, 'aria-label': '放大 ComfyUI 界面' }, '+')),
         h('button', { type: 'button', className: 'dsh-comfy-privacy', role: 'switch', 'aria-checked': imagePrivacy, 'aria-label': '图片对话中模糊',
-          onClick: () => setImagePrivacy(!imagePrivacy), title: '只影响本插件在对话中返回的图片；每张图片左上角的小眼睛可单独切换。' },
+          onClick: () => setImagePrivacy(!imagePrivacy), title: '只影响本插件在对话中返回的图片和视频；左上角的小眼睛可单独切换。' },
           h('span', null, '图片对话中模糊'), h('span', { className: 'dsh-comfy-privacy-track', 'aria-hidden': true }),
           h('span', { className: 'dsh-comfy-privacy-state', 'aria-hidden': true }, imagePrivacy ? '开' : '关')),
         h('button', { type: 'button', onClick: () => { setReady(false); setEpoch(v => v + 1); }, title: '刷新 ComfyUI 页面' }, '刷新'),
@@ -321,6 +374,9 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     });
     ctx.effect(() => ctx.slots.inject('tool.call.toolview', () => ctx.slots.register({
       name: 'tool.call.toolview', key: 'mcp__comfyui__get_image'
+    }, ComfyImageResult)));
+    ctx.effect(() => ctx.slots.inject('tool.call.toolview', () => ctx.slots.register({
+      name: 'tool.call.toolview', key: 'mcp__comfyui__get_video'
     }, ComfyImageResult)));
     ctx.effect(() => ctx.slots.inject('conversation.chat.turnTail', () => ctx.slots.register({
       name: 'conversation.chat.turnTail', id: ID + '.images', order: 35,

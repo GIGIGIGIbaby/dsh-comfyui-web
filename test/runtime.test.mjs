@@ -20,7 +20,7 @@ test('browser tab resume synchronizes into the existing workflow without duplica
   function page(clientId, external = false) {
     const scheduled = []; const commands = []; const replies = []; const calls = [];
     let syncGate;
-    const active = { path: clientId + '.json' }; const tabs = [active];
+    const active = { path: 'shared.json' }; const tabs = [active];
     const tracker = { isLoadingGraph: false };
     let graph = { id: clientId, revision: 1, nodes: [{ id: 6, widgets_values: ['original'] }], links: [] };
     const app = { extensionManager: { workflow: { activeWorkflow: active } }, canvas: { ds: { scale: 0.8, offset: [20, 30] } },

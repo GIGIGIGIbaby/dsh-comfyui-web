@@ -2,8 +2,8 @@
   'use strict';
   if (window.__DSH_COMFYUI_BRIDGE_ACTIVE__) return;
   window.__DSH_COMFYUI_BRIDGE_ACTIVE__ = true;
-  const bridgeProtocol = 2;
-  const bridgeVersion = '0.2.2';
+  const bridgeProtocol = 3;
+  const bridgeVersion = '0.4.0';
   const bootstrap = window.__DSH_COMFYUI_BOOTSTRAP__ || {};
   let token = bootstrap.token || __DSH_BRIDGE_TOKEN__;
   const bridgeBase = bootstrap.bridgeBase || location.origin;
@@ -14,7 +14,7 @@
   let parentOrigin;
   if (embedded) { try { parentOrigin = new URL(document.referrer).origin; } catch { return; } }
   let allowAI = embedded; let visible = true; let busy = false;
-  let revision = 0; let lastFingerprint; let initialized = false;
+  let revision = 0; let lastFingerprint; let initialized = false; let syncOwner;
   const undo = []; const completed = new Map();
   const appOf = () => window.comfyAPI?.app?.app;
   const apiOf = () => window.comfyAPI?.api?.api;
@@ -83,9 +83,11 @@
   }
   async function syncWorkflow(app) {
     const owner = activeWorkflowOf(app);
+    if (!owner?.path) return;
+    if (owner !== syncOwner) { syncOwner = owner; revision = 0; initialized = false; lastFingerprint = undefined; }
     const workflow = snapshot(app); const current = fingerprint(workflow);
     const changed = initialized && current !== lastFingerprint;
-    const update = await send('sync', { revision, ...(!initialized || changed ? { workflow, fingerprint: current } : {}) });
+    const update = await send('sync', { workflowKey: owner.path, revision, ...(!initialized || changed ? { workflow, fingerprint: current } : {}) });
     // A manual workflow switch can finish while the network request is pending.
     // Defer the response rather than applying it to the new tab or a loading graph.
     if (!graphReady(app) || activeWorkflowOf(app) !== owner) return;
@@ -100,6 +102,34 @@
     revision = update.revision; initialized = true;
   }
   function remember(app) { undo.push({ workflow: snapshot(app), owner: activeWorkflowOf(app) }); if (undo.length > 20) undo.shift(); }
+  function workflowStore(app) {
+    const store = app.extensionManager?.workflow;
+    if (!store?.getWorkflowByPath || !store?.createNewTemporary) throw new Error('此 ComfyUI 前端未提供工作流标签页接口，请更新前端');
+    return store;
+  }
+  function describeWorkflow(store, workflow) {
+    return { path: workflow.path, name: workflow.filename || workflow.path,
+      active: workflow === store.activeWorkflow, open: store.openWorkflows?.some(w => w.path === workflow.path) === true,
+      saved: workflow.isPersisted === true, modified: workflow.isModified === true };
+  }
+  async function workflowData(app, workflow) {
+    if (workflow === activeWorkflowOf(app)) return snapshot(app);
+    const loaded = workflow.isLoaded ? workflow : await workflow.load();
+    if (!loaded?.activeState) throw new Error('无法读取该工作流');
+    return clone(loaded.activeState);
+  }
+  async function openWorkflow(app, workflow, data) {
+    const retained = activeWorkflowOf(app), previous = snapshot(app);
+    try {
+      const loaded = await app.loadGraphData(data, true, true, workflow,
+        { checkForRerouteMigration: false, silentAssetErrors: true });
+      if (loaded === false || activeWorkflowOf(app)?.path !== workflow.path) throw new Error('ComfyUI 未能打开工作流');
+    } catch (error) {
+      if (retained) await app.loadGraphData(previous, true, true, retained,
+        { checkForRerouteMigration: false, silentAssetErrors: true });
+      throw error;
+    }
+  }
   function nodes(app) {
     return (app.graph._nodes || []).map(n => ({ id: String(n.id), type: n.type, title: n.title, mode: n.mode,
       widgets: (n.widgets || []).filter(w => w.type !== 'button').map(w => ({ name: w.name, type: w.type, value: w.value ?? null,
@@ -113,6 +143,33 @@
     if (!allowAI) throw new Error('此面板已关闭 AI 操作');
     if (!graphReady(app)) throw new Error('ComfyUI 工作流尚未就绪');
     switch (command.action) {
+      case 'list_workflows': {
+        const store = workflowStore(app);
+        await store.syncWorkflows?.();
+        return { activePath: store.activeWorkflow?.path,
+          open: (store.openWorkflows || []).map(w => describeWorkflow(store, w)),
+          saved: (store.persistedWorkflows || []).map(w => describeWorkflow(store, w)) };
+      }
+      case 'switch_workflow': {
+        const store = workflowStore(app);
+        const workflow = store.getWorkflowByPath(args.path);
+        if (!workflow) throw new Error('工作流不存在，请先 list_workflows 获取准确 path');
+        if (workflow !== activeWorkflowOf(app)) await openWorkflow(app, workflow, await workflowData(app, workflow));
+        return { switched: true, workflow: describeWorkflow(store, store.activeWorkflow) };
+      }
+      case 'new_workflow': {
+        const store = workflowStore(app);
+        const source = args.sourcePath ? store.getWorkflowByPath(args.sourcePath) : activeWorkflowOf(app);
+        if (!source) throw new Error('源工作流不存在，请先 list_workflows');
+        const data = await workflowData(app, source);
+        data.id = crypto.randomUUID(); delete data.revision;
+        const name = args.name || (source.filename || 'Workflow').replace(/\.json$/i, '') + ' (Copy)';
+        if (typeof name !== 'string' || !name.trim() || name.length > 180 || /[\\/:*?"<>|\x00-\x1f]/.test(name) || /^\.+$/.test(name)) throw new Error('请使用不含路径分隔符的工作流名称');
+        const workflow = store.createNewTemporary(name.replace(/\.json$/i, '') + '.json', data);
+        try { await openWorkflow(app, workflow, data); }
+        catch (error) { await store.closeWorkflow?.(workflow); throw error; }
+        return { created: true, sourcePath: source.path, workflow: describeWorkflow(store, store.activeWorkflow) };
+      }
       case 'list_nodes': return { nodes: nodes(app).filter(n => !args.filter || (n.type + ' ' + n.title).toLowerCase().includes(args.filter.toLowerCase())) };
       case 'get_workflow': return { workflow: snapshot(app), prompt: (await app.graphToPrompt()).output };
       case 'update_nodes': {
@@ -171,7 +228,7 @@
         if (!reply) {
           try {
             reply = { id: command.id, result: await execute(command) };
-            if (['update_nodes', 'load_workflow', 'undo'].includes(command.action)) await syncWorkflow(appOf());
+            if (['update_nodes', 'load_workflow', 'undo', 'switch_workflow', 'new_workflow'].includes(command.action)) await syncWorkflow(appOf());
           }
           catch (e) { reply = { id: command.id, error: e.message || String(e) }; }
           completed.set(command.id, reply);
