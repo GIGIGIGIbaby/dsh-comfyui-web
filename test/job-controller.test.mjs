@@ -63,6 +63,12 @@ test('official controller loads once per minimal agent, wakes its owner, injects
   completions.get('s1').finish({ finished: true, status: 'completed', prompt_id: 's1' }); await flush();
   assert.equal(loads, 2, 'an existing standard controller must not get a second controller');
   assert.equal(standard.followups.length, 1); assert.equal(submitted, 3);
+  await runWithCompletionJob(jobs, a.id, invoke('manual-stop'), monitor);
+  completions.get('manual-stop').finish({ finished: true, status: 'interrupted', prompt_id: 'manual-stop' }); await flush();
+  assert.equal(a.followups.length, 2);
+  assert.match(JSON.stringify(a.followups[1].content), /主动中断，不是节点故障/);
+  assert.match(JSON.stringify(a.followups[1].content), /不要修复、重试、重新提交或继续下一段/);
+  assert.equal(submitted, 4, 'an interruption notice must not submit another prompt');
 });
 
 test('recovered tasks attach the missing controller once without resubmitting or duplicating notices', async t => {

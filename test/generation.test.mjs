@@ -55,6 +55,9 @@ test('cached completion, errors, interruptions and a lost pending task remain di
   const results = await Promise.all(['cached', 'failed', 'interrupted', 'deleted'].map(id => monitor.wait(id, 'owner')));
   assert.deepEqual(results.map(r => r.status), ['completed', 'failed', 'interrupted', 'not_found']);
   assert.equal(results[1].error.message, 'OOM'); assert.equal(results[3].finished, false);
+  assert.equal(results[2].retryAllowed, false); assert.equal(results[2].requiresUserInstruction, true);
+  assert.match(results[2].message, /主动中断，不是节点故障/);
+  assert.equal(results[3].retryAllowed, false);
 });
 
 test('event wait timeout and abort do not cancel, resubmit or consume completion for other waiters', async t => {

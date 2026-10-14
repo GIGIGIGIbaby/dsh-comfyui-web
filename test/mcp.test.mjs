@@ -15,12 +15,15 @@ import { apply } from '../lib/host.js';
 test('native MCP run works with a global jobs service but no controller in the minimal agent', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-comfy-minimal-')), previousHome = process.env.DSH_HOME;
   const effects = [], tools = [], sockets = new Set();
-  let completed = false, runCommands = 0;
+  let completed = false, runCommands = 0, stopQueued = false, stopped = false, admissions = 0;
   const upstream = http.createServer((req, res) => {
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify(req.url === '/queue' ? { queue_running: [], queue_pending: completed ? [] : [[0, 'minimal-prompt']] }
-      : req.url.startsWith('/history') ? completed ? { 'minimal-prompt': { status: { status_str: 'success' },
-        outputs: { 9: { images: [{ filename: 'minimal.png', type: 'output', subfolder: '' }] } } } } : {}
+    const history = { ...(completed ? { 'minimal-prompt': { status: { status_str: 'success' },
+      outputs: { 9: { images: [{ filename: 'minimal.png', type: 'output', subfolder: '' }] } } } } : {}),
+      ...(stopped ? { 'stopped-prompt': { status: { status_str: 'error', messages: [['execution_interrupted', {}]] }, outputs: {} } } : {}) };
+    res.end(JSON.stringify(req.url === '/queue' ? { queue_running: [], queue_pending:
+      [...(completed ? [] : [[0, 'minimal-prompt']]), ...(stopQueued && !stopped ? [[1, 'stopped-prompt']] : [])] }
+      : req.url.startsWith('/history') ? history
       : { system: {} }));
   });
   upstream.on('upgrade', (req, socket) => {
@@ -38,7 +41,7 @@ test('native MCP run works with a global jobs service but no controller in the m
   process.env.DSH_HOME = directory;
   await mkdir(join(directory, 'comfyui'));
   await writeFile(join(directory, 'comfyui', 'config.json'), JSON.stringify({ url: 'http://127.0.0.1:' + upstream.address().port }));
-  const jobs = { start() { throw new Error('background jobs unavailable: no job controller serves this agent (load @deepseek-ai/dsh-tool-jobs in its composition)'); } };
+  const jobs = { start() { admissions++; throw new Error('background jobs unavailable: no job controller serves this agent (load @deepseek-ai/dsh-tool-jobs in its composition)'); } };
   await apply({ get(name) { if (name === 'jobs') return jobs; },
     effect(fn) { const dispose = fn(); if (typeof dispose === 'function') effects.push(dispose); return dispose; },
     tools: { register(tool) { tools.push(tool); } }, webServer: { register() {} } });
@@ -52,7 +55,8 @@ test('native MCP run works with a global jobs service but no controller in the m
     return response.json();
   }
   await bridge('poll');
-  const execution = { agent: { session: { id: 'owner' }, ctx: { get: () => jobs } }, signal: new AbortController().signal };
+  const messages = [{ id: 'human-first', role: 'user', source: { kind: 'user' } }];
+  const execution = { agent: { session: { id: 'owner', deriveMessages: () => messages }, ctx: { get: () => jobs } }, signal: new AbortController().signal };
   const submitted = tools.find(tool => tool.name === 'mcp__comfyui__run').execute({}, execution);
   let commands = [];
   for (let attempt = 0; attempt < 60 && !commands.length; attempt++) {
@@ -78,6 +82,31 @@ test('native MCP run works with a global jobs service but no controller in the m
   assert.equal(tasks[0].status, 'completed'); assert.equal(tasks[0].media[0].filename, 'minimal.png');
   assert.equal((await bridge('poll')).commands.length, 0);
   assert.equal(runCommands, 1);
+  stopQueued = true;
+  const runTool = tools.find(tool => tool.name === 'mcp__comfyui__run');
+  const second = runTool.execute({}, execution);
+  commands = [];
+  for (let attempt = 0; attempt < 60 && !commands.length; attempt++) {
+    commands = (await bridge('poll')).commands;
+    if (!commands.length) await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(commands.length, 1); runCommands++;
+  await bridge('result', { id: commands[0].id, result: { submitted: true, prompt_id: 'stopped-prompt' } });
+  await second;
+  stopped = true;
+  for (const socket of sockets) socket.write(Buffer.concat([Buffer.from([0x81, message.length]), message]));
+  for (let attempt = 0; attempt < 60; attempt++) {
+    tasks = (await tools.find(tool => tool.name === 'mcp__comfyui__list_tasks').execute({}, execution)).structuredContent.tasks;
+    if (tasks.find(task => task.promptId === 'stopped-prompt')?.status === 'interrupted') break;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(tasks.find(task => task.promptId === 'stopped-prompt')?.result?.retryAllowed, false);
+  messages.push({ id: 'completion-notice', role: 'user', source: { kind: 'tool-jobs', form: 'notice' } });
+  const priorAdmissions = admissions;
+  await assert.rejects(runTool.execute({}, execution), /本次 run 未提交/);
+  assert.equal(admissions, priorAdmissions, 'blocked retries must not even create a background job');
+  assert.equal((await bridge('poll')).commands.length, 0, 'no run command reaches ComfyUI after manual interruption');
+  assert.equal(runCommands, 2);
 });
 
 test('shared canvas accepts changes, delivers them to other tabs, and preserves conflicting edit', () => {
