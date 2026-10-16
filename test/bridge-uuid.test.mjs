@@ -6,6 +6,7 @@ import vm from 'node:vm';
 const bridgeSource = readFileSync(new URL('../bridge.js', import.meta.url), 'utf8');
 
 function loadBridgeForUuidTest({ cryptoValue, randomImpl }) {
+  const warnings = [];
   const window = {
     __DSH_COMFYUI_BOOTSTRAP__: { token: 'test-token', bridgeBase: 'https://example.test' },
     __DSH_COMFYUI_BRIDGE_ACTIVE__: false,
@@ -25,7 +26,8 @@ function loadBridgeForUuidTest({ cryptoValue, randomImpl }) {
     addEventListener() {},
     removeEventListener() {},
     comfyAPI: {},
-    console: { warn() {} },
+    crypto: cryptoValue,
+    console: { warn(...args) { warnings.push(args); } },
     fetch: async () => ({
       ok: true,
       status: 200,
@@ -73,6 +75,7 @@ function loadBridgeForUuidTest({ cryptoValue, randomImpl }) {
   );
 
   vm.runInNewContext(patchedSource, context, { filename: 'bridge.js' });
+  window.__test_warnings = warnings;
   return window;
 }
 
@@ -98,12 +101,15 @@ test('bridge UUID fallback generates valid v4 UUIDs when crypto is unavailable',
   assert.match(uuid1, v4);
   assert.match(uuid2, v4);
   assert.notEqual(uuid1, uuid2);
+  assert.equal(window.__test_warnings.length, 1);
 });
 
 test('bridge UUID fallback generates valid v4 UUIDs when randomUUID is missing and getRandomValues throws', () => {
+  let cryptoCalls = 0;
   const window = loadBridgeForUuidTest({
     cryptoValue: {
       getRandomValues() {
+        cryptoCalls++;
         throw new Error('crypto.getRandomValues failed');
       }
     },
@@ -118,4 +124,37 @@ test('bridge UUID fallback generates valid v4 UUIDs when randomUUID is missing a
   assert.match(uuid1, v4);
   assert.match(uuid2, v4);
   assert.notEqual(uuid1, uuid2);
+  assert.ok(cryptoCalls > 0, 'the throwing crypto mock must actually be used');
+  assert.equal(window.__test_warnings.length, 1);
+});
+
+test('bridge UUID prefers native randomUUID without using fallback sources', () => {
+  const uuid = '12345678-1234-4234-8234-123456789abc';
+  const window = loadBridgeForUuidTest({
+    cryptoValue: {
+      randomUUID: () => uuid,
+      getRandomValues() { throw new Error('unexpected fallback'); }
+    },
+    randomImpl() { throw new Error('unexpected Math.random'); }
+  });
+  assert.equal(window.__test_randomUUID(), uuid);
+  assert.equal(window.__test_warnings.length, 0);
+});
+
+test('bridge UUID uses getRandomValues when native randomUUID is unavailable', () => {
+  let calls = 0;
+  const window = loadBridgeForUuidTest({
+    cryptoValue: {
+      getRandomValues(bytes) { bytes.fill(++calls); return bytes; }
+    },
+    randomImpl() { throw new Error('unexpected Math.random'); }
+  });
+  const uuid1 = window.__test_randomUUID();
+  const uuid2 = window.__test_randomUUID();
+  const v4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  assert.match(uuid1, v4);
+  assert.match(uuid2, v4);
+  assert.notEqual(uuid1, uuid2);
+  assert.ok(calls > 0);
+  assert.equal(window.__test_warnings.length, 0);
 });
