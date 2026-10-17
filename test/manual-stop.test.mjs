@@ -47,13 +47,13 @@ test('manual stop blocks new prompts until human input, ignores notices, stays s
   assert.equal((await new TaskStore(file).start()).records.find(r => r.promptId === 'stopped').stopReleased, true);
 });
 
-test('queued cancellations and deleted prompts stop the plan; real node errors do not become manual stops', () => {
+test('only confirmed interruptions and cancellations fence the conversation', () => {
   const session = { id: 'owner', deriveMessages: () => [{ id: 'request', role: 'user', source: { kind: 'user' } }] };
-  for (const status of ['cancelled', 'not_found', 'failed', 'completed']) {
+  for (const status of ['interrupted', 'cancelled', 'not_found', 'failed', 'completed']) {
     const record = { sessionId: 'owner', promptId: status, result: { status } };
     const runtime = { generations: { records: new Map([[status, record]]), changed() {} } };
     const guard = new ManualStopGuard(runtime, () => session);
-    if (['cancelled', 'not_found'].includes(status)) assert.throws(() => guard.check('owner'), /未提交/);
+    if (['interrupted', 'cancelled'].includes(status)) assert.throws(() => guard.check('owner'), /未提交/);
     else assert.doesNotThrow(() => guard.check('owner'));
   }
 });

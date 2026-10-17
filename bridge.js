@@ -3,7 +3,7 @@
   if (window.__DSH_COMFYUI_BRIDGE_ACTIVE__) return;
   window.__DSH_COMFYUI_BRIDGE_ACTIVE__ = true;
   const bridgeProtocol = 5;
-  const bridgeVersion = '0.5.8';
+  const bridgeVersion = '0.5.9';
   const bootstrap = window.__DSH_COMFYUI_BOOTSTRAP__ || {};
   let token = bootstrap.token || __DSH_BRIDGE_TOKEN__;
   const bridgeBase = bootstrap.bridgeBase || location.origin;
