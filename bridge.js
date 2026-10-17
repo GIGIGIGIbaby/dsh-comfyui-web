@@ -3,7 +3,7 @@
   if (window.__DSH_COMFYUI_BRIDGE_ACTIVE__) return;
   window.__DSH_COMFYUI_BRIDGE_ACTIVE__ = true;
   const bridgeProtocol = 5;
-  const bridgeVersion = '0.5.7';
+  const bridgeVersion = '0.5.8';
   const bootstrap = window.__DSH_COMFYUI_BOOTSTRAP__ || {};
   let token = bootstrap.token || __DSH_BRIDGE_TOKEN__;
   const bridgeBase = bootstrap.bridgeBase || location.origin;
@@ -113,35 +113,45 @@
     // not moved we still send the sync — that POST is how this tab pulls other tabs'
     // edits — but with an empty body, so the idle heartbeat carries no payload.
     const push = forceSync || !initialized || (check && graphChanged(app));
+    const sentVersion = graphVersionOf(app);
     let workflow, current;
     if (push) { workflow = snapshot(app); current = fingerprint(workflow); }
     const changed = workflow !== undefined && initialized && current !== lastFingerprint;
-    const update = await send('sync', { workflowKey: owner.path, revision, ...(workflow ? { workflow, fingerprint: current } : {}) });
+    // Consume only the force flag present at request time; an event arriving while
+    // awaiting the network must still force the next reconciliation.
+    forceSync = false;
+    let update;
+    try { update = await send('sync', { workflowKey: owner.path, revision, ...(workflow ? { workflow, fingerprint: current } : {}) }); }
+    catch (error) { forceSync = true; throw error; }
     // A manual workflow switch can finish while the network request is pending.
     // Defer the response rather than applying it to the new tab or a loading graph.
     if (!graphReady(app) || activeWorkflowOf(app) !== owner) return;
     if (update.workflow) {
+      const nowVersion = graphVersionOf(app);
+      const editedWhileWaiting = sentVersion != null && nowVersion != null
+        ? nowVersion !== sentVersion : fingerprint(snapshot(app)) !== (current ?? lastFingerprint);
+      // Do not overwrite an edit made after this request's snapshot. Retry with
+      // that edit and the original revision so normal conflict recovery sees it.
+      if (editedWhileWaiting) { forceSync = true; return; }
       if (update.conflict && changed) {
         try { localStorage.setItem('dsh.comfyui.sync-conflict.' + clientId, JSON.stringify(workflow)); } catch {}
         notify({ warning: '另一页也修改了工作流，已同步最新图；本页冲突副本保存在浏览器中。' });
       }
-      if (fingerprint(update.workflow) !== current) await replaceCurrentWorkflow(app, update.workflow);
+      if (fingerprint(update.workflow) !== current) { await replaceCurrentWorkflow(app, update.workflow); forceSync = true; }
       lastFingerprint = fingerprint(snapshot(app));
     } else if (workflow) lastFingerprint = current;
-    forceSync = false;
-    noteGraphVersion(app);
+    // A version observed AFTER awaiting a response may include unsent local edits.
+    lastGraphVersion = sentVersion;
     revision = update.revision; initialized = true;
   }
-  // Idle cadence exists to drain commands if the SSE stream silently dies and to pull
-  // other tabs' edits; both are second-scale concerns. While the stream is open the
-  // page reports state through /state, so 750 ms buys nothing but POSTs.
-  const FAST_POLL_MS = 750, IDLE_POLL_MS = 4000;
-  let lastGraphVersion = null, forceSync = true;
+  // Keep lightweight cross-tab sync responsive. Only the backup command poll is
+  // throttled while SSE is open; idle sync does not serialize an unchanged graph.
+  const FAST_POLL_MS = 400, IDLE_POLL_MS = 4000;
+  let lastGraphVersion = null, forceSync = true, lastCommandPoll = -Infinity;
   const streamAlive = () => !!commandStream && commandStream.readyState === (EventSource.OPEN ?? 1);
-  const pollDelay = () => streamAlive() ? IDLE_POLL_MS : FAST_POLL_MS;
   const graphVersionOf = app => {
     try {
-      const graph = app?.graph;
+      const graph = rootGraphOf(app);
       if (!graph) return null;
       if (typeof graph.version === 'function') return graph.version();
       // Current front-ends expose the counter as graph._version (a getter backed by
@@ -149,7 +159,6 @@
       return Number.isFinite(graph._version) ? graph._version : null;
     } catch { return null; }
   };
-  const noteGraphVersion = app => { lastGraphVersion = graphVersionOf(app); };
   function graphChanged(app) {
     const version = graphVersionOf(app);
     // An unseen version baseline means we have no evidence yet: serialize.
@@ -159,15 +168,18 @@
     return activeWorkflowOf(app)?.isModified !== false;
   }
   async function poll() {
-    if (busy || handlingCommands) { setTimeout(poll, pollDelay()); return; } busy = true;
+    if (busy || handlingCommands) { setTimeout(poll, FAST_POLL_MS); return; } busy = true;
     try {
       const ready = graphReady(appOf());
       if (ready) await syncWorkflow(appOf());
-      const response = await send('poll', {});
+      if (!streamAlive() || Date.now() - lastCommandPoll >= IDLE_POLL_MS) {
+        const response = await send('poll', {});
+        lastCommandPoll = Date.now();
+        commandQueue.push(...response.commands || []);
+      }
       notify({ ready, allowAI });
-      commandQueue.push(...response.commands || []);
     } catch (e) { notify({ ready: false, error: e.message }); }
-    finally { busy = false; handleCommands(); setTimeout(poll, pollDelay()); }
+    finally { busy = false; handleCommands(); setTimeout(poll, FAST_POLL_MS); }
   }
   const historyKey = app => 'dsh.comfyui.history.' + encodeURIComponent(location.origin + ':' + sessionId + ':' + activeWorkflowOf(app).path);
   function historyOf(app) {

@@ -19,7 +19,7 @@ function fatGraph(nodes = 120) {
 const fatWorkflow = { nodes: Array.from({ length: 120 }, (_, i) => ({ id: i + 1, type: 'KSampler', widgets_values: ['a'.repeat(400)] })), links: [], groups: [] };
 
 test('queue and history digests keep identity and outputs but drop the embedded graph', () => {
-  const raw = { queue_running: [[0, 'p-run', fatGraph(), ['9'], {}]], queue_pending: [[1, 'p-wait', fatGraph(), ['9'], {}]] };
+  const raw = { queue_running: [[0, 'p-run', fatGraph(), {}, ['9']]], queue_pending: [[1, 'p-wait', fatGraph(), {}, ['9']]] };
   assert.ok(byteLength(raw) > 50_000, 'fixture must be fat enough to matter');
   const digest = digestQueue(raw);
   assert.equal(digest.counts.running, 1);
@@ -108,8 +108,26 @@ test('get_workflow projects oversized graphs but leaves the documented raw shape
   // A page running an older bridge.js ignores mode and returns the whole graph anyway.
   const backstopped = backstopWorkflowProjection({ mode: 'auto' }, fat);
   assert.equal(backstopped.projection.projected, true);
-  assert.match(backstopped.fallbackNote, /较旧/);
+  assert.equal(backstopped.projection.fullCall.args.mode, 'full');
   assert.equal(backstopWorkflowProjection({ mode: 'full' }, fat), fat);
+});
+
+test('explicit workflow summary projects small graphs without claiming they exceeded the budget', async () => {
+  const raw = { workflow: { nodes: [{ id: 1, type: 'KSampler', widgets_values: [123] }], links: [] }, prompt: {} };
+  const result = await callComfyTool({ mcpEnabled: true, command: async () => raw }, 'get_workflow',
+    { mode: 'summary' }, { dshSessionId: 'own' });
+  assert.equal(result.structuredContent.nodeCount, 1);
+  assert.equal(result.structuredContent.workflow, undefined);
+  assert.equal(result.structuredContent.projection.projected, true);
+  assert.doesNotMatch(result.structuredContent.projection.reason, /超过/);
+});
+
+test('projection budgets count UTF-8 bytes for Chinese prompts', () => {
+  const payload = { message: '图'.repeat(4000) };
+  assert.equal(byteLength(payload), Buffer.byteLength(JSON.stringify(payload), 'utf8'));
+  const result = maybeProject('auto', payload, { budgetBytes: 8192, shape: '摘要', tool: 'queue',
+    reason: '测试', build: () => ({ summary: true }) });
+  assert.equal(result.projected, true);
 });
 
 test('list_nodes drops parameter values above the budget and restores them on demand', async () => {
