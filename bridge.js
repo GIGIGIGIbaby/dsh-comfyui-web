@@ -309,9 +309,118 @@
       throw error;
     }
   }
+  // A widget whose value is not the source of truth: DOM widgets own their own state,
+  // hidden widgets are driven by a panel, and a serialize:false widget never reaches the
+  // prompt at all. Writing `widget.value` on those looks like success and is not.
+  // Only the options pair marks a real DOM widget. Native Combo/Number/Text/Boolean widgets
+  // also expose prototype.setValue, so "has setValue" alone classified every native control
+  // as DOM — which is what made list_nodes report kind:"dom" for node 195 mode and made the
+  // write path believe it was talking to a frontend-owned control.
+  function widgetKind(widget) {
+    if (widget.type === 'button') return 'button';
+    if (typeof widget.options?.setValue === 'function' || typeof widget.options?.getValue === 'function') return 'dom';
+    if (widget.type === 'hidden' || widget.hidden === true || widget.options?.hidden === true) return 'hidden';
+    if (widget.serialize === false || widget.options?.serialize === false) return 'shadowed';
+    return 'plain';
+  }
+  const widgetSetter = widget => widget.options?.setValue || widget.setValue || null;
+  // Native ComfyUI widgets read the second argument: BaseWidget.setValue(e, { e, node, canvas }).
+  // Calling one with the value alone throws "Cannot destructure property 'e' of 'undefined'"
+  // from inside the frontend bundle — the exact failure every combo/number/toggle/text write
+  // used to hit. DOM widgets take the value and ignore the rest, so one call shape fits both.
+  const writeContext = (app, node) => ({ e: null, node, canvas: app.canvas || {} });
+  function widgetReadback(widget) {
+    try { return typeof widget.options?.getValue === 'function' ? widget.options.getValue() : widget.value; }
+    catch { return widget.value; }
+  }
+  // Some packs keep a structured document in node.properties and render their editor from
+  // it, so a freshly written value is ignored until that shadow is dropped — the same
+  // order of operations the packs use for their own "fill this in" buttons.
+  const shadowDocs = node => Object.entries(node.properties || {})
+    .filter(([, value]) => value && typeof value === 'object' && Array.isArray(value.parts)).map(([key]) => key);
+  // A hidden original widget and the DOM widget that replaced it hold the same value;
+  // writing through the visible one is what makes the editor and the archive agree.
+  function writeTarget(node, widget) {
+    if (widgetKind(widget) !== 'hidden' && widgetKind(widget) !== 'shadowed') return { widget, reroutedFrom: null };
+    const sibling = (node.widgets || []).find(other => other !== widget && widgetSetter(other)
+      && String(widgetReadback(other) ?? '') === String(widget.value ?? ''));
+    return sibling ? { widget: sibling, reroutedFrom: widget.name } : { widget, reroutedFrom: null };
+  }
+  // A failed write has to say which step failed and what to try instead; a bare
+  // "Cannot destructure property 'e' of 'undefined'" tells the caller nothing.
+  const writeHint = (kind, node, widget) => {
+    const shadow = shadowDocs(node);
+    const base = kind === 'dom' || kind === 'shadowed' || kind === 'hidden'
+      ? '该控件由前端组件自己持有状态（kind=' + kind + '），写控件回读不一致就代表没写进去。'
+      : '控件回读值与提交值不一致，面板可能拒绝了这次写入（kind=' + kind + '）。';
+    const paths = [];
+    if (shadow.length) paths.push('写它的 shadow 源 node.properties[' + shadow.map(k => JSON.stringify(k)).join(' / ') + ']（update_nodes 已尝试清除，仍失败就说明文档格式有额外约束）');
+    paths.push('用该节点包自带的写入入口（例如 AICG3D 的 globalThis.AICG3D_H3.setPromptText(node, value, {notifyGraphChange:false, preserveNodeSize:true})），它才会同步刷新 UI 与 properties');
+    paths.push('或改磁盘上的工作流 JSON，再用 load_workflow（workflowJson 传字符串）+ save_workflow 整图替换');
+    return base + ' 可行路径：' + paths.map((p, i) => '(' + (i + 1) + ') ' + p).join('；') + '。不要重试同一调用。';
+  };
+  function writeWidget(app, node, widget, value) {
+    const setter = widgetSetter(widget), kind = widgetKind(widget);
+    const apply = () => {
+      if (setter) setter.call(widget, value, writeContext(app, node));
+      else { widget.value = value; widget.callback?.(value, app.canvas, node); }
+    };
+    // Record which step blew up so the caller gets "阶段：调用控件 setter" instead of
+    // an anonymous TypeError, plus the node/widget it happened on.
+    let stage = 'call-setter';
+    const fail = error => {
+      const wrapped = error instanceof Error ? error : new Error(String(error));
+      wrapped.stage = stage; wrapped.nodeId = String(node.id); wrapped.widget = widget.name;
+      wrapped.widgetKind = kind; wrapped.hint = writeHint(kind, node, widget);
+      throw wrapped;
+    };
+    try { apply(); } catch (error) { fail(error); }
+    let cleared;
+    try {
+      if (typeof value === 'string' && String(widgetReadback(widget) ?? '') !== value) {
+        stage = 'clear-shadow-docs';
+        cleared = shadowDocs(node);
+        if (cleared.length) { for (const key of cleared) delete node.properties[key]; apply(); }
+        else cleared = null;
+      }
+    } catch (error) { fail(error); }
+    stage = 'read-back';
+    let after;
+    try { after = widgetReadback(widget); } catch (error) { fail(error); }
+    app.graph.setDirtyCanvas(true, true);
+    const verified = String(after ?? '') === String(value);
+    return { kind, via: setter ? (widget.options?.setValue ? 'dom-setter' : 'native-setter') : kind === 'plain' ? 'value+callback' : kind,
+      verified, after, cleared, ...(verified ? {} : { hint: writeHint(kind, node, widget) }) };
+  }
+  const optionHint = values => {
+    const shown = values.slice(0, 12).map(v => JSON.stringify(v)).join(', ');
+    return ' 画布上的可选项是 [' + shown + (values.length > 12 ? ` …共 ${values.length} 项` : '') + ']，用其中之一的原文提交。';
+  };
+  // A rejected call is a validation fact, not a page-side crash: it deserves a hint that
+  // names the next call. Without this every "节点不存在" came back with the generic
+  // "page threw an exception, read the stack" advice, which sends the model hunting for a
+  // stack trace that does not exist.
+  const fail = (message, hint) => { const error = new Error(message); error.hint = hint; return error; };
+  // A caller that sends {edits: [...]} to update_nodes gets told the field it actually sent —
+  // "changes must be an array" alone reads like the value was wrong, not the key name.
+  const argNameHint = (args, expected) => {
+    const given = Object.keys(args || {}).filter(key => !expected.includes(key) && !['clientId', 'sessionId'].includes(key));
+    return given.length ? '（收到的是 ' + given.join(' / ') + '，应改用 ' + expected.join(' / ') + '）' : '';
+  };
+  // Predict whether update_nodes can make this widget stick, before the caller spends a write
+  // on it. 'ok' = plain value write; 'risky' = a DOM/panel-owned control whose setter may throw
+  // or silently disagree (call it, then trust only verified); 'no' = button/no widget.
+  function writability(widget) {
+    const kind = widgetKind(widget);
+    if (kind === 'plain') return 'ok';
+    if (kind === 'button') return 'no';
+    return 'risky';
+  }
   function nodes(app) {
     return (app.graph._nodes || []).map(n => ({ id: String(n.id), type: n.type, title: n.title, mode: n.mode,
       widgets: (n.widgets || []).filter(w => w.type !== 'button').map(w => ({ name: w.name, type: w.type, value: w.value ?? null,
+        ...(widgetKind(w) === 'plain' ? {} : { kind: widgetKind(w) }),
+        writable: writability(w),
         ...(Array.isArray(w.options?.values) ? { choices: w.options.values } : {}),
         ...(typeof w.options?.min === 'number' ? { min: w.options.min, max: w.options.max ?? null } : {}) })),
       inputs: (n.inputs || []).map((i, slot) => ({ name: i.name, type: i.type, slot, link: i.link ?? null })),
@@ -385,11 +494,13 @@
         app.graph.setDirtyCanvas(true, true); return { changed, nodes: nodes(app) };
       }
       case 'bind_image': {
-        const node = app.graph.getNodeById(args.nodeId), widget = node?.widgets?.find(widget => widget.name === args.widget);
-        if (!widget || widget.type === 'button') throw new Error('目标图片参数不存在，请先 list_nodes 获取准确 nodeId/widget');
-        if (Array.isArray(widget.options?.values) && !widget.options.values.includes(args.value)) widget.options.values.push(args.value);
-        widget.value = args.value; widget.callback?.(args.value, app.canvas, node);
-        app.graph.setDirtyCanvas(true, true); return { nodeId: String(node.id), widget: widget.name, value: widget.value };
+        const node = app.graph.getNodeById(args.nodeId), found = node?.widgets?.find(widget => widget.name === args.widget);
+        if (!found || found.type === 'button') throw new Error('目标图片参数不存在，请先 list_nodes 获取准确 nodeId/widget');
+        if (Array.isArray(found.options?.values) && !found.options.values.includes(args.value)) found.options.values.push(args.value);
+        const { widget, reroutedFrom } = writeTarget(node, found);
+        const outcome = writeWidget(app, node, widget, args.value);
+        return { nodeId: String(node.id), widget: widget.name, value: outcome.after, via: outcome.via, verified: outcome.verified,
+          ...(reroutedFrom ? { requestedWidget: reroutedFrom } : {}), ...(outcome.cleared ? { shadowDocsCleared: outcome.cleared } : {}) };
       }
       case 'list_edits': {
         const history = historyOf(app);
@@ -429,27 +540,57 @@
         catch (error) { await store.closeWorkflow?.(workflow); throw error; }
         return { created: true, sourcePath: source.path, workflow: describeWorkflow(store, store.activeWorkflow) };
       }
-      case 'list_nodes': return { nodes: nodes(app).filter(n => !args.filter || (n.type + ' ' + n.title).toLowerCase().includes(args.filter.toLowerCase())) };
+      case 'list_nodes': {
+        // filter also matches the node id: "回读 node 195" is the most common lookup, and an
+        // id that silently matched nothing (filter only searched type/title) reads as
+        // "the node is gone" when it is right there.
+        const needle = args.filter ? String(args.filter).toLowerCase() : null;
+        const list = nodes(app);
+        const hit = needle ? list.filter(n => (n.type + ' ' + n.title + ' ' + n.id).toLowerCase().includes(needle)) : list;
+        // The active workflow path rides along: usage notes are keyed by it, and asking the
+        // page for the path separately would cost a second round trip on every read.
+        return { nodes: hit, nodeCount: list.length, workflowPath: activeWorkflowOf(app)?.path ?? null, ...(needle && !hit.length ? {
+          filterHint: 'filter 同时匹配类型 / 标题 / 节点 id，' + JSON.stringify(args.filter) + ' 一个都没命中。当前画布 ' + list.length + ' 个节点，id 是 [' + list.slice(0, 20).map(n => n.id).join(', ') + (list.length > 20 ? ' …' : '') + ']。'
+        } : {}) };
+      }
       case 'get_workflow': return { workflow: snapshot(app), prompt: (await app.graphToPrompt()).output };
       case 'update_nodes': {
         const changes = args.changes;
-        if (!Array.isArray(changes) || !changes.length || changes.length > 500) throw new Error('changes 必须是包含 1–500 项的数组');
+        if (!Array.isArray(changes) || !changes.length || changes.length > 500) throw fail('changes 必须是包含 1–500 项的数组' + argNameHint(args, ['changes']),
+          '参数名是 changes，每项结构 {nodeId, widget, value}（nodeId 用 list_nodes 取到的 id）：改好参数名后整批重发，画布尚未改动。');
+        const ids = (app.graph._nodes || []).map(n => n.id);
         const edits = changes.map(change => {
           const node = app.graph.getNodeById(change.nodeId);
-          if (!node) throw new Error('节点不存在：' + change.nodeId);
-          const widget = (node.widgets || []).find(w => w.name === change.widget);
-          if (!widget || widget.type === 'button') throw new Error('可编辑参数不存在：' + change.nodeId + '.' + change.widget);
-          if (typeof widget.value === 'number' && (typeof change.value !== 'number' || !Number.isFinite(change.value))) throw new Error(widget.name + ' 必须是数字');
-          if (typeof widget.value === 'string' && typeof change.value !== 'string') throw new Error(widget.name + ' 必须是文本');
-          if (typeof widget.value === 'boolean' && typeof change.value !== 'boolean') throw new Error(widget.name + ' 必须是布尔值');
-          if (Array.isArray(widget.options?.values) && !widget.options.values.includes(change.value)) throw new Error(widget.name + ' 的值不在可选项中');
-          if (typeof change.value === 'number' && ((widget.options?.min != null && change.value < widget.options.min) || (widget.options?.max != null && change.value > widget.options.max))) throw new Error(widget.name + ' 超出节点允许的范围');
-          return { node, widget, value: change.value, before: clone(widget.value) };
+          if (!node) throw fail('节点不存在：' + change.nodeId,
+            '当前画布只有 ' + ids.length + ' 个节点，id 是 [' + ids.slice(0, 20).join(', ') + (ids.length > 20 ? ' …' : '') + ']：先用 list_nodes（可带 filter 按类型/标题过滤）取真实 id，不要复用上一次或别的页面的 nodeId。');
+          const found = (node.widgets || []).find(w => w.name === change.widget);
+          if (!found || found.type === 'button') {
+            const names = (node.widgets || []).filter(w => w.type !== 'button').map(w => w.name);
+            throw fail('可编辑参数不存在：' + change.nodeId + '.' + change.widget,
+              '节点 ' + change.nodeId + '（' + node.type + '）的可写控件名是 [' + names.join(', ') + ']：用其中之一，或先 list_nodes detail=values 看清 name。');
+          }
+          const { widget, reroutedFrom } = writeTarget(node, found);
+          const current = widgetReadback(widget);
+          const kindOf = value => Array.isArray(value) ? 'array' : value === null ? 'null' : typeof value;
+          if (typeof current === 'number' && (typeof change.value !== 'number' || !Number.isFinite(change.value))) throw fail(widget.name + ' 必须是数字', widget.name + ' 当前是数字 ' + current + '，提交的是 ' + kindOf(change.value) + ' ' + JSON.stringify(change.value) + '：传裸数字，别传字符串或对象。');
+          if (typeof current === 'string' && typeof change.value !== 'string') throw fail(widget.name + ' 必须是文本', widget.name + ' 当前是文本，提交的是 ' + kindOf(change.value) + '：传字符串（枚举值也要传原文）。');
+          if (typeof current === 'boolean' && typeof change.value !== 'boolean') throw fail(widget.name + ' 必须是布尔值', widget.name + ' 当前是布尔 ' + current + '，提交的是 ' + kindOf(change.value) + '：传 true/false，别传 0/1 或字符串。');
+          if (Array.isArray(widget.options?.values) && !widget.options.values.includes(change.value)) throw fail(widget.name + ' 的值不在可选项中；' + optionHint(widget.options.values), '当前值是 ' + JSON.stringify(current) + '，可选值见错误正文；若可选项看起来像本地化显示名，说明该 pack 在提交时做转换，改用 load_workflow 整图替换更稳。');
+          if (typeof change.value === 'number' && ((widget.options?.min != null && change.value < widget.options.min) || (widget.options?.max != null && change.value > widget.options.max))) throw fail(widget.name + ' 超出节点允许的范围', widget.name + ' 允许范围是 [' + (widget.options?.min ?? '-∞') + ', ' + (widget.options?.max ?? '+∞') + ']，当前值 ' + current + '，提交值 ' + change.value + '。');
+          return { node, widget, reroutedFrom, value: change.value, before: clone(current) };
         });
-        for (const edit of edits) edit.widget.value = edit.value;
-        for (const edit of edits) edit.widget.callback?.(edit.value, app.canvas, edit.node);
-        app.graph.setDirtyCanvas(true, true);
-        return { changed: edits.map(e => ({ nodeId: String(e.node.id), widget: e.widget.name, before: e.before, after: e.widget.value })) };
+        const results = edits.map(edit => ({ edit, outcome: writeWidget(app, edit.node, edit.widget, edit.value) }));
+        const unverified = results.filter(entry => !entry.outcome.verified);
+        return {
+          changed: results.map(({ edit, outcome }) => ({
+            nodeId: String(edit.node.id), widget: edit.widget.name,
+            ...(edit.reroutedFrom ? { requestedWidget: edit.reroutedFrom } : {}),
+            before: edit.before, after: outcome.after, via: outcome.via, verified: outcome.verified,
+            ...(outcome.cleared ? { shadowDocsCleared: outcome.cleared } : {}),
+            ...(outcome.hint ? { hint: outcome.hint } : {})
+          })),
+          ...(unverified.length ? { warning: unverified.length + ' 项写入后回读与提交值不一致（verified:false）：该控件的状态由前端组件自己持有，写控件不会生效，别把它当成改好了。每条 changed 里的 hint 给出了可执行的替代路径。', nextSteps: unverified.map(({ edit }) => 'node ' + edit.node.id + '.' + edit.widget.name + ' → 读该条 hint，别重复同一调用') } : {})
+        };
       }
       case 'load_workflow': {
         if (!args.workflow || !Array.isArray(args.workflow.nodes) || !Array.isArray(args.workflow.links)) throw new Error('请提供普通 ComfyUI 工作流 JSON（包含 nodes、links），不是 API prompt');
@@ -470,6 +611,21 @@
         } catch (error) { await replaceCurrentWorkflow(app, before); throw error; }
         return { restored: true, nodes: nodes(app) };
       }
+      case 'audit_graph': return {
+        nodes: (app.graph._nodes || []).map(node => ({
+          id: String(node.id), type: node.type, title: node.title || '', mode: node.mode ?? 0,
+          widgets: (node.widgets || []).map(widget => ({
+            name: widget.name, kind: widgetKind(widget), type: widget.type,
+            value: typeof widget.value === 'string' && widget.value.length > 200 ? widget.value.slice(0, 200) + '…' : widget.value ?? null,
+            ...(Array.isArray(widget.options?.values) ? { shown: widget.options.values.slice(0, 40) } : {})
+          })),
+          inputs: (node.inputs || []).map(input => ({ name: input.name, type: input.type, link: input.link ?? null })),
+          outputs: (node.outputs || []).map(output => ({ name: output.name, type: output.type, links: output.links || [] })),
+          shadowDocs: shadowDocs(node)
+        })),
+        linkCount: Object.keys(app.graph.links || {}).length,
+        workflowPath: activeWorkflowOf(app)?.path ?? null
+      };
       case 'run': {
         const api = apiOf();
         if (!api?.queuePrompt) throw new Error('当前 ComfyUI 前端没有 queuePrompt 接口');
@@ -497,6 +653,29 @@
       saveHistory(app, history); throw error;
     }
   }
+  // A page-side exception used to reach the caller as one bare message with no stack,
+  // which made "which pack line exploded" unanswerable from the tool side. Report the
+  // stack plus the command target, capped so a long traceback cannot flood the caller.
+  function commandTarget(command) {
+    const args = command.args || {};
+    const target = { action: command.action };
+    const first = Array.isArray(args.changes) ? args.changes[0] : null;
+    if (first) { target.nodeId = first.nodeId; target.widget = first.widget; }
+    if (args.nodeId != null) target.nodeId = args.nodeId;
+    if (typeof args.widget === 'string') target.widget = args.widget;
+    if (typeof args.filter === 'string') target.filter = args.filter;
+    return target;
+  }
+  function commandError(command, error) {
+    const e = error instanceof Error ? error : new Error(String(error));
+    const reply = { id: command.id, error: e.message || String(e), ...commandTarget(command) };
+    if (e.stack) reply.stack = String(e.stack).slice(0, 4000);
+    if (e.stage) reply.stage = e.stage;
+    if (e.widgetKind) reply.widgetKind = e.widgetKind;
+    if (e.hint) reply.hint = e.hint;
+    else reply.hint = '页面侧抛了异常，按 stack 里的文件:行号定位；若来自自定义节点包的 setter，改用该包自带的写入入口或整图替换（load_workflow），不要重复同一调用。';
+    return reply;
+  }
   async function handleCommands() {
     if (busy || handlingCommands) return;
     handlingCommands = true;
@@ -518,14 +697,14 @@
           }
           catch (e) {
             if (commandEditSequence !== undefined && commandEditSequence === editSequence) localAuthority = previousAuthority;
-            reply = { id: command.id, error: e.message || String(e) };
+            reply = commandError(command, e);
           }
           completed.set(command.id, reply);
           if (completed.size > 200) completed.delete(completed.keys().next().value);
         }
         await send('result', reply);
       }
-    } catch (e) { notify({ ready: false, error: e.message }); }
+    } catch (e) { notify({ ready: false, error: e.message, stack: String(e?.stack || '').slice(0, 2000) }); }
     finally { handlingCommands = false; }
   }
   async function connectCommands() {

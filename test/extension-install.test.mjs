@@ -65,7 +65,10 @@ test('extension installation failure does not prevent host settings and MCP tool
   await apply({ effect(fn) { const dispose = fn(); if (typeof dispose === 'function') effects.push(dispose); },
     logger: { warn: text => warnings.push(text) }, webServer: { register(route) { routes.push(route); } },
     tools: { register(tool) { tools.push(tool); } } });
-  assert.equal(tools.length, 27); assert.equal(warnings.length, 1); assert.match(warnings[0], /安装失败/);
+  // 31 = the 29 canvas/data tools plus environment doctor and usage notes; an install failure
+  // must still leave a way to ask "what is actually broken", so doctor counts as a host tool
+  // like the rest, and a note left by a previous session must survive a broken install.
+  assert.equal(tools.length, 31); assert.equal(warnings.length, 1); assert.match(warnings[0], /安装失败/);
   let settings;
   const response = { writeHead(code) { assert.equal(code, 200); }, end(body) { settings = JSON.parse(body); } };
   await routes.find(route => route.path === '/dsh-comfyui/api').handler({ method: 'GET', headers: {} }, response);

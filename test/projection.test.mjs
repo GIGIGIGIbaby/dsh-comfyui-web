@@ -162,7 +162,10 @@ test('list_nodes drops parameter values above the budget and restores them on de
 });
 
 test('tool surface keeps its size and gains only optional projection modes', () => {
-  assert.equal(MCP_TOOLS.length, 27, 'no tools added or removed');
+  // 31 = the 27 tools the projection change measured, plus the write-lease control, audit,
+  // environment doctor and usage notes. Pinning the exact number keeps a silently dropped
+  // registration from passing as "still lists tools".
+  assert.equal(MCP_TOOLS.length, 31, 'no tools added or removed');
   for (const name of ['get_workflow', 'queue', 'history']) {
     const tool = MCP_TOOLS.find(item => item.name === name);
     assert.deepEqual(tool.inputSchema.properties.mode.enum, name === 'get_workflow' ? ['auto', 'full', 'summary'] : ['auto', 'full']);
