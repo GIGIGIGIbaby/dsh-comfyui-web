@@ -3,7 +3,7 @@
   if (window.__DSH_COMFYUI_BRIDGE_ACTIVE__) return;
   window.__DSH_COMFYUI_BRIDGE_ACTIVE__ = true;
   const bridgeProtocol = 5;
-  const bridgeVersion = '0.5.10';
+  const bridgeVersion = '0.5.9';
   const bootstrap = window.__DSH_COMFYUI_BOOTSTRAP__ || {};
   let token = bootstrap.token || __DSH_BRIDGE_TOKEN__;
   const bridgeBase = bootstrap.bridgeBase || location.origin;
@@ -36,13 +36,6 @@
   if (embedded) { try { parentOrigin = new URL(document.referrer).origin; } catch { return; } }
   let allowAI = embedded; let visible = true; let busy = false;
   let revision = 0; let lastFingerprint; let initialized = false; let syncOwner, syncPath;
-  let pointerHeld = false;
-  const heldKeys = new Set();
-  function manualEditing() {
-    if (document.visibilityState === 'hidden' || document.hasFocus?.() === false) return false;
-    return pointerHeld || heldKeys.size > 0 || !!document.activeElement?.matches?.(
-      'input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]');
-  }
   const histories = new Map(); const completed = new Map();
   const commandQueue = []; let handlingCommands = false, commandStream, reconnectTimer;
   const appOf = () => window.comfyAPI?.app?.app;
@@ -123,49 +116,32 @@
     const sentVersion = graphVersionOf(app);
     let workflow, current;
     if (push) { workflow = snapshot(app); current = fingerprint(workflow); }
-    // Keep a baseline even before the first exchange finishes. A user can edit
-    // while the initial pull is waiting or deferred by an active input field.
-    if (!initialized && lastFingerprint === undefined) lastFingerprint = current;
-    const changed = workflow !== undefined && (current !== lastFingerprint ||
-      (!initialized && !embedded && owner.isModified === true));
+    const changed = workflow !== undefined && initialized && current !== lastFingerprint;
     // Consume only the force flag present at request time; an event arriving while
     // awaiting the network must still force the next reconciliation.
     forceSync = false;
     let update;
-    // A forced reconciliation is not a local edit. In particular, do not publish
-    // browser-specific defaults introduced by a previous graph load on focus/SSE resume.
-    try { update = await send('sync', { workflowKey: owner.path, revision, ...(!initialized || changed ? { workflow, fingerprint: current } : {}) }); }
+    try { update = await send('sync', { workflowKey: owner.path, revision, ...(workflow ? { workflow, fingerprint: current } : {}) }); }
     catch (error) { forceSync = true; throw error; }
     // A manual workflow switch can finish while the network request is pending.
     // Defer the response rather than applying it to the new tab or a loading graph.
     if (!graphReady(app) || activeWorkflowOf(app) !== owner) return;
-    let loadedRemote = false;
     if (update.workflow) {
-      // Text widgets can change before the change tracker advances its counter.
-      // Check the actual graph before every destructive remote replacement.
-      const liveFingerprint = fingerprint(snapshot(app));
-      const editedWhileWaiting = liveFingerprint !== (current ?? lastFingerprint);
+      const nowVersion = graphVersionOf(app);
+      const editedWhileWaiting = sentVersion != null && nowVersion != null
+        ? nowVersion !== sentVersion : fingerprint(snapshot(app)) !== (current ?? lastFingerprint);
       // Do not overwrite an edit made after this request's snapshot. Retry with
       // that edit and the original revision so normal conflict recovery sees it.
       if (editedWhileWaiting) { forceSync = true; return; }
       if (update.conflict && changed) {
-        try { localStorage.setItem('dsh.comfyui.sync-conflict.' + clientId, JSON.stringify(update.workflow)); } catch {}
-        notify({ warning: '另一页也修改了工作流，已保留本页编辑；另一页版本已备份到浏览器，正在重新同步。' });
-        // Keep the unsent local edit and retry against the revision just observed.
-        // An idle page has no changed content, so it cannot win this retry.
-        revision = update.revision; forceSync = true;
-        return;
+        try { localStorage.setItem('dsh.comfyui.sync-conflict.' + clientId, JSON.stringify(workflow)); } catch {}
+        notify({ warning: '另一页也修改了工作流，已同步最新图；本页冲突副本保存在浏览器中。' });
       }
-      if (fingerprint(update.workflow) !== liveFingerprint) {
-        if (manualEditing()) { forceSync = true; return; }
-        await replaceCurrentWorkflow(app, update.workflow); loadedRemote = true;
-      }
+      if (fingerprint(update.workflow) !== current) { await replaceCurrentWorkflow(app, update.workflow); forceSync = true; }
       lastFingerprint = fingerprint(snapshot(app));
     } else if (workflow) lastFingerprint = current;
     // A version observed AFTER awaiting a response may include unsent local edits.
-    // Loading a remote graph may normalize node data and bump the local counter.
-    // That is the new local baseline, not an edit to echo back to the other page.
-    lastGraphVersion = loadedRemote ? graphVersionOf(app) : sentVersion;
+    lastGraphVersion = sentVersion;
     revision = update.revision; initialized = true;
   }
   // Keep lightweight cross-tab sync responsive. Only the backup command poll is
@@ -486,14 +462,7 @@
       stream.onerror = () => { stream.close(); reconnectTimer = setTimeout(connectCommands, 2000); };
     } catch (error) { notify({ ready: false, error: error.message }); reconnectTimer = setTimeout(connectCommands, 2000); }
   }
-  document.addEventListener?.('pointerdown', () => { pointerHeld = true; }, true);
-  for (const name of ['pointerup', 'pointercancel']) document.addEventListener?.(name, () => { pointerHeld = false; forceSync = true; }, true);
-  document.addEventListener?.('keydown', event => { heldKeys.add(event.code || event.key); }, true);
-  document.addEventListener?.('keyup', event => { heldKeys.delete(event.code || event.key); forceSync = true; }, true);
-  for (const name of ['input', 'change', 'focusout']) document.addEventListener?.(name, () => { forceSync = true; }, true);
-  const clearInteraction = () => { pointerHeld = false; heldKeys.clear(); };
-  window.addEventListener('blur', clearInteraction);
-  document.addEventListener?.('visibilitychange', () => { if (document.visibilityState === 'hidden') clearInteraction(); forceSync = true; send('state', {}).catch(() => {}); handleCommands(); });
+  document.addEventListener?.('visibilitychange', () => { forceSync = true; send('state', {}).catch(() => {}); handleCommands(); });
   window.addEventListener('pagehide', () => { commandStream?.close(); clearTimeout(reconnectTimer); });
   window.addEventListener('pageshow', event => { if (event.persisted) { forceSync = true; connectCommands(); } });
   connectCommands();
