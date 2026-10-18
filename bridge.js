@@ -346,6 +346,68 @@
       && String(widgetReadback(other) ?? '') === String(widget.value ?? ''));
     return sibling ? { widget: sibling, reroutedFrom: widget.name } : { widget, reroutedFrom: null };
   }
+  // The front-end persists every graph change as a localStorage draft; when the origin's
+  // quota is full the write itself fails and the user gets a toast the tool side can neither
+  // see nor dismiss. A silent page-wide side effect deserves a number in the reply: measure
+  // the keys ComfyUI uses for drafts so a caller can tell "full" from "normal".
+  function draftStorage() {
+    const facts = { available: false, usedChars: 0, keys: [], persistSetting: null, blocking: null };
+    try {
+      const store = typeof localStorage === 'undefined' ? null : localStorage;
+      if (!store || typeof store.length !== 'number' || typeof store.key !== 'function') {
+        facts.blocking = '当前页面没有可枚举的 localStorage';
+        return facts;
+      }
+      facts.available = true;
+      for (let index = 0; index < store.length; index += 1) {
+        const key = store.key(index);
+        // Every draft family starts here: Draft.v2, DraftIndex.v2, DraftOrder, Drafts. The
+        // persistence switch shares the prefix but is a flag, not a payload — counting its 4
+        // characters would make the number describe something else than the store's size.
+        if (!String(key).startsWith('Comfy.Workflow.') || key === 'Comfy.Workflow.Persist') continue;
+        const value = store.getItem(key) ?? '';
+        facts.keys.push({ key, chars: String(value).length });
+        facts.usedChars += String(value).length;
+      }
+      facts.persistSetting = store.getItem('Comfy.Workflow.Persist');
+    } catch (error) { facts.blocking = error.message || String(error); }
+    return facts;
+  }
+  // ComfyUI runs some parameter changes through the node's own autofill driver: writing a
+  // prompt can rewrite downstream widgets a few hundred milliseconds later, so a reply that
+  // lists only the node we touched reads as "nothing else moved".
+  const downstreamOf = (app, node) => {
+    const graph = app.graph || {};
+    const links = graph.links || {};
+    const found = [], seen = new Set();
+    for (const output of node.outputs || []) for (const linkId of output.links || []) {
+      const link = links[linkId] || (Array.isArray(links) ? links.find(item => item && item.id === linkId) : null);
+      const target = link?.target_id != null ? graph.getNodeById?.(link.target_id) : null;
+      if (target && !seen.has(String(target.id))) { seen.add(String(target.id)); found.push(target); }
+    }
+    return found;
+  };
+  const widgetSnapshot = node => {
+    const map = {};
+    for (const widget of node.widgets || []) {
+      try { map[widget.name] = widgetReadback(widget); } catch { map[widget.name] = widget.value ?? null; }
+    }
+    return map;
+  };
+  const diffSnapshot = (before, after) => {
+    const changed = [];
+    for (const [name, previous] of Object.entries(before)) {
+      if (!Object.prototype.hasOwnProperty.call(after, name)) continue;
+      if (String(previous ?? '') !== String(after[name] ?? '')) changed.push({ widget: name, before: previous ?? null, after: after[name] ?? null });
+    }
+    return changed;
+  };
+  // The autofill driver is debounced (~400ms in the front-end), so the read-back above can be
+  // true and still get overwritten later. Watch the wired-down nodes across that window and
+  // report what actually moved instead of promising the canvas stood still.
+  const SETTLE_MS = 600;
+  const settle = ms => new Promise(resolve => setTimeout(resolve, ms));
+
   // A failed write has to say which step failed and what to try instead; a bare
   // "Cannot destructure property 'e' of 'undefined'" tells the caller nothing.
   const writeHint = (kind, node, widget) => {
@@ -391,6 +453,44 @@
     const verified = String(after ?? '') === String(value);
     return { kind, via: setter ? (widget.options?.setValue ? 'dom-setter' : 'native-setter') : kind === 'plain' ? 'value+callback' : kind,
       verified, after, cleared, ...(verified ? {} : { hint: writeHint(kind, node, widget) }) };
+  }
+  // Writing one widget can make the pack rewrite the nodes wired below it (AICG3D's prompt
+  // editor refills segments ~400ms after a change). Snapshot those nodes first, let the
+  // debounce land, then diff: a reply that only lists the node we touched reads as "nothing
+  // else moved", which is exactly the false success the tool face is supposed to prevent.
+  function watchDownstream(app, targets) {
+    const watched = [];
+    for (const node of targets) for (const target of downstreamOf(app, node))
+      watched.push({ node, peer: target, id: String(target.id), type: target.type, widgets: widgetSnapshot(target) });
+    return watched;
+  }
+  async function followUpWrite(app, edits, outcomes, watched) {
+    const report = {};
+    // No wiring below the touched nodes means no cascade to wait for: stay fast.
+    if (!watched.length) return report;
+    await settle(SETTLE_MS);
+    const late = [];
+    outcomes.forEach((outcome, index) => {
+      const edit = edits[index];
+      let after; try { after = widgetReadback(edit.widget); } catch { after = edit.widget.value; }
+      if (String(after ?? '') !== String(outcome.after ?? '')) {
+        outcome.after = after; outcome.verified = String(after ?? '') === String(edit.value);
+        late.push({ nodeId: String(edit.node.id), widget: edit.widget.name, value: after, now: outcome.verified ? 'accepted' : 'overwritten' });
+      }
+    });
+    const cascaded = [];
+    for (const entry of watched) {
+      const after = widgetSnapshot(entry.peer);
+      for (const change of diffSnapshot(entry.widgets, after))
+        cascaded.push({ fromNodeId: String(entry.node.id), nodeId: entry.id, type: entry.type, ...change });
+    }
+    report.settledMs = SETTLE_MS;
+    if (late.length) report.lateChange = late;
+    if (cascaded.length) {
+      report.cascaded = cascaded;
+      report.cascadedNote = '等待 ' + SETTLE_MS + 'ms 让前端防抖落定后，下游节点被联动改写 ' + cascaded.length + ' 处（' + [...new Set(cascaded.map(item => item.nodeId))].map(id => 'node ' + id).join('、') + '）。这不在本批 changes 里，是节点包自己的 autofill 行为：如果这些下游值本来是手调的，写回去。';
+    }
+    return report;
   }
   const optionHint = values => {
     const shown = values.slice(0, 12).map(v => JSON.stringify(v)).join(', ');
@@ -579,7 +679,12 @@
           if (typeof change.value === 'number' && ((widget.options?.min != null && change.value < widget.options.min) || (widget.options?.max != null && change.value > widget.options.max))) throw fail(widget.name + ' 超出节点允许的范围', widget.name + ' 允许范围是 [' + (widget.options?.min ?? '-∞') + ', ' + (widget.options?.max ?? '+∞') + ']，当前值 ' + current + '，提交值 ' + change.value + '。');
           return { node, widget, reroutedFrom, value: change.value, before: clone(current) };
         });
+        // Snapshot the wired-down nodes before the first write, then read the canvas again once
+        // the pack's autofill debounce has landed. A batch of pure parameters touches nothing
+        // below it, and the wait is skipped entirely.
+        const watched = watchDownstream(app, edits.map(edit => edit.node));
         const results = edits.map(edit => ({ edit, outcome: writeWidget(app, edit.node, edit.widget, edit.value) }));
+        const followUp = await followUpWrite(app, edits, results.map(entry => entry.outcome), watched);
         const unverified = results.filter(entry => !entry.outcome.verified);
         return {
           changed: results.map(({ edit, outcome }) => ({
@@ -589,6 +694,7 @@
             ...(outcome.cleared ? { shadowDocsCleared: outcome.cleared } : {}),
             ...(outcome.hint ? { hint: outcome.hint } : {})
           })),
+          ...followUp,
           ...(unverified.length ? { warning: unverified.length + ' 项写入后回读与提交值不一致（verified:false）：该控件的状态由前端组件自己持有，写控件不会生效，别把它当成改好了。每条 changed 里的 hint 给出了可执行的替代路径。', nextSteps: unverified.map(({ edit }) => 'node ' + edit.node.id + '.' + edit.widget.name + ' → 读该条 hint，别重复同一调用') } : {})
         };
       }
@@ -624,7 +730,11 @@
           shadowDocs: shadowDocs(node)
         })),
         linkCount: Object.keys(app.graph.links || {}).length,
-        workflowPath: activeWorkflowOf(app)?.path ?? null
+        workflowPath: activeWorkflowOf(app)?.path ?? null,
+        // The canvas autosaves itself into localStorage; when that quota is full the front-end
+        // throws a toast and stops persisting for the rest of the session. The tool side cannot
+        // prevent it, so it measures it and lets doctor judge it.
+        draftStorage: draftStorage()
       };
       case 'run': {
         const api = apiOf();

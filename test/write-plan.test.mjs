@@ -4,7 +4,7 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ComfyRuntime } from '../lib/runtime.js';
-import { callComfyTool } from '../lib/mcp.js';
+import { callComfyTool, draftEnvelope } from '../lib/mcp.js';
 import { planWrites, writeEnvelope } from '../lib/write-plan.js';
 
 // A canvas fact shaped exactly like bridge.js list_nodes: writable is 'ok' | 'risky' | 'no',
@@ -159,4 +159,75 @@ test('update_nodes still writes when the plan passes, and reports what landed', 
   assert.equal(reply.structuredContent.status, 'written');
   assert.equal(reply.structuredContent.changed[0].after, 26);
   assert.deepEqual(reply.structuredContent.planned.map(item => item.widget), ['steps']);
+});
+
+test('a cascade the pack caused is reported apart from the batch that caused it', () => {
+  const envelope = writeEnvelope({
+    changed: [{ nodeId: '195', widget: 'text', before: '', after: '镜1', via: 'dom-setter', verified: true }],
+    settledMs: 600,
+    cascaded: [{ fromNodeId: '195', nodeId: '107', type: 'AIC3D_H3Sequence', widget: 'segments', before: 1, after: 4 }],
+    cascadedNote: '下游节点被联动改写了 1 处（node 107）'
+  }, [{ nodeId: 195, widget: 'text', value: '镜1' }]);
+  assert.equal(envelope.status, 'written');
+  assert.deepEqual(envelope.cascaded.map(item => item.nodeId), ['107']);
+  assert.match(envelope.cascadedNote, /node 107/);
+});
+
+test('a value the front-end debounce overwrites is reported as a partial write, not a success', () => {
+  const envelope = writeEnvelope({
+    changed: [{ nodeId: '195', widget: 'mode', before: '分隔线 ---', after: '每行一段', via: 'dom-setter', verified: true }],
+    settledMs: 600,
+    lateChange: [{ nodeId: '195', widget: 'mode', value: '分隔线 ---', now: 'overwritten' }]
+  }, [{ nodeId: 195, widget: 'mode', value: '每行一段' }]);
+  assert.equal(envelope.status, 'partial', 'the read-back was true and then became false');
+  assert.equal(envelope.written, false);
+  assert.match(envelope.summary, /600ms 后被前端防抖改写回去了/);
+  assert.deepEqual(envelope.lateChange.map(item => item.now), ['overwritten']);
+});
+
+test('the draft store is described honestly whether it was measurable or not', () => {
+  const unreadable = draftEnvelope({ available: false, blocking: '当前页面没有可枚举的 localStorage' });
+  assert.equal(unreadable.unavailable, '当前页面没有可枚举的 localStorage');
+  assert.equal(unreadable.usedChars, undefined, 'an unmeasured store must not report a size');
+
+  const roomy = draftEnvelope({ available: true, usedChars: 1200, keys: [{ key: 'Comfy.Workflow.Draft.v2:x', chars: 1200 }] });
+  assert.equal(roomy.usedChars, 1200);
+  assert.deepEqual(roomy.keys, ['Comfy.Workflow.Draft.v2:x']);
+  assert.match(roomy.advice, /不影响画布里的值/);
+
+  const tight = draftEnvelope({ available: true, usedChars: 4_200_000, keys: [] });
+  assert.match(tight.advice, /保存工作流草稿失败|Comfy.Workflow.Persist/);
+});
+
+test('a caller that passes one change at the top level is handed the exact payload to resend', async t => {
+  const rt = await runtime(); t.after(() => rt.stop());
+  rt.clients.set('pA', { id: 'pA', sessionId: 'A', ready: true, allowAI: true, visible: true, seen: Date.now(), queue: [] });
+  const dispatched = [];
+  rt.command = async (sessionId, action) => { dispatched.push(action); return { nodes }; };
+  const error = await callComfyTool(rt, 'update_nodes', { nodeId: 78, widget: 'steps', value: 26 }, { dshSessionId: 'A' })
+    .then(() => null, failure => failure);
+  assert.ok(error, 'a misplaced key must fail rather than plan an empty batch');
+  assert.match(error.message, /参数名是 changes（收到的是 nodeId \/ widget \/ value）/);
+  assert.match(error.message, /包进 changes 的一项里/);
+  assert.deepEqual(error.example, { changes: [{ nodeId: 78, widget: 'steps', value: 26 }] }, 'the example is the caller\'s own value, ready to paste');
+  assert.deepEqual(error.receivedKeys, ['nodeId', 'widget', 'value']);
+  assert.deepEqual(dispatched, [], 'nothing reached the canvas');
+});
+
+test('list_nodes only speaks about notes when it has one to speak about', async t => {
+  const rt = await runtime(); t.after(() => rt.stop());
+  rt.clients.set('pA', { id: 'pA', sessionId: 'A', ready: true, allowAI: true, visible: true, seen: Date.now(), queue: [] });
+  rt.command = async () => ({ nodes: [{ id: '78', type: 'KSampler', widgets: [] }], workflowPath: 'workflows/H3.json' });
+
+  const quiet = await callComfyTool(rt, 'list_nodes', {}, { dshSessionId: 'A' });
+  assert.deepEqual(quiet.structuredContent, { nodes: [{ id: '78', type: 'KSampler', widgets: [] }], workflowPath: 'workflows/H3.json' },
+    'a canvas with no known gotchas comes back exactly as the page sent it');
+
+  await rt.noteStore.add('node:KSampler', 'steps above 30 times out on this box');
+  await rt.noteStore.add('node:OtherNode', 'a note about a node that is not on this canvas');
+  const noted = await callComfyTool(rt, 'list_nodes', {}, { dshSessionId: 'A' });
+  assert.deepEqual(noted.structuredContent.nodes[0].usageNotes, ['steps above 30 times out on this box'],
+    'the note rides along with the node it is about');
+  assert.deepEqual(noted.structuredContent.usageNotes.map(group => group.target), ['node:KSampler'],
+    'and a note for a type that is not on the canvas stays out of the reply');
 });

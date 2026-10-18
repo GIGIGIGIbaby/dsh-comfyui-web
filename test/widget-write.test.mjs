@@ -10,11 +10,11 @@ const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(r => 
 // that owns the value, a structured "reference document" in node.properties that shadows
 // writes, a localized combo whose options are display strings, and a setter that just
 // refuses to apply.
-async function boot(nodes) {
+async function boot(nodes, options = {}) {
   const code = (await readFile(new URL('../bridge.js', import.meta.url), 'utf8')).replace('__DSH_BRIDGE_TOKEN__', '"test"');
   const timers = [], replies = [], commands = [];
   const graph = {
-    _nodes: nodes,
+    _nodes: nodes, links: options.links || [],
     serialize: () => ({ nodes: nodes.map(n => ({ id: n.id, type: n.type, widgets_values: (n.widgets || []).map(w => w.value) })), links: [], groups: [] }),
     setDirtyCanvas() {},
     getNodeById(id) { return nodes.find(node => String(node.id) === String(id)); }
@@ -28,7 +28,7 @@ async function boot(nodes) {
     crypto: { randomUUID: () => 'u' + Math.random() }, URL, URLSearchParams, console,
     location: { origin: 'http://comfy.test', search: '?dsh_client=p&dsh_session=own', href: 'http://comfy.test/' },
     document: { referrer: 'http://dsh.test/', visibilityState: 'visible', addEventListener() {} },
-    localStorage: { getItem: () => null, setItem() {} },
+    localStorage: options.localStorage || { getItem: () => null, setItem() {} },
     setTimeout: fn => timers.push(fn), clearTimeout() {},
     fetch: async (url, options) => {
       const body = options?.body ? JSON.parse(options.body) : {};
@@ -39,7 +39,14 @@ async function boot(nodes) {
   await flush();
   return async (action, args = {}) => {
     commands.push({ id: 'c' + (replies.length + 1), action, args });
-    timers.shift()(); await flush();
+    // A write can park on the 600ms settle window, so keep running whatever the bridge queued
+    // until the reply lands instead of firing exactly one timer and assuming it is done.
+    const before = replies.length;
+    for (let turn = 0; turn < 60 && replies.length === before; turn += 1) {
+      const next = timers.shift();
+      if (next) next();
+      await flush();
+    }
     const reply = replies.at(-1);
     // The bridge reports the message and the next step separately (the MCP layer joins them
     // with "下一步："). Keep both reachable so a test can assert on the actionable half.
@@ -227,4 +234,58 @@ test('list_nodes filter matches the node id and an empty hit says what the ids a
   const miss = await command('list_nodes', { filter: 'zzz' });
   assert.equal(miss.nodes.length, 0);
   assert.match(miss.filterHint, /当前画布 2 个节点/);
+});
+
+// A full localStorage is the difference between "written" and a red toast on the user's screen,
+// and it is invisible from the write itself. The page measures it, the reply reports it.
+const fakeStorage = entries => {
+  const keys = Object.keys(entries);
+  return {
+    get length() { return keys.length; },
+    key(index) { return keys[index] ?? null; },
+    getItem(key) { return Object.prototype.hasOwnProperty.call(entries, key) ? entries[key] : null; },
+    setItem() {}
+  };
+};
+
+test('audit_graph measures the front-end draft store instead of guessing whether it is full', async () => {
+  const command = await boot([plainNode()], {
+    localStorage: fakeStorage({
+      'Comfy.Workflow.Draft.v2:workflows/H3.json': 'x'.repeat(120),
+      'Comfy.Workflow.DraftIndex.v2:personal': 'y'.repeat(30),
+      'Comfy.Workflow.Persist': 'true',
+      'unrelated.key': 'z'.repeat(999)
+    })
+  });
+  const audit = await command('audit_graph');
+  assert.equal(audit.draftStorage.available, true);
+  assert.equal(audit.draftStorage.usedChars, 150, 'only Comfy draft keys count, unrelated storage does not');
+  assert.deepEqual(audit.draftStorage.keys.map(item => item.key), [
+    'Comfy.Workflow.Draft.v2:workflows/H3.json', 'Comfy.Workflow.DraftIndex.v2:personal'
+  ]);
+  assert.equal(audit.draftStorage.persistSetting, 'true');
+});
+
+test('a write that makes the pack rewrite the nodes below it reports the cascade', async () => {
+  const upstream = plainNode();
+  const downstream = { id: 9, type: 'AICG3D_H3Sequence', title: '', mode: 0, properties: {},
+    widgets: [{ name: 'segments', type: 'number', value: 1, options: {}, callback: () => {} }], inputs: [], outputs: [] };
+  // The autofill driver: changing "steps" refills the wired node a debounce later, which is
+  // exactly the rewrite a reply that only lists the touched node would hide.
+  upstream.widgets[0].callback = () => { downstream.widgets[0].value = 4; };
+  upstream.outputs = [{ name: 'out', type: 'LATENT', links: [100] }];
+  const command = await boot([upstream, downstream], { links: [{ id: 100, origin_id: 1, target_id: 9 }] });
+  const result = await command('update_nodes', { changes: [{ nodeId: 1, widget: 'steps', value: 21 }] });
+  assert.equal(result.changed[0].verified, true);
+  assert.equal(result.settledMs, 600, 'the reply says how long it waited before trusting the read-back');
+  assert.deepEqual(result.cascaded.map(item => [item.nodeId, item.widget, item.before, item.after]), [['9', 'segments', 1, 4]]);
+  assert.match(result.cascadedNote, /不在本批 changes 里/);
+  assert.match(result.cascadedNote, /node 9/);
+});
+
+test('a batch of pure parameters does not pay the settle wait', async () => {
+  const command = await boot([plainNode()]);
+  const result = await command('update_nodes', { changes: [{ nodeId: 1, widget: 'steps', value: 33 }] });
+  assert.equal(result.settledMs, undefined, 'nothing is wired below node 1, so nothing can cascade');
+  assert.equal(result.cascaded, undefined);
 });

@@ -25,11 +25,11 @@ test('the first canvas write takes the lease and a second conversation is refuse
 
   await assert.rejects(callComfyTool(rt, 'update_nodes', { changes: [{ nodeId: 1, widget: 'seed', value: 4 }] }, { dshSessionId: 'B' }),
     /写租约被另一条对话持有（A，空闲 \d+ 秒）/);
-  // A's successful write costs two dispatches: the read the two-phase plan makes before it
-  // commits, then the write itself. B's refusal must not add a third — and in particular must
-  // not add an update_nodes, because a refused write that still reads the canvas is fine while
-  // one that still writes is not.
-  assert.deepEqual(dispatched.map(item => item.action), ['list_nodes', 'update_nodes']);
+  // A's successful write costs three dispatches: the read the two-phase plan makes before it
+  // commits, the write itself, then the audit_graph that measures the front-end draft store for
+  // the reply. B's refusal must add none of them — in particular no update_nodes, because a
+  // refused write that still reads the canvas is fine while one that still writes is not.
+  assert.deepEqual(dispatched.map(item => item.action), ['list_nodes', 'update_nodes', 'audit_graph']);
   assert.equal(dispatched.filter(item => item.action === 'update_nodes').length, 1, 'the refused write never reached the canvas');
 
   // Reads stay free while someone holds the lease.
