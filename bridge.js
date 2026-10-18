@@ -376,14 +376,52 @@
   // ComfyUI runs some parameter changes through the node's own autofill driver: writing a
   // prompt can rewrite downstream widgets a few hundred milliseconds later, so a reply that
   // lists only the node we touched reads as "nothing else moved".
+  // The graph keeps its links in a Map keyed by link id (graph.links.get(id)) — not the plain
+  // object older litegraph versions exposed. Reading graph.links[id] on a Map silently yields
+  // undefined for every id, which is why a node with four outgoing links reported no downstream
+  // nodes at all. This one helper is also what audit_graph counts, so both agree with the
+  // serialized workflow instead of always answering 0.
+  const linkTable = graph => (graph?.links || null);
+  const linkById = (graph, linkId) => {
+    const table = linkTable(graph);
+    if (!table) return null;
+    if (typeof table.get === 'function') return table.get(linkId) ?? null;
+    if (Array.isArray(table)) return table.find(item => item && (item.id === linkId || item[0] === linkId)) ?? null;
+    return table[linkId] ?? null;
+  };
+  const linkCount = graph => {
+    const table = linkTable(graph);
+    if (!table) return 0;
+    if (typeof table.size === 'number') return table.size;
+    if (Array.isArray(table)) return table.length;
+    return Object.keys(table).length;
+  };
+  // litegraph exposes the wiring per slot through node.getOutputNodes(slot), which works whether
+  // the graph keeps links in a Map or a plain object. Ask it first and only fall back to the link
+  // table when the node object is too old to have it.
   const downstreamOf = (app, node) => {
     const graph = app.graph || {};
-    const links = graph.links || {};
     const found = [], seen = new Set();
-    for (const output of node.outputs || []) for (const linkId of output.links || []) {
-      const link = links[linkId] || (Array.isArray(links) ? links.find(item => item && item.id === linkId) : null);
-      const target = link?.target_id != null ? graph.getNodeById?.(link.target_id) : null;
-      if (target && !seen.has(String(target.id))) { seen.add(String(target.id)); found.push(target); }
+    const push = target => {
+      if (!target || seen.has(String(target.id))) return;
+      seen.add(String(target.id));
+      found.push(target);
+    };
+    const outputs = node.outputs || [];
+    if (typeof node.getOutputNodes === 'function' && outputs.length) {
+      let answered = false;
+      outputs.forEach((output, slot) => {
+        let peers = null;
+        try { peers = node.getOutputNodes(slot); } catch { peers = null; }
+        if (!Array.isArray(peers)) return;
+        answered = true;
+        for (const peer of peers) push(peer);
+      });
+      if (answered) return found;
+    }
+    for (const output of outputs) for (const linkId of output.links || []) {
+      const link = linkById(graph, linkId);
+      push(link?.target_id != null ? graph.getNodeById?.(link.target_id) : null);
     }
     return found;
   };
@@ -729,7 +767,7 @@
           outputs: (node.outputs || []).map(output => ({ name: output.name, type: output.type, links: output.links || [] })),
           shadowDocs: shadowDocs(node)
         })),
-        linkCount: Object.keys(app.graph.links || {}).length,
+        linkCount: linkCount(app.graph),
         workflowPath: activeWorkflowOf(app)?.path ?? null,
         // The canvas autosaves itself into localStorage; when that quota is full the front-end
         // throws a toast and stops persisting for the rest of the session. The tool side cannot

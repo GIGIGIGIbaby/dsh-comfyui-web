@@ -266,6 +266,38 @@ test('audit_graph measures the front-end draft store instead of guessing whether
   assert.equal(audit.draftStorage.persistSetting, 'true');
 });
 
+test('links stored in a Map are followed, not silently reported as none', async () => {
+  // Newer litegraph keeps graph.links in a Map. Reading graph.links[id] on a Map is undefined
+  // for every id, so a node with four outgoing links looked completely unwired.
+  const upstream = plainNode();
+  const downstream = { id: 9, type: 'AICG3D_H3Sequence', title: '', mode: 0, properties: {},
+    widgets: [{ name: 'segments', type: 'number', value: 1, options: {}, callback: () => {} }], inputs: [], outputs: [] };
+  upstream.widgets[0].callback = () => { downstream.widgets[0].value = 7; };
+  upstream.outputs = [{ name: 'out', type: 'LATENT', links: [100] }];
+  const command = await boot([upstream, downstream], { links: new Map([[100, { id: 100, origin_id: 1, target_id: 9 }]]) });
+  const result = await command('update_nodes', { changes: [{ nodeId: 1, widget: 'steps', value: 21 }] });
+  assert.equal(result.settledMs, 600, 'the wiring was seen, so the settle wait was paid');
+  assert.deepEqual(result.cascaded.map(item => [item.nodeId, item.widget, item.before, item.after]), [['9', 'segments', 1, 7]]);
+  const audit = await command('audit_graph');
+  assert.equal(audit.linkCount, 1, 'the audit counts the same links the write path follows');
+});
+
+test('the graph is asked for its own downstream nodes before any link table is read', async () => {
+  // output.links is deprecated in newer litegraph and can be empty while the slot is wired.
+  // node.getOutputNodes(slot) is the API the front-end itself uses, so it must win.
+  const upstream = plainNode();
+  const downstream = { id: 9, type: 'AICG3D_H3Sequence', title: '', mode: 0, properties: {},
+    widgets: [{ name: 'segments', type: 'number', value: 1, options: {}, callback: () => {} }], inputs: [], outputs: [] };
+  upstream.widgets[0].callback = () => { downstream.widgets[0].value = 5; };
+  upstream.outputs = [{ name: 'out', type: 'LATENT', links: [] }];
+  upstream.getOutputNodes = slot => (slot === 0 ? [downstream] : null);
+  // The link table is empty on purpose: only getOutputNodes can answer here.
+  const command = await boot([upstream, downstream], { links: new Map() });
+  const result = await command('update_nodes', { changes: [{ nodeId: 1, widget: 'steps', value: 21 }] });
+  assert.equal(result.settledMs, 600, 'the slot-level API was trusted over the deprecated links array');
+  assert.deepEqual(result.cascaded.map(item => [item.nodeId, item.widget, item.before, item.after]), [['9', 'segments', 1, 5]]);
+});
+
 test('a write that makes the pack rewrite the nodes below it reports the cascade', async () => {
   const upstream = plainNode();
   const downstream = { id: 9, type: 'AICG3D_H3Sequence', title: '', mode: 0, properties: {},
