@@ -32,7 +32,7 @@ function loadBridgeForUuidTest({ cryptoValue, randomImpl }) {
       ok: true,
       status: 200,
       async json() {
-        return { token: 'test-token', bridgeProtocol: 5, commands: [] };
+        return { token: 'test-token', bridgeProtocol: 6, commands: [] };
       },
       async text() {
         return '';

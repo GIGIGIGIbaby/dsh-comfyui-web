@@ -18,7 +18,7 @@ test('browser tab resume synchronizes into the existing workflow without duplica
   const sync = new WorkflowSync();
   const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(r => setImmediate(r)); };
   function page(clientId, external = false) {
-    const scheduled = []; const commands = []; const replies = []; const calls = [];
+    const scheduled = []; const commands = []; const replies = []; const calls = []; const events = new Map();
     let syncGate;
     const active = { path: 'shared.json' }; const tabs = [active];
     const tracker = { isLoadingGraph: false };
@@ -36,7 +36,7 @@ test('browser tab resume synchronizes into the existing workflow without duplica
     const window = { parent, comfyAPI: { app: { app }, changeTracker: { ChangeTracker: tracker } }, addEventListener() {} };
     if (external) window.parent = window;
     const context = vm.createContext({ window, crypto: { randomUUID: () => clientId }, location: { search: external ? '' : '?dsh_client=' + clientId + '&dsh_session=s' },
-      document: { referrer: 'http://127.0.0.1:3080/' }, URL, URLSearchParams,
+      document: { referrer: 'http://127.0.0.1:3080/', addEventListener(name, callback) { events.set(name, callback); } }, URL, URLSearchParams,
       localStorage: { setItem() {} }, setTimeout: fn => scheduled.push(fn), fetch: async (path, options) => {
         const data = JSON.parse(options.body);
         if (path.endsWith('/result')) replies.push(data);
@@ -45,7 +45,7 @@ test('browser tab resume synchronizes into the existing workflow without duplica
         return { ok: true, json: async () => reply };
       } });
     return { app, tracker, tabs, active, calls, replies, start() { vm.runInContext(code, context); },
-      edit(value) { graph.nodes[0].widgets_values[0] = value; }, value() { return graph.nodes[0].widgets_values[0]; },
+      edit(value) { events.get('pointerdown')?.({ isTrusted: true }); graph.nodes[0].widgets_values[0] = value; events.get('input')?.({ isTrusted: true }); events.get('pointerup')?.({ isTrusted: true }); }, value() { return graph.nodes[0].widgets_values[0]; },
       localRevision() { graph.revision++; },
       holdSync() { let release; syncGate = new Promise(resolve => { release = resolve; }); return release; },
       async tick() { scheduled.shift()(); await flush(); },
@@ -135,6 +135,11 @@ test('proxy injects bridge, forwards HTTP, rejects cross-origin writes, and isol
   assert.equal(blocked.workflow, undefined, 'old pages must never receive a graph they can load into a new tab');
   const diagnostics = runtime.status().syncClients.find(c => c.clientId === 'c');
   assert.equal(diagnostics.refreshRequired, true); assert.equal(diagnostics.bridgeVersion, 'legacy');
+  const oldPage = await bridge('sync', { bridgeProtocol: 5, bridgeVersion: '0.5.10', revision: 1,
+    workflow: { nodes: [{ id: 'old-code' }], links: [] }, fingerprint: 'old-code' });
+  assert.equal(oldPage.status, 409, 'the reverted bridge must not participate in the new synchronization protocol');
+  assert.equal((await oldPage.json()).workflow, undefined);
+  assert.equal(runtime.sync.exchange({ clientId: 'inspector' }).fingerprint, 'new');
 });
 
 test('browser bridge edits actual named widgets, validates whole batch and restores graph', async () => {

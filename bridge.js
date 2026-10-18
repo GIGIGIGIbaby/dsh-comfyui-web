@@ -2,8 +2,8 @@
   'use strict';
   if (window.__DSH_COMFYUI_BRIDGE_ACTIVE__) return;
   window.__DSH_COMFYUI_BRIDGE_ACTIVE__ = true;
-  const bridgeProtocol = 5;
-  const bridgeVersion = '0.5.9';
+  const bridgeProtocol = 6;
+  const bridgeVersion = '0.5.11';
   const bootstrap = window.__DSH_COMFYUI_BOOTSTRAP__ || {};
   let token = bootstrap.token || __DSH_BRIDGE_TOKEN__;
   const bridgeBase = bootstrap.bridgeBase || location.origin;
@@ -35,7 +35,16 @@
   let parentOrigin;
   if (embedded) { try { parentOrigin = new URL(document.referrer).origin; } catch { return; } }
   let allowAI = embedded; let visible = true; let busy = false;
-  let revision = 0; let lastFingerprint; let initialized = false; let syncOwner, syncPath;
+  let revision = 0; let lastFingerprint; let initialized = false; let syncPath;
+  let localAuthority = true, editSequence = 0, acknowledgedEditSequence = 0, applyingRemote = false;
+  const synchronization = { loaded: 0, published: 0, deferred: 0, conflicts: 0 };
+  let pointerHeld = false;
+  const heldKeys = new Set();
+  function manualEditing() {
+    if (document.visibilityState === 'hidden' || document.hasFocus?.() === false) return false;
+    return pointerHeld || heldKeys.size > 0 || !!document.activeElement?.matches?.(
+      'input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]');
+  }
   const histories = new Map(); const completed = new Map();
   const commandQueue = []; let handlingCommands = false, commandStream, reconnectTimer;
   const appOf = () => window.comfyAPI?.app?.app;
@@ -55,7 +64,8 @@
     const tabs = app?.extensionManager?.workflow?.openWorkflows;
     return { bridgeProtocol, bridgeVersion, ready: graphReady(app), allowAI,
       visible: visible && document.visibilityState !== 'hidden',
-      hasActiveWorkflow: !!activeWorkflowOf(app), workflowTabs: Array.isArray(tabs) ? tabs.length : null };
+      hasActiveWorkflow: !!activeWorkflowOf(app), workflowTabs: Array.isArray(tabs) ? tabs.length : null,
+      synchronization: { ...synchronization } };
   }
   const notify = data => { if (embedded) window.parent.postMessage({ source: 'dsh-comfyui', clientId, ...data }, parentOrigin); };
   window.addEventListener('message', event => {
@@ -105,43 +115,105 @@
       app.graph.setDirtyCanvas(true, true);
     }
   }
-  async function syncWorkflow(app, { check = true } = {}) {
+  function selectSyncWorkflow(app) {
     const owner = activeWorkflowOf(app);
-    if (!owner?.path) return;
-    if (owner !== syncOwner || owner.path !== syncPath) { syncOwner = owner; syncPath = owner.path; revision = 0; initialized = false; lastFingerprint = undefined; forceSync = true; }
+    if (!owner?.path) return null;
+    // Reactive wrappers may change while the same workflow stays active.
+    // Only a different path starts a new synchronization identity.
+    if (owner.path !== syncPath) {
+      syncPath = owner.path; revision = 0; initialized = false; lastFingerprint = undefined;
+      lastGraphVersion = null; localAuthority = true; editSequence = acknowledgedEditSequence = 0; forceSync = true;
+    }
+    return owner;
+  }
+  function localEdit(beforeChange = false) {
+    const app = appOf();
+    if (applyingRemote || !graphReady(app) || !selectSyncWorkflow(app)) return;
+    // Discard passive loader changes before a real gesture, not after it.
+    if (!localAuthority && beforeChange) {
+      lastFingerprint = fingerprint(snapshot(app)); lastGraphVersion = graphVersionOf(app);
+    }
+    localAuthority = true; editSequence++; forceSync = true;
+  }
+  async function syncWorkflow(app, { check = true } = {}) {
+    const owner = selectSyncWorkflow(app);
+    if (!owner) return;
+    const path = owner.path;
     // Detecting a change costs a whole serialize + fingerprint pass. When the graph has
     // not moved we still send the sync — that POST is how this tab pulls other tabs'
     // edits — but with an empty body, so the idle heartbeat carries no payload.
-    const push = forceSync || !initialized || (check && graphChanged(app));
+    // A graph counter alone is not proof of an edit: custom nodes also bump it
+    // from timers, preview updates and delayed sizing after a remote load.
+    const pendingLocalEdit = editSequence > acknowledgedEditSequence;
+    const push = forceSync || !initialized || (pendingLocalEdit && check && graphChanged(app));
     const sentVersion = graphVersionOf(app);
     let workflow, current;
     if (push) { workflow = snapshot(app); current = fingerprint(workflow); }
-    const changed = workflow !== undefined && initialized && current !== lastFingerprint;
+    // Keep a baseline even before the first exchange finishes. A user can edit
+    // while the initial pull is waiting or deferred by an active input field.
+    if (!initialized && lastFingerprint === undefined) lastFingerprint = current;
+    const changed = workflow !== undefined && current !== lastFingerprint;
+    const publishing = !!workflow && localAuthority && (!initialized || (changed && pendingLocalEdit));
+    const sentEditSequence = editSequence;
     // Consume only the force flag present at request time; an event arriving while
     // awaiting the network must still force the next reconciliation.
     forceSync = false;
     let update;
-    try { update = await send('sync', { workflowKey: owner.path, revision, ...(workflow ? { workflow, fingerprint: current } : {}) }); }
+    // A forced reconciliation is not a local edit. In particular, do not publish
+    // browser-specific defaults introduced by a previous graph load on focus/SSE resume.
+    try {
+      if (publishing) synchronization.published++;
+      update = await send('sync', { workflowKey: path, revision, ...(publishing
+        ? { workflow, fingerprint: current, seedOnly: !initialized && editSequence === acknowledgedEditSequence } : {}) });
+    }
     catch (error) { forceSync = true; throw error; }
     // A manual workflow switch can finish while the network request is pending.
     // Defer the response rather than applying it to the new tab or a loading graph.
-    if (!graphReady(app) || activeWorkflowOf(app) !== owner) return;
+    if (!graphReady(app) || activeWorkflowOf(app)?.path !== path) return;
+    let loadedRemote = false;
     if (update.workflow) {
-      const nowVersion = graphVersionOf(app);
-      const editedWhileWaiting = sentVersion != null && nowVersion != null
-        ? nowVersion !== sentVersion : fingerprint(snapshot(app)) !== (current ?? lastFingerprint);
+      // Text widgets can change before the change tracker advances its counter.
+      // Check the actual graph before every destructive remote replacement.
+      const liveFingerprint = fingerprint(snapshot(app));
+      const editedWhileWaiting = editSequence > acknowledgedEditSequence && liveFingerprint !== (current ?? lastFingerprint);
       // Do not overwrite an edit made after this request's snapshot. Retry with
       // that edit and the original revision so normal conflict recovery sees it.
-      if (editedWhileWaiting) { forceSync = true; return; }
-      if (update.conflict && changed) {
-        try { localStorage.setItem('dsh.comfyui.sync-conflict.' + clientId, JSON.stringify(workflow)); } catch {}
-        notify({ warning: '另一页也修改了工作流，已同步最新图；本页冲突副本保存在浏览器中。' });
+      if (editedWhileWaiting) { forceSync = true; synchronization.deferred++; return; }
+      if (update.conflict && changed && editSequence > acknowledgedEditSequence) {
+        try { localStorage.setItem('dsh.comfyui.sync-conflict.' + clientId, JSON.stringify(update.workflow)); } catch {}
+        notify({ warning: '另一页也修改了工作流，已保留本页编辑；另一页版本已备份到浏览器，正在重新同步。' });
+        // Keep the unsent local edit and retry against the revision just observed.
+        // An idle page has no changed content, so it cannot win this retry.
+        revision = update.revision; initialized = true; forceSync = true; synchronization.conflicts++;
+        return;
       }
-      if (fingerprint(update.workflow) !== current) { await replaceCurrentWorkflow(app, update.workflow); forceSync = true; }
+      if (fingerprint(update.workflow) !== liveFingerprint) {
+        if (manualEditing()) { forceSync = true; synchronization.deferred++; return; }
+        // An existing unsaved native draft is not permission to overwrite either
+        // page. Preserve it on joining; the next actual edit establishes authorship.
+        if (!initialized && !embedded && owner.isModified === true && editSequence === acknowledgedEditSequence) {
+          localAuthority = false; lastFingerprint = liveFingerprint; lastGraphVersion = graphVersionOf(app);
+          revision = update.revision; initialized = true; return;
+        }
+        applyingRemote = true;
+        try { await replaceCurrentWorkflow(app, update.workflow); loadedRemote = true; synchronization.loaded++; }
+        finally { applyingRemote = false; }
+      }
+      // Keep this page a receiver until a genuine user gesture or an MCP write.
+      // A timeout cannot cover custom-node normalization occurring much later.
+      localAuthority = false; acknowledgedEditSequence = editSequence;
       lastFingerprint = fingerprint(snapshot(app));
-    } else if (workflow) lastFingerprint = current;
+    } else if (workflow) {
+      lastFingerprint = current;
+      if (publishing) acknowledgedEditSequence = sentEditSequence;
+    }
+    if (!update.workflow && update.revision === 0 && !publishing) {
+      localAuthority = true; forceSync = true; initialized = false; return;
+    }
     // A version observed AFTER awaiting a response may include unsent local edits.
-    lastGraphVersion = sentVersion;
+    // Loading a remote graph may normalize node data and bump the local counter.
+    // That is the new local baseline, not an edit to echo back to the other page.
+    lastGraphVersion = loadedRemote ? graphVersionOf(app) : sentVersion;
     revision = update.revision; initialized = true;
   }
   // Keep lightweight cross-tab sync responsive. Only the backup command poll is
@@ -433,13 +505,21 @@
         const command = commandQueue.shift();
         let reply = completed.get(command.id);
         if (!reply) {
+          let previousAuthority, commandEditSequence;
           try {
             if (graphReady(appOf())) await syncWorkflow(appOf());
+            const writesCanvas = ['update_nodes', 'bind_image', 'load_workflow', 'undo', 'redo', 'restore_edit', 'edit_graph', 'save_workflow', 'save_as_workflow', 'switch_workflow', 'new_workflow', 'run'].includes(command.action);
+            if (writesCanvas && allowAI && graphReady(appOf())) {
+              previousAuthority = localAuthority; localEdit(true); commandEditSequence = editSequence;
+            }
             reply = { id: command.id, result: await execute(command) };
             // A write must always be published, whatever the counter says about it.
-            if (['update_nodes', 'bind_image', 'load_workflow', 'undo', 'redo', 'restore_edit', 'edit_graph', 'save_workflow', 'save_as_workflow', 'switch_workflow', 'new_workflow'].includes(command.action)) { forceSync = true; await syncWorkflow(appOf()); }
+            if (writesCanvas) { forceSync = true; await syncWorkflow(appOf()); }
           }
-          catch (e) { reply = { id: command.id, error: e.message || String(e) }; }
+          catch (e) {
+            if (commandEditSequence !== undefined && commandEditSequence === editSequence) localAuthority = previousAuthority;
+            reply = { id: command.id, error: e.message || String(e) };
+          }
           completed.set(command.id, reply);
           if (completed.size > 200) completed.delete(completed.keys().next().value);
         }
@@ -462,7 +542,19 @@
       stream.onerror = () => { stream.close(); reconnectTimer = setTimeout(connectCommands, 2000); };
     } catch (error) { notify({ ready: false, error: error.message }); reconnectTimer = setTimeout(connectCommands, 2000); }
   }
-  document.addEventListener?.('visibilitychange', () => { forceSync = true; send('state', {}).catch(() => {}); handleCommands(); });
+  document.addEventListener?.('pointerdown', event => { if (event.isTrusted) { pointerHeld = true; localEdit(true); } }, true);
+  document.addEventListener?.('pointermove', event => { if (event.isTrusted && pointerHeld) localEdit(); }, true);
+  for (const name of ['pointerup', 'pointercancel']) document.addEventListener?.(name, event => { if (event.isTrusted) { pointerHeld = false; localEdit(); } }, true);
+  document.addEventListener?.('keydown', event => { if (event.isTrusted) { heldKeys.add(event.code || event.key); localEdit(true); } }, true);
+  document.addEventListener?.('keyup', event => { if (event.isTrusted) { heldKeys.delete(event.code || event.key); localEdit(); } }, true);
+  document.addEventListener?.('drop', event => { if (event.isTrusted) localEdit(true); }, true);
+  document.addEventListener?.('paste', event => { if (event.isTrusted) localEdit(true); }, true);
+  document.addEventListener?.('wheel', event => { if (event.isTrusted) localEdit(true); }, { capture: true, passive: true });
+  for (const name of ['input', 'change']) document.addEventListener?.(name, event => { if (event.isTrusted) localEdit(); }, true);
+  document.addEventListener?.('focusout', () => { forceSync = true; }, true);
+  const clearInteraction = () => { pointerHeld = false; heldKeys.clear(); };
+  window.addEventListener('blur', clearInteraction);
+  document.addEventListener?.('visibilitychange', () => { if (document.visibilityState === 'hidden') clearInteraction(); forceSync = true; send('state', {}).catch(() => {}); handleCommands(); });
   window.addEventListener('pagehide', () => { commandStream?.close(); clearTimeout(reconnectTimer); });
   window.addEventListener('pageshow', event => { if (event.persisted) { forceSync = true; connectCommands(); } });
   connectCommands();
