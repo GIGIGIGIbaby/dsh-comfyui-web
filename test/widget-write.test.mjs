@@ -238,13 +238,21 @@ test('list_nodes filter matches the node id and an empty hit says what the ids a
 
 // A full localStorage is the difference between "written" and a red toast on the user's screen,
 // and it is invisible from the write itself. The page measures it, the reply reports it.
-const fakeStorage = entries => {
-  const keys = Object.keys(entries);
+// This one behaves like the real thing (writes land, removeItem removes, length/key enumerate);
+// `failHistory` makes the bridge's own snapshot writes throw so a full quota can be simulated.
+const fakeStorage = (entries = {}, options = {}) => {
+  const data = new Map(Object.entries(entries));
+  let failures = options.failHistory ?? 0;
   return {
-    get length() { return keys.length; },
-    key(index) { return keys[index] ?? null; },
-    getItem(key) { return Object.prototype.hasOwnProperty.call(entries, key) ? entries[key] : null; },
-    setItem() {}
+    get length() { return data.size; },
+    key(index) { return [...data.keys()][index] ?? null; },
+    getItem(key) { return data.has(key) ? data.get(key) : null; },
+    setItem(key, value) {
+      if (failures > 0 && String(key).startsWith('dsh.comfyui.history.')) { failures -= 1; throw new Error('QuotaExceededError'); }
+      data.set(String(key), String(value));
+    },
+    removeItem(key) { data.delete(key); },
+    snapshot() { return Object.fromEntries(data); }
   };
 };
 
@@ -264,6 +272,105 @@ test('audit_graph measures the front-end draft store instead of guessing whether
     'Comfy.Workflow.Draft.v2:workflows/H3.json', 'Comfy.Workflow.DraftIndex.v2:personal'
   ]);
   assert.equal(audit.draftStorage.persistSetting, 'true');
+});
+
+test('the draft store is measured together with the keys the bridge itself writes', async () => {
+  // Measuring only Comfy.Workflow.* let the store sit at its limit while doctor honestly reported
+  // "298 chars": the bridge kept one whole graph per checkpoint and one per client in the same quota.
+  const otherSession = 'dsh.comfyui.history.' + encodeURIComponent('http://comfy.test:other:workflows/H3.json');
+  // A live foreign snapshot: timestamped now, so the load-time prune is not what answers here.
+  const foreign = JSON.stringify({ version: 1, undo: [], redo: [], savedAt: Date.now(), pad: 'h'.repeat(400) });
+  const command = await boot([plainNode()], {
+    localStorage: fakeStorage({
+      'Comfy.Workflow.Draft.v2:workflows/H3.json': 'x'.repeat(120),
+      'Comfy.Workflow.Persist': 'true',
+      [otherSession]: foreign,
+      'dsh.comfyui.sync-conflict': 'c'.repeat(50),
+      'dsh.comfyui.sync-conflict.dead-client': 'd'.repeat(25)
+    })
+  });
+  const storage = (await command('audit_graph')).draftStorage;
+  assert.equal(storage.usedChars, 120, 'ComfyUI draft keys only');
+  assert.equal(storage.historyChars, foreign.length);
+  assert.equal(storage.conflictChars, 75);
+  assert.equal(storage.ownChars, foreign.length + 75, 'the bridge own keys are part of the same quota');
+  assert.equal(storage.totalChars, 120 + storage.ownChars);
+  assert.equal(storage.staleChars, 0, 'a snapshot saved a moment ago is not stale');
+  assert.deepEqual(storage.ownKeys.map(item => item.kind).sort(), ['conflict', 'conflict', 'history']);
+  assert.equal(storage.ownKeys.find(item => item.kind === 'history').current, false, 'another session left it behind');
+});
+
+test('a full store costs the undo snapshot, never the canvas write', async () => {
+  // saveHistory used to throw, which rolled back a write that had already landed on the canvas.
+  // Now the value sticks, the reply admits the snapshot was lost and names the keys it reclaimed.
+  const otherSession = 'dsh.comfyui.history.' + encodeURIComponent('http://comfy.test:other:workflows/H3.json');
+  const foreign = JSON.stringify({ version: 1, undo: [], redo: [], savedAt: Date.now(), pad: 'h'.repeat(400) });
+  const dead = 'd'.repeat(60);
+  const store = fakeStorage({ [otherSession]: foreign, 'dsh.comfyui.sync-conflict.dead': dead },
+    { failHistory: Infinity });
+  const command = await boot([plainNode()], { localStorage: store });
+  const result = await command('update_nodes', { changes: [{ nodeId: 1, widget: 'steps', value: 31 }] });
+  assert.equal(result.changed[0].after, 31, 'the canvas write still happened');
+  assert.equal(result.changed[0].verified, true);
+  assert.equal(result.historyStore.stored, false, 'the reply admits the snapshot was lost');
+  assert.equal(result.historyStore.pruned.keys, 2, 'the dead session key and the dead conflict key were reclaimed');
+  assert.equal(result.historyStore.pruned.chars, foreign.length + dead.length);
+  assert.match(result.historyStore.note, /localStorage 已满/);
+  assert.equal(store.snapshot()[otherSession], undefined, 'the other session history is gone');
+  assert.equal(store.snapshot()['dsh.comfyui.sync-conflict.dead'], undefined, 'and so is the stale conflict backup');
+});
+
+test('a page load reclaims the snapshots whose sessions are long gone', async () => {
+  // Every new conversation writes its own history key and never deletes it. Without this the store
+  // only ever fills up, and the first symptom is ComfyUI's own "保存工作流草稿失败" banner.
+  const encode = path => 'dsh.comfyui.history.' + encodeURIComponent(path);
+  const ancient = encode('http://comfy.test:gone-a:workflows/A.json');
+  const recent = encode('http://comfy.test:gone-b:workflows/B.json');
+  const mine = encode('http://comfy.test:own:workflows/H3.json');
+  const store = fakeStorage({
+    [ancient]: JSON.stringify({ version: 1, undo: [], redo: [], savedAt: Date.now() - 10 * 24 * 60 * 60 * 1000, pad: 'a'.repeat(300) }),
+    [recent]: JSON.stringify({ version: 1, undo: [], redo: [], savedAt: Date.now(), pad: 'b'.repeat(200) }),
+    [mine]: JSON.stringify({ version: 1, undo: [], redo: [], savedAt: Date.now() - 10 * 24 * 60 * 60 * 1000, pad: 'm'.repeat(100) }),
+    'Comfy.Workflow.Persist': 'true'
+  });
+  const command = await boot([plainNode()], { localStorage: store });
+  const after = store.snapshot();
+  assert.equal(after[ancient], undefined, 'ten days old: nothing will ever read it');
+  assert.ok(after[recent], 'saved today: the user may still switch back to it');
+  assert.ok(after[mine], 'this session keeps its own history however old it is');
+  const storage = (await command('audit_graph')).draftStorage;
+  assert.equal(storage.staleChars, 0, 'what survived the sweep is not reported as stale');
+  assert.equal(storage.historyChars, after[recent].length + after[mine].length);
+});
+
+test('stale snapshots are reported before they are the reason a draft save fails', async () => {
+  // The sweep runs once per page load, so a tab left open for days can still be holding keys that
+  // went stale afterwards (and a store we may read but not delete keeps them for good). doctor has
+  // to be able to point at them instead of only saying "the store is full".
+  const encode = path => 'dsh.comfyui.history.' + encodeURIComponent(path);
+  const old = JSON.stringify({ version: 1, undo: [], redo: [], savedAt: Date.now() - 10 * 24 * 60 * 60 * 1000, pad: 'o'.repeat(500) });
+  const base = fakeStorage({
+    [encode('http://comfy.test:gone:workflows/A.json')]: old,
+    [encode('http://comfy.test:own:workflows/H3.json')]: JSON.stringify({ version: 1, undo: [], redo: [], savedAt: Date.now(), pad: 'm'.repeat(50) })
+  });
+  // Readable and enumerable, but this page may not delete anything.
+  const readOnly = { ...base, removeItem: undefined };
+  Object.defineProperty(readOnly, 'length', { get: () => base.length });
+  const command = await boot([plainNode()], { localStorage: readOnly });
+  const storage = (await command('audit_graph')).draftStorage;
+  assert.equal(storage.staleKeys, 1);
+  assert.equal(storage.staleChars, old.length);
+  assert.ok(storage.staleAfterMs >= 24 * 60 * 60 * 1000, 'the age threshold is reported with the finding');
+  assert.equal(storage.ownKeys.filter(item => item.stale).length, 1);
+});
+
+test('list_edits reports how much of the shared store its own snapshots hold', async () => {
+  const command = await boot([plainNode()], { localStorage: fakeStorage() });
+  await command('update_nodes', { changes: [{ nodeId: 1, widget: 'steps', value: 22 }] });
+  const edits = await command('list_edits');
+  assert.equal(edits.maxCheckpoints, 20);
+  assert.equal(edits.budget, 1_500_000);
+  assert.ok(edits.historyChars > 0, 'the snapshots are counted, not assumed to be free');
 });
 
 test('links stored in a Map are followed, not silently reported as none', async () => {

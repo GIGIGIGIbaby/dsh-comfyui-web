@@ -46,6 +46,13 @@
       'input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]');
   }
   const histories = new Map(); const completed = new Map();
+  // Every checkpoint stores a whole serialized graph, so an unbounded history is what slowly
+  // eats the localStorage ComfyUI also keeps its drafts in. These two numbers are the budget the
+  // bridge enforces on itself; when it trims, the reply says so instead of failing the write.
+  const HISTORY_BUDGET = 1_500_000;
+  const HISTORY_MAX = 20;
+  const CONFLICT_KEY = 'dsh.comfyui.sync-conflict';
+  const CONFLICT_BUDGET = 2_000_000;
   const commandQueue = []; let handlingCommands = false, commandStream, reconnectTimer;
   const appOf = () => window.comfyAPI?.app?.app;
   const apiOf = () => window.comfyAPI?.api?.api;
@@ -180,7 +187,7 @@
       // that edit and the original revision so normal conflict recovery sees it.
       if (editedWhileWaiting) { forceSync = true; synchronization.deferred++; return; }
       if (update.conflict && changed && editSequence > acknowledgedEditSequence) {
-        try { localStorage.setItem('dsh.comfyui.sync-conflict.' + clientId, JSON.stringify(update.workflow)); } catch {}
+        rememberConflict(update.workflow);
         notify({ warning: '另一页也修改了工作流，已保留本页编辑；另一页版本已备份到浏览器，正在重新同步。' });
         // Keep the unsent local edit and retry against the revision just observed.
         // An idle page has no changed content, so it cannot win this retry.
@@ -253,27 +260,131 @@
     } catch (e) { notify({ ready: false, error: e.message }); }
     finally { busy = false; handleCommands(); setTimeout(poll, FAST_POLL_MS); }
   }
-  const historyKey = app => 'dsh.comfyui.history.' + encodeURIComponent(location.origin + ':' + sessionId + ':' + activeWorkflowOf(app).path);
+  const historyPrefix = 'dsh.comfyui.history.';
+  const historyKey = app => historyPrefix + encodeURIComponent(location.origin + ':' + sessionId + ':' + activeWorkflowOf(app).path);
+  const charCount = value => String(value ?? '').length;
+  // Two different questions, two different stores: writing a snapshot only needs setItem, while
+  // counting what this origin holds needs an enumerable store. Conflating them turned "the page
+  // has a localStorage we cannot enumerate" into "storage is full".
+  function historyStore() {
+    try { const store = globalThis.localStorage; return store && typeof store.setItem === 'function' ? store : null; } catch { return null; }
+  }
+  function storageStore() {
+    try { const store = globalThis.localStorage; return store && typeof store.length === 'number' && typeof store.key === 'function' ? store : null; } catch { return null; }
+  }
+  function listStorageKeys(prefix) {
+    const store = storageStore(); const keys = [];
+    if (!store) return keys;
+    for (let index = 0; index < store.length; index += 1) {
+      const key = String(store.key(index));
+      if (key.startsWith(prefix)) keys.push(key);
+    }
+    return keys;
+  }
+  function historyCharsOf(history) {
+    const size = list => (Array.isArray(list) ? list : []).reduce((total, item) => total + charCount(JSON.stringify(item?.workflow)), 0);
+    return size(history?.undo) + size(history?.redo);
+  }
+  // Oldest checkpoints go first: undo needs the newest one, and a snapshot the user cannot reach
+  // is worth less than a store that can still accept the front-end's own drafts.
+  function trimHistory(history, budget = HISTORY_BUDGET) {
+    let dropped = 0;
+    while (history.undo.length > 1 && historyCharsOf(history) > budget) { history.undo.shift(); dropped += 1; }
+    while (history.redo.length > 1 && historyCharsOf(history) > budget) { history.redo.pop(); dropped += 1; }
+    return dropped;
+  }
+  // History keys are scoped by origin + session + workflow path, so every new DSH session leaves
+  // the previous one's megabytes behind with nobody to delete them. That is the difference between
+  // a store that stays usable and one that makes the front-end report 保存工作流草稿失败 forever.
+  function pruneOwnStorage(keepKey) {
+    const store = storageStore(); const removed = []; let chars = 0;
+    if (!store || typeof store.removeItem !== 'function') return { removed, chars };
+    const mine = encodeURIComponent(location.origin + ':' + sessionId + ':');
+    const drop = key => {
+      if (key === keepKey) return;
+      const size = charCount(store.getItem(key));
+      try { store.removeItem(key); removed.push({ key, chars: size }); chars += size; } catch {}
+    };
+    for (const key of listStorageKeys(historyPrefix)) if (!key.includes(mine)) drop(key);
+    for (const key of listStorageKeys(CONFLICT_KEY)) drop(key);
+    return { removed, chars };
+  }
+  // History keys are per session, so every new DSH conversation leaves the previous one's graphs
+  // behind forever. The write path reclaims them under pressure; this constant is what the audit
+  // calls "stale", so the caller can see the megabytes before they become a failed draft save.
+  const HISTORY_MAX_AGE = 3 * 24 * 60 * 60 * 1000;
+  const staleThreshold = () => Date.now() - HISTORY_MAX_AGE;
+  // A snapshot left by a session whose tab closed days ago will never be read again, and it sits in
+  // the same quota ComfyUI needs for its own drafts. Removing those on load is what keeps the store
+  // usable across sessions; anything younger is left alone because the user may switch back to it.
+  function pruneStaleStorage() {
+    const store = storageStore(); const removed = []; let chars = 0;
+    if (!store || typeof store.removeItem !== 'function') return { removed, chars };
+    const mine = encodeURIComponent(location.origin + ':' + sessionId + ':');
+    const drop = key => {
+      const size = charCount(store.getItem(key));
+      try { store.removeItem(key); removed.push({ key, chars: size }); chars += size; } catch {}
+    };
+    const cutoff = staleThreshold();
+    for (const key of listStorageKeys(historyPrefix)) {
+      if (key.includes(mine)) continue;
+      let savedAt = 0;
+      try { savedAt = Number(JSON.parse(store.getItem(key) || 'null')?.savedAt) || 0; } catch {}
+      if (!savedAt || savedAt < cutoff) drop(key);
+    }
+    return { removed, chars };
+  }
+  // Conflict backups used to be one key per clientId and never read back, so they accumulated one
+  // full graph per page load. One overwritten slot is all the value they ever had.
+  function rememberConflict(workflow) {
+    const store = historyStore(); if (!store?.setItem) return false;
+    try {
+      const text = JSON.stringify(workflow);
+      if (charCount(text) > CONFLICT_BUDGET) { store.removeItem?.(CONFLICT_KEY); return false; }
+      store.setItem(CONFLICT_KEY, text);
+      // Drop the per-client keys written by older bridges so they stop occupying the quota.
+      for (const key of listStorageKeys(CONFLICT_KEY)) if (key !== CONFLICT_KEY) store.removeItem?.(key);
+      return true;
+    } catch { return false; }
+  }
   function historyOf(app) {
     const key = historyKey(app);
     if (!histories.has(key)) {
       let saved;
       try { saved = JSON.parse(globalThis.localStorage?.getItem?.(key) || 'null'); } catch {}
-      histories.set(key, saved?.version === 1 && Array.isArray(saved.undo) && Array.isArray(saved.redo) ? saved : { version: 1, undo: [], redo: [] });
+      const history = saved?.version === 1 && Array.isArray(saved.undo) && Array.isArray(saved.redo) ? saved : { version: 1, undo: [], redo: [] };
+      trimHistory(history);
+      histories.set(key, history);
     }
     return histories.get(key);
   }
+  // Returns what actually happened instead of throwing: a full localStorage must not roll back a
+  // canvas write that succeeded, and the caller has to be able to tell the two apart.
   function saveHistory(app, history) {
     const key = historyKey(app);
-    for (;;) {
-      try { globalThis.localStorage?.setItem?.(key, JSON.stringify(history)); break; }
-      catch {
-        if (history.undo.length > 1) history.undo.shift();
-        else if (history.redo.length > 1) history.redo.shift();
-        else throw new Error('工作流快照保存失败，浏览器存储空间不足；本次修改未提交，请清理空间后重试');
-      }
+    const outcome = { stored: null, dropped: trimHistory(history), pruned: null };
+    const store = historyStore();
+    history.savedAt = Date.now();
+    if (store) {
+      const write = () => store.setItem(key, JSON.stringify(history));
+      outcome.stored = true;
+      try { write(); }
+      catch { outcome.pruned = pruneOwnStorage(key); try { write(); } catch { outcome.stored = false; } }
     }
     histories.set(key, history);
+    return outcome;
+  }
+  function historyNote(outcome) {
+    if (!outcome) return null;
+    const note = {};
+    if (outcome.stored === false) note.stored = false;
+    if (outcome.dropped) note.dropped = outcome.dropped;
+    if (outcome.pruned?.removed?.length) note.pruned = { keys: outcome.pruned.removed.length, chars: outcome.pruned.chars };
+    if (note.stored !== false && !note.dropped && !note.pruned) return null;
+    note.note = note.stored === false
+      ? '浏览器 localStorage 已满：这次撤销快照只留在内存里，刷新页面后 list_edits 会少掉它（画布写入本身成功）。根治办法是清理设置里的工作流草稿（关掉 Comfy.Workflow.Persist），或换一个干净的浏览器配置。'
+      : '浏览器存储吃紧：已回收 ' + (note.pruned?.chars ?? 0) + ' 字符的旧快照' + (note.pruned ? '（' + note.pruned.keys + ' 个键）' : '') + '，并丢弃本工作流最早的 ' + (note.dropped ?? 0) + ' 个撤销点；画布写入正常，list_edits 里能回退的步数变少。';
+    return note;
   }
   function graphHash(app) {
     const text = fingerprint(snapshot(app)); let hash = 2166136261;
@@ -351,24 +462,52 @@
   // see nor dismiss. A silent page-wide side effect deserves a number in the reply: measure
   // the keys ComfyUI uses for drafts so a caller can tell "full" from "normal".
   function draftStorage() {
-    const facts = { available: false, usedChars: 0, keys: [], persistSetting: null, blocking: null };
+    const facts = { available: false, usedChars: 0, keys: [], persistSetting: null, blocking: null,
+      ownChars: 0, historyChars: 0, conflictChars: 0, conflictKeys: 0, ownKeys: [], totalChars: 0,
+      staleChars: 0, staleKeys: 0, staleAfterMs: HISTORY_MAX_AGE };
     try {
-      const store = typeof localStorage === 'undefined' ? null : localStorage;
-      if (!store || typeof store.length !== 'number' || typeof store.key !== 'function') {
+      const store = storageStore();
+      if (!store) {
         facts.blocking = '当前页面没有可枚举的 localStorage';
         return facts;
       }
       facts.available = true;
+      const mine = encodeURIComponent(location.origin + ':' + sessionId + ':');
       for (let index = 0; index < store.length; index += 1) {
         const key = store.key(index);
+        const value = store.getItem(key) ?? '';
+        const chars = charCount(value);
+        // The bridge owns keys in the same quota. Counting only ComfyUI's drafts answered
+        // "how full is the store" with a number that could be near zero while the store was full.
+        if (String(key).startsWith(historyPrefix)) {
+          facts.historyChars += chars;
+          const current = String(key).includes(mine);
+          // A snapshot from another session is not necessarily junk: the user may switch back to
+          // it. Only one old enough that its tab cannot still be open is worth reporting as stale.
+          let stale = false;
+          if (!current) {
+            let savedAt = 0;
+            try { savedAt = Number(JSON.parse(value)?.savedAt) || 0; } catch {}
+            stale = !savedAt || savedAt < staleThreshold();
+          }
+          if (stale) { facts.staleChars += chars; facts.staleKeys += 1; }
+          if (facts.ownKeys.length < 40) facts.ownKeys.push({ key: String(key), kind: 'history', chars, current, ...(stale ? { stale: true } : {}) });
+          continue;
+        }
+        if (String(key).startsWith(CONFLICT_KEY)) {
+          facts.conflictChars += chars; facts.conflictKeys += 1;
+          if (facts.ownKeys.length < 40) facts.ownKeys.push({ key: String(key), kind: 'conflict', chars });
+          continue;
+        }
         // Every draft family starts here: Draft.v2, DraftIndex.v2, DraftOrder, Drafts. The
         // persistence switch shares the prefix but is a flag, not a payload — counting its 4
         // characters would make the number describe something else than the store's size.
         if (!String(key).startsWith('Comfy.Workflow.') || key === 'Comfy.Workflow.Persist') continue;
-        const value = store.getItem(key) ?? '';
-        facts.keys.push({ key, chars: String(value).length });
-        facts.usedChars += String(value).length;
+        facts.keys.push({ key, chars });
+        facts.usedChars += chars;
       }
+      facts.ownChars = facts.historyChars + facts.conflictChars;
+      facts.totalChars = facts.usedChars + facts.ownChars;
       facts.persistSetting = store.getItem('Comfy.Workflow.Persist');
     } catch (error) { facts.blocking = error.message || String(error); }
     return facts;
@@ -644,7 +783,10 @@
         const history = historyOf(app);
         return { workflowPath: activeWorkflowOf(app).path, checkpoints: [...history.undo].reverse().map(item => ({
           checkpointId: item.id, time: item.time, label: item.label, nodes: item.workflow.nodes.length
-        })), canRedo: history.redo.length > 0 };
+        })), canRedo: history.redo.length > 0,
+          // Undo depth is capped on purpose; say so instead of letting "only 3 checkpoints" look
+          // like a bug, and show the chars this workflow currently occupies.
+          historyChars: historyCharsOf(history), budget: HISTORY_BUDGET, maxCheckpoints: HISTORY_MAX };
       }
       case 'restore_edit': {
         const saved = historyOf(app).undo.find(item => item.id === args.checkpointId);
@@ -791,11 +933,20 @@
     const app = appOf();
     if (!allowAI || !graphReady(app)) return executeAction(command);
     const before = snapshot(app), history = clone(historyOf(app)), pending = clone(history);
-    pending.undo.push(checkpoint(app, command.action)); pending.undo = pending.undo.slice(-20); pending.redo = [];
-    saveHistory(app, pending);
+    pending.undo.push(checkpoint(app, command.action)); pending.undo = pending.undo.slice(-HISTORY_MAX); pending.redo = [];
+    // The pre-write and post-write saves can both reclaim keys; the reply has to report the total,
+    // or a write that pruned its way through looks like it reclaimed nothing.
+    const reclaimed = [];
+    const keep = outcome => { if (outcome?.pruned?.removed?.length) reclaimed.push(outcome.pruned); return outcome; };
+    const merged = outcome => reclaimed.length
+      ? { ...outcome, pruned: { removed: reclaimed.flatMap(item => item.removed), chars: reclaimed.reduce((sum, item) => sum + item.chars, 0) } }
+      : outcome;
+    let stored = keep(saveHistory(app, pending));
     try {
       const result = await executeAction(command);
-      pending.expectedHash = graphHash(app); saveHistory(app, pending); return result;
+      pending.expectedHash = graphHash(app); stored = keep(saveHistory(app, pending));
+      const note = historyNote(merged(stored));
+      return note && result && typeof result === 'object' ? { ...result, historyStore: note } : result;
     } catch (error) {
       if (fingerprint(snapshot(app)) !== fingerprint(before)) await replaceCurrentWorkflow(app, before);
       saveHistory(app, history); throw error;
@@ -884,6 +1035,7 @@
   document.addEventListener?.('visibilitychange', () => { if (document.visibilityState === 'hidden') clearInteraction(); forceSync = true; send('state', {}).catch(() => {}); handleCommands(); });
   window.addEventListener('pagehide', () => { commandStream?.close(); clearTimeout(reconnectTimer); });
   window.addEventListener('pageshow', event => { if (event.persisted) { forceSync = true; connectCommands(); } });
+  try { pruneStaleStorage(); } catch {}
   connectCommands();
   poll();
 })();
