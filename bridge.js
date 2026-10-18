@@ -408,16 +408,16 @@
       found.push(target);
     };
     const outputs = node.outputs || [];
-    if (typeof node.getOutputNodes === 'function' && outputs.length) {
-      let answered = false;
+    // Both answers are merged instead of one shadowing the other. The slot API reads the
+    // global link registry, which a graph loaded through loadGraphData can lag behind; the
+    // link table can be empty on a graph that has not been wired the old way yet. An empty
+    // answer from either one is not evidence that the node has no downstream nodes.
+    if (typeof node.getOutputNodes === 'function') {
       outputs.forEach((output, slot) => {
         let peers = null;
         try { peers = node.getOutputNodes(slot); } catch { peers = null; }
-        if (!Array.isArray(peers)) return;
-        answered = true;
-        for (const peer of peers) push(peer);
+        if (Array.isArray(peers)) for (const peer of peers) push(peer);
       });
-      if (answered) return found;
     }
     for (const output of outputs) for (const linkId of output.links || []) {
       const link = linkById(graph, linkId);

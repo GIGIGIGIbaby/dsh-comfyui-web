@@ -282,6 +282,22 @@ test('links stored in a Map are followed, not silently reported as none', async 
   assert.equal(audit.linkCount, 1, 'the audit counts the same links the write path follows');
 });
 
+test('an empty answer from the slot API does not hide a link the table does know', async () => {
+  // A graph loaded through loadGraphData can have the slot API answer null while the link
+  // table still holds the wire. Trusting the empty answer alone reported "no downstream
+  // nodes" on a canvas where the pack does rewrite the nodes below.
+  const upstream = plainNode();
+  const downstream = { id: 9, type: 'AICG3D_H3Sequence', title: '', mode: 0, properties: {},
+    widgets: [{ name: 'segments', type: 'number', value: 1, options: {}, callback: () => {} }], inputs: [], outputs: [] };
+  upstream.widgets[0].callback = () => { downstream.widgets[0].value = 6; };
+  upstream.outputs = [{ name: 'out', type: 'LATENT', links: [100] }];
+  upstream.getOutputNodes = () => null;
+  const command = await boot([upstream, downstream], { links: [{ id: 100, origin_id: 1, target_id: 9 }] });
+  const result = await command('update_nodes', { changes: [{ nodeId: 1, widget: 'steps', value: 21 }] });
+  assert.equal(result.settledMs, 600, 'the table answered when the slot API said nothing');
+  assert.deepEqual(result.cascaded.map(item => [item.nodeId, item.widget, item.before, item.after]), [['9', 'segments', 1, 6]]);
+});
+
 test('the graph is asked for its own downstream nodes before any link table is read', async () => {
   // output.links is deprecated in newer litegraph and can be empty while the slot is wired.
   // node.getOutputNodes(slot) is the API the front-end itself uses, so it must win.
