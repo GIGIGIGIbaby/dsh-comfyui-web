@@ -19,10 +19,19 @@ function text(tree) {
   return (tree.props?.children || []).map(text).join(' ');
 }
 
-async function panel(installation) {
+async function panel(installation, language = 'zh') {
   let plugin, index = 0, nextTimer = 0, rendered;
   const hooks = [], effects = [], registrations = [], timers = new Map(), listeners = new Map();
   const frameWindow = { postMessage() {} };
+  const localeListeners = new Set(); let localeSnapshot = { active: language, revision: 0 }, dictionaries;
+  let localeRenderRequested = false;
+  const locale = {
+    register(_namespace, values) { dictionaries = values; return () => {}; },
+    getSnapshot: () => localeSnapshot,
+    subscribe(listener) { localeListeners.add(listener); return () => localeListeners.delete(listener); },
+    bind() { return (key, params = {}) => (dictionaries[localeSnapshot.active]?.[key] ?? dictionaries.en[key] ?? key)
+      .replace(/\{(\w+)\}/g, (match, name) => String(params[name] ?? match)); }
+  };
   const settings = { url: 'http://127.0.0.1:8188', frameOrigin: 'http://127.0.0.1:19000', token: 'fixture',
     mcp: { enabled: true, endpoint: 'http://127.0.0.1:19000/mcp', clientConfig: {} }, extensionInstallation: installation };
   const React = {
@@ -39,7 +48,11 @@ async function panel(installation) {
         old?.cleanup?.(); hooks[at] = { deps, cleanup: fn() };
       });
     },
-    useSyncExternalStore(_subscribe, read) { return read(); }
+    useSyncExternalStore(subscribe, read) {
+      const at = index++;
+      if (!(at in hooks)) hooks[at] = { cleanup: subscribe(() => { localeRenderRequested = true; }) };
+      return read();
+    }
   };
   const source = await readFile(new URL('../client.js', import.meta.url), 'utf8');
   vm.runInNewContext(source, {
@@ -55,7 +68,7 @@ async function panel(installation) {
       return { ok: true, json: async () => structuredClone(settings) };
     }
   });
-  plugin.apply({ effect(fn) { fn(); }, sidebarRightTabs: { register() {} }, sidebarRight: { openTab() {} },
+  plugin.apply({ locale, effect(fn) { fn(); }, sidebarRightTabs: { register() {} }, sidebarRight: { openTab() {} },
     slots: { inject(_name, fn) { fn(); }, register(def, component) { registrations.push({ def, component }); } } });
   const Body = registrations.find(row => row.def.name === 'sidebar.right.pane.tab').component;
   function render() {
@@ -67,7 +80,14 @@ async function panel(installation) {
     return rendered;
   }
   render(); await flush(); render(); render();
-  return { render, get tree() { return rendered; },
+  return { render, get tree() { return rendered; }, get dictionaries() { return dictionaries; },
+    component(key) { return registrations.find(row => row.def.key === key)?.component; },
+    language(active) {
+      localeRenderRequested = false; localeSnapshot = { active, revision: localeSnapshot.revision + 1 };
+      for (const listener of localeListeners) listener();
+      assert.equal(localeRenderRequested, true, 'mounted labels must subscribe to native dsh language changes');
+      render();
+    },
     expire() { const waiting = [...timers.values()].find(timer => timer.delay === 12000); assert.ok(waiting); waiting.fn(); render(); },
     receive(origin = settings.url) { listeners.get('message')({ origin, source: frameWindow,
       data: { source: 'dsh-comfyui', clientId: 'panel-client', ready: true } }); render(); },
@@ -105,4 +125,45 @@ test('failed writes appear in MCP settings and disabling MCP removes the missing
   page.render();
   assert.match(text(page.tree), /MCP 已关闭/);
   assert.equal(find(page.tree, node => node.props?.role === 'alert'), undefined);
+});
+
+test('English panel follows dsh language changes without refreshing the iframe or changing privacy', async t => {
+  const page = await panel({ status: 'installed' }, 'en'); t.after(() => page.close());
+  assert.match(text(page.tree), /Waiting for ComfyUI/);
+  assert.match(text(page.tree), /Blur chat media/);
+  const frame = find(page.tree, node => node.type === 'iframe');
+  assert.equal(frame.props.title, 'ComfyUI node editor and live generation preview');
+  const privacy = () => find(page.tree, node => node.props?.role === 'switch' && node.type === 'button');
+  privacy().props.onClick(); page.render();
+  assert.equal(privacy().props['aria-checked'], true);
+  find(page.tree, node => node.type === 'button' && text(node) === 'MCP settings').props.onClick(); page.render();
+  assert.match(text(page.tree), /Save and connect/);
+  assert.match(text(page.tree), /MCP configuration for other AI clients/);
+  assert.equal(/\p{Script=Han}/u.test(text(page.tree)), false);
+  page.language('zh');
+  assert.match(text(page.tree), /保存并连接/);
+  assert.match(text(page.tree), /图片对话中模糊/);
+  assert.equal(privacy().props['aria-checked'], true);
+  const switchedFrame = find(page.tree, node => node.type === 'iframe');
+  assert.equal(switchedFrame.props.src, frame.props.src);
+  assert.equal(switchedFrame.props.key, frame.props.key, 'changing language must not remount ComfyUI');
+  page.language('en');
+  assert.match(text(page.tree), /Save and connect/);
+});
+
+test('English setup diagnostics, result cards and accessibility labels use the same bilingual catalog', async t => {
+  const page = await panel({ status: 'failed', message: '目录不可写', messageEn: 'The directory is not writable.' }, 'en');
+  t.after(() => page.close()); page.expire();
+  assert.match(text(page.tree), /The directory is not writable/);
+  const guide = find(page.tree, node => node.type === 'a');
+  assert.match(guide.props.href, /README\.en\.md#comfyui-extension-install$/);
+  assert.deepEqual(Object.keys(page.dictionaries.zh).sort(), Object.keys(page.dictionaries.en).sort());
+  assert.equal(Object.values(page.dictionaries.en).some(value => /\p{Script=Han}/u.test(value)), false);
+  const Result = page.component('mcp__comfyui__get_image');
+  const row = Result({ toolName: 'mcp__comfyui__get_image', block: { kind: 'tool-result', content: [
+    { type: 'image', attachment: { attachmentId: 'image-1', name: 'result.png' } }
+  ] }, inspect() {} });
+  assert.equal(row.props['aria-label'], 'ComfyUI image result');
+  assert.match(text(row), /Image will appear below this reply/);
+  assert.match(text(row), /Inspect tool call/);
 });

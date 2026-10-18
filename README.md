@@ -1,5 +1,7 @@
 # dsh-comfyui-web
 
+[简体中文](README.md) | [English](README.en.md)
+
 在 dsh 里直接使用 ComfyUI，让 AI 通过 MCP 操作当前工作流。改提示词、调参数、运行生图，节点变化和生成预览都在同一个页面里看得见。
 
 ## 安装
@@ -77,6 +79,8 @@ NODE_CLASS_MAPPINGS = {}
 
 左边聊需求，右边改节点、看预览。手动编辑和 AI 操作都落在当前工作流上。
 
+插件界面跟随 dsh 的语言设置，支持中文和 English。ComfyUI 自身的语言在 ComfyUI 设置中选择。
+
 ### 2. 确认连接地址
 
 默认连接 `http://127.0.0.1:8188`。如果更换了端口，打开 **MCP 设置**，修改地址后点击 **保存并连接**。
@@ -122,7 +126,7 @@ MCP 默认开启，dsh 已自动接入。这里也能关闭 MCP，或复制配�
 
 ## 友情链接
 
-[LINUX DO](https://linux.do/) · [插件介绍帖](https://linux.do/t/topic/3009797)
+[LINUX DO](https://linux.do/)
 
 ## Star History
 

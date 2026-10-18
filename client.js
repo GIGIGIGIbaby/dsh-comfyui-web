@@ -4,6 +4,109 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
   const h = React.createElement;
   const { useState, useEffect, useRef, useSyncExternalStore } = React;
   const ID = 'dsh-comfyui-web';
+
+  // The shared dsh locale service owns the language preference. Switching it
+  // updates these labels without remounting the ComfyUI iframe.
+  const EN = {
+  "图片": "Image",
+  "加载失败，点击重试": "Could not load. Click to retry.",
+  "图片已遮挡，点击显示图片": "Image blurred. Click to reveal.",
+  "点击查看原图": "Click to view the original",
+  "重新加载图片": "Reload image",
+  "显示已遮挡图片：": "Reveal blurred image: ",
+  "查看原图：": "View original: ",
+  "加载图片…": "Loading image…",
+  "点击显示图片": "Click to reveal image",
+  "显示图片：": "Reveal image: ",
+  "模糊图片：": "Blur image: ",
+  "显示这张图片": "Reveal this image",
+  "模糊这张图片": "Blur this image",
+  "原图预览": "Original image",
+  "关闭原图预览": "Close original image",
+  "视频加载失败，点击重试": "Could not load video. Click to retry.",
+  "显示已遮挡视频：": "Reveal blurred video: ",
+  "点击显示视频": "Click to reveal video",
+  "显示视频：": "Reveal video: ",
+  "模糊视频：": "Blur video: ",
+  "显示这个视频": "Reveal this video",
+  "模糊这个视频": "Blur this video",
+  "ComfyUI 视频结果": "ComfyUI video result",
+  "ComfyUI 图片结果": "ComfyUI image result",
+  "ComfyUI 视频": "ComfyUI video",
+  "ComfyUI 图片": "ComfyUI image",
+  "读取中…": "Loading…",
+  "读取失败": "Could not load",
+  "已读取": "Loaded",
+  "已完成": "Completed",
+  "查看调用": "Inspect tool call",
+  "视频": "Video",
+  "将在本次回复正文的结果区显示。": " will appear below this reply.",
+  "排队中": "Queued",
+  "生成中": "Generating",
+  "生成失败": "Generation failed",
+  "已取消": "Cancelled",
+  "已中断": "Interrupted",
+  "未找到任务": "Task not found",
+  "等待重新连接": "Waiting to reconnect",
+  "ComfyUI 生成结果": "ComfyUI generation results",
+  "连接失败": "Connection failed",
+  "复制失败，请选中下方配置手动复制。": "Could not copy. Select the configuration below and copy it manually.",
+  "尚未收到 AI 桥接扩展连接。请确认 ComfyUI 可访问、已安装扩展；首次安装后重启 ComfyUI 并刷新面板。Docker 用户需确认扩展所在目录已持久化挂载。": "The AI bridge has not connected. Check that ComfyUI is reachable and the extension is installed. After first installation, restart ComfyUI and refresh the panel. For Docker, use a persistent mounted extension directory.",
+  "扩展安装说明": "Extension setup guide",
+  "ComfyUI 工作台": "ComfyUI workspace",
+  "MCP 已关闭": "MCP off",
+  "MCP · 共享画布已连接": "MCP · Shared canvas connected",
+  "AI 桥接扩展未连接": "AI bridge disconnected",
+  "等待 ComfyUI": "Waiting for ComfyUI",
+  "ComfyUI 界面缩放": "ComfyUI interface zoom",
+  "缩小 ComfyUI 界面": "Zoom out ComfyUI",
+  "恢复 100% 大小": "Reset to 100%",
+  "当前缩放 {percent}%，点击恢复 100%": "Current zoom {percent}%. Click to reset to 100%.",
+  "放大 ComfyUI 界面": "Zoom in ComfyUI",
+  "图片对话中模糊": "Blur chat media",
+  "只影响本插件在对话中返回的图片和视频；左上角的小眼睛可单独切换。": "Only affects images and videos returned by this plugin. Use the eye icon at the top left to toggle each item.",
+  "开": "On",
+  "关": "Off",
+  "刷新 ComfyUI 页面": "Refresh the ComfyUI page",
+  "刷新": "Refresh",
+  "MCP 设置": "MCP settings",
+  "保存中…": "Saving…",
+  "开启 MCP": "Enable MCP",
+  "MCP 已开启，当前对话的 AI 可直接读取、修改和运行画布。": "MCP is enabled. The AI in this conversation can read, edit and run the workflow.",
+  "MCP 已开启，等待桥接扩展连接后可操作画布。": "MCP is enabled. Waiting for the bridge to connect before the AI can operate the canvas.",
+  "MCP 已关闭，仍可手动编辑和生成。": "MCP is off. You can still edit and generate manually.",
+  "ComfyUI 地址": "ComfyUI URL",
+  "连接中…": "Connecting…",
+  "保存并连接": "Save and connect",
+  "MCP 地址：": "MCP endpoint: ",
+  "其他 AI 客户端的 MCP 配置": "MCP configuration for other AI clients",
+  "MCP 客户端配置": "MCP client configuration",
+  "已复制": "Copied",
+  "复制配置": "Copy configuration",
+  "dsh 已自动接入；这份配置可用于本机其他支持 MCP 的客户端。": "dsh is already connected. Use this configuration with other MCP clients on this computer.",
+  "ComfyUI 节点编辑与实时生成预览": "ComfyUI node editor and live generation preview",
+  "正在连接本机 ComfyUI…": "Connecting to local ComfyUI…",
+  "在右侧打开 ComfyUI，可改节点、预览并让 AI 操作": "Open ComfyUI in the side panel to edit nodes, preview results and let AI operate the workflow",
+  "节点编辑 · 实时预览 · AI 操作": "Node editing · Live previews · AI control",
+  "另一页也修改了工作流，已保留本页编辑；另一页版本已备份到浏览器，正在重新同步。": "Another page also changed the workflow. Your local edits were kept, the other version was backed up in the browser, and synchronization is retrying.",
+  "正在重新连接 ComfyUI 桥接": "Reconnecting the ComfyUI bridge",
+  "ComfyUI 同步代码已更新，请刷新此 ComfyUI 页面后继续。": "ComfyUI synchronization has been updated. Refresh this ComfyUI page to continue.",
+  "同步代码已更新，请刷新 ComfyUI 页面": "Synchronization has been updated. Refresh the ComfyUI page.",
+  "ComfyUI 当前工作流正在载入，请稍后再试": "The ComfyUI workflow is loading. Try again shortly.",
+  "ComfyUI 当前工作流尚未就绪，请稍后再试": "The ComfyUI workflow is not ready. Try again shortly.",
+  "ComfyUI 未能载入工作流": "ComfyUI could not load the workflow"
+};
+  const ZH = Object.fromEntries(Object.keys(EN).map(key => [key, key]));
+  let locale, translate;
+  const fallbackLocale = Object.freeze({ active: 'zh', revision: 0 });
+  const readLocale = () => locale?.getSnapshot() ?? fallbackLocale;
+  const subscribeLocale = listener => locale?.subscribe(listener) ?? (() => {});
+  const useTranslations = () => useSyncExternalStore(subscribeLocale, readLocale, readLocale);
+  function t(key, params) {
+    const message = translate ? translate(key, params) : key;
+    return params ? message.replace(/\{(\w+)\}/g, (match, name) => String(params[name] ?? match)) : message;
+  }
+  const localizedMessage = message => typeof message === 'string' && message in EN ? t(message) : message;
   const PRIVACY_KEY = 'dsh.comfyui.blurOutputImages';
   const privacyListeners = new Set();
   let blurOutputImages = false;
@@ -109,6 +212,7 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
       h('circle', { cx: 12, cy: 12, r: 3 }), hidden ? h('path', { d: 'M3 3l18 18', strokeWidth: 2 }) : null);
   }
   function OutputImage({ image, loadImage, protectedImage }) {
+    useTranslations();
     const attachment = image.attachment;
     const preview = image.preview;
     const imageKey = attachment ? attachment.attachmentId : preview?.url;
@@ -119,7 +223,7 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     const [naturalSize, setNaturalSize] = useState(null);
     const src = preview?.url ?? (loaded.key === imageKey ? loaded.src : null);
     const error = loaded.key === imageKey && loaded.error;
-    const label = image.label ?? preview?.name ?? attachment?.name ?? '图片';
+    const label = image.label ?? preview?.name ?? attachment?.name ?? t('图片');
     const recordedSize = attachment ?? preview;
     const dimensions = recordedSize?.width > 0 && recordedSize?.height > 0 ? recordedSize
       : naturalSize?.key === imageKey ? naturalSize : { width: 360, height: 360 };
@@ -144,8 +248,8 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
       h('div', { className: 'dsh-comfy-image-card', style: { width: cardWidth } },
       h('button', { type: 'button', className: 'dsh-comfy-image', 'data-blurred': mask ? 'true' : 'false',
         style: { aspectRatio: dimensions.width + ' / ' + dimensions.height },
-        title: error ? '加载失败，点击重试' : mask ? '图片已遮挡，点击显示图片' : '点击查看原图',
-        'aria-label': error ? '重新加载图片' : (mask ? '显示已遮挡图片：' : '查看原图：') + label,
+        title: error ? t('加载失败，点击重试') : mask ? t('图片已遮挡，点击显示图片') : t('点击查看原图'),
+        'aria-label': error ? t('重新加载图片') : (mask ? t('显示已遮挡图片：') : t('查看原图：')) + label,
         'aria-busy': !error && src === null,
         onClick: () => {
           if (error) { setAttempt(value => value + 1); return; }
@@ -153,8 +257,8 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
           if (mask) setOverride({ key: imageKey, baseline: protectedImage, value: false });
           else setOpen(true);
         } },
-        error ? h('span', { className: 'dsh-comfy-image-error' }, '加载失败，点击重试') : src === null
-          ? h('span', { className: 'dsh-comfy-image-loading' }, '加载图片…')
+        error ? h('span', { className: 'dsh-comfy-image-error' }, t('加载失败，点击重试')) : src === null
+          ? h('span', { className: 'dsh-comfy-image-loading' }, t('加载图片…'))
           : h('img', { src, alt: label, onLoad: event => {
             const img = event.currentTarget;
             if (!(recordedSize?.width > 0 && recordedSize?.height > 0) && img.naturalWidth > 0 && img.naturalHeight > 0)
@@ -162,15 +266,16 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
           } }),
         mask ? h('span', { className: 'dsh-comfy-image-mask', 'aria-hidden': true },
           h(Eye, { hidden: true, size: 22 }),
-          h('span', null, '点击显示图片')) : null),
+          h('span', null, t('点击显示图片'))) : null),
       protectedImage && src !== null && !error ? h('button', { type: 'button', className: 'dsh-comfy-image-eye', 'aria-pressed': mask,
-        'aria-label': (mask ? '显示图片：' : '模糊图片：') + label, title: mask ? '显示这张图片' : '模糊这张图片',
+        'aria-label': (mask ? t('显示图片：') : t('模糊图片：')) + label, title: mask ? t('显示这张图片') : t('模糊这张图片'),
         onClick: () => setOverride({ key: imageKey, baseline: protectedImage, value: !mask }) }, h(Eye, { hidden: mask })) : null,
       h('div', { className: 'dsh-comfy-image-info' }, label,
         dimensions?.width && dimensions?.height ? ' · ' + dimensions.width + ' × ' + dimensions.height : '')),
-      open && src !== null ? h(ImageLightbox, { src, alt: label, labels: { dialog: '原图预览', close: '关闭原图预览' }, onClose: close }) : null);
+      open && src !== null ? h(ImageLightbox, { src, alt: label, labels: { dialog: t('原图预览'), close: t('关闭原图预览') }, onClose: close }) : null);
   }
   function OutputVideo({ image, protectedImage }) {
+    useTranslations();
     const [override, setOverride] = useState(null);
     const [size, setSize] = useState(null);
     const [error, setError] = useState(false);
@@ -192,11 +297,11 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
             if (video.videoWidth > 0 && video.videoHeight > 0)
               setSize({ key: image.url, width: video.videoWidth, height: video.videoHeight });
           } }),
-        error ? h('button', { type: 'button', className: 'dsh-comfy-video-reveal', onClick: () => { setError(false); setAttempt(v => v + 1); } }, '视频加载失败，点击重试')
-          : blurred ? h('button', { type: 'button', className: 'dsh-comfy-video-reveal', onClick: reveal, 'aria-label': '显示已遮挡视频：' + image.filename },
-            h('span', { className: 'dsh-comfy-image-mask', 'aria-hidden': true }, h(Eye, { hidden: true, size: 22 }), h('span', null, '点击显示视频'))) : null),
+        error ? h('button', { type: 'button', className: 'dsh-comfy-video-reveal', onClick: () => { setError(false); setAttempt(v => v + 1); } }, t('视频加载失败，点击重试'))
+          : blurred ? h('button', { type: 'button', className: 'dsh-comfy-video-reveal', onClick: reveal, 'aria-label': t('显示已遮挡视频：') + image.filename },
+            h('span', { className: 'dsh-comfy-image-mask', 'aria-hidden': true }, h(Eye, { hidden: true, size: 22 }), h('span', null, t('点击显示视频')))) : null),
       protectedImage && !error ? h('button', { type: 'button', className: 'dsh-comfy-image-eye', 'aria-pressed': blurred,
-        'aria-label': (blurred ? '显示视频：' : '模糊视频：') + image.filename, title: blurred ? '显示这个视频' : '模糊这个视频',
+        'aria-label': (blurred ? t('显示视频：') : t('模糊视频：')) + image.filename, title: blurred ? t('显示这个视频') : t('模糊这个视频'),
         onClick: () => setOverride({ key: image.url, baseline: protectedImage, value: !blurred }) }, h(Eye, { hidden: blurred })) : null,
       h('div', { className: 'dsh-comfy-image-info' }, image.filename,
         size?.key === image.url ? ' · ' + size.width + ' × ' + size.height : ''));
@@ -225,16 +330,17 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
   }
   function ComfyImageResult({ toolName, block, inspect }) {
     if (!['mcp__comfyui__get_image', 'mcp__comfyui__get_video'].includes(toolName)) return null;
+    useTranslations();
     const video = toolName === 'mcp__comfyui__get_video';
     const settled = block.kind === 'tool-result';
     const content = settled && Array.isArray(block.content) ? block.content : [];
     const text = content.filter(part => part.type === 'text').map(part => part.text).join('\n');
     const images = video ? resultVideos(block) : resultImages(block);
-    return h('section', { className: 'dsh-comfy-output', 'aria-label': video ? 'ComfyUI 视频结果' : 'ComfyUI 图片结果' }, h('style', null, CSS),
-      h('div', { className: 'dsh-comfy-output-head' }, h('strong', null, video ? 'ComfyUI 视频' : 'ComfyUI 图片'),
-        h('span', { role: 'status' }, !settled ? '读取中…' : block.isError ? '读取失败' : images.length ? '已读取' : '已完成'),
-        inspect ? h('button', { type: 'button', onClick: inspect }, '查看调用') : null),
-      images.length ? h('span', { className: 'dsh-comfy-image-info' }, (video ? '视频' : '图片') + '将在本次回复正文的结果区显示。') : null,
+    return h('section', { className: 'dsh-comfy-output', 'aria-label': video ? t('ComfyUI 视频结果') : t('ComfyUI 图片结果') }, h('style', null, CSS),
+      h('div', { className: 'dsh-comfy-output-head' }, h('strong', null, video ? t('ComfyUI 视频') : t('ComfyUI 图片')),
+        h('span', { role: 'status' }, !settled ? t('读取中…') : block.isError ? t('读取失败') : images.length ? t('已读取') : t('已完成')),
+        inspect ? h('button', { type: 'button', onClick: inspect }, t('查看调用')) : null),
+      images.length ? h('span', { className: 'dsh-comfy-image-info' }, (video ? t('视频') : t('图片')) + t('将在本次回复正文的结果区显示。')) : null,
       !images.length && text ? h('pre', { className: 'dsh-comfy-output-text', role: block.isError ? 'alert' : undefined }, text) : null);
   }
   function resultVideos(block) {
@@ -250,6 +356,7 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     return [];
   }
   function ComfyTurnResults({ turn, resultSource, loadImage, generationSource }) {
+    useTranslations();
     const subscribe = React.useCallback(listener => resultSource.subscribe(listener), [resultSource]);
     const read = React.useCallback(() => resultSource.getSnapshot(), [resultSource]);
     const snapshot = useSyncExternalStore(subscribe, read, read);
@@ -295,13 +402,13 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
       else if (media.kind === 'dsh-comfyui-web.image') images.push({ label: media.filename, preview: { url: media.url, name: media.filename } });
     }
     if (!images.length && !ownedTasks.length) return null;
-    const labels = { queued: '排队中', running: '生成中', completed: '已完成', failed: '生成失败', cancelled: '已取消', interrupted: '已中断', not_found: '未找到任务', monitor_stopped: '等待重新连接' };
-    return h('section', { className: 'dsh-comfy-output', 'aria-label': 'ComfyUI 生成结果' },
+    const labels = { queued: t('排队中'), running: t('生成中'), completed: t('已完成'), failed: t('生成失败'), cancelled: t('已取消'), interrupted: t('已中断'), not_found: t('未找到任务'), monitor_stopped: t('等待重新连接') };
+    return h('section', { className: 'dsh-comfy-output', 'aria-label': t('ComfyUI 生成结果') },
       h('style', null, CSS),
-      h('div', { className: 'dsh-comfy-output-head' }, h('strong', null, 'ComfyUI 生成结果')),
+      h('div', { className: 'dsh-comfy-output-head' }, h('strong', null, t('ComfyUI 生成结果'))),
       ownedTasks.map(task => h('div', { key: task.promptId, className: 'dsh-comfy-image-info', role: 'status' },
         labels[task.status] || task.status, task.progress?.max > 0 ? ' · ' + Math.round(task.progress.value / task.progress.max * 100) + '%' : '',
-        task.result?.error?.message ? ' · ' + task.result.error.message : task.result?.message ? ' · ' + task.result.message : '')),
+        task.result?.error?.message ? ' · ' + localizedMessage(task.result.error.message) : task.result?.message ? ' · ' + localizedMessage(task.result.message) : '')),
       h(MessageImages, { images, loadImage, align: 'start' }));
   }
   async function api(body, token, signal) {
@@ -312,6 +419,7 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     return result;
   }
   function Body({ sessionId, useTabInfo }) {
+    useTranslations();
     const { tab } = useTabInfo();
     const frame = useRef(null);
     const clientId = useRef(crypto.randomUUID());
@@ -391,50 +499,54 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     const bridgeMissing = connection && mcpEnabled && !bridgeSeen && bridgeWaitExpired;
     const installation = connection?.extensionInstallation;
     const installationHelp = installation?.status === 'failed' || installation?.status === 'unconfigured'
-      ? installation.message : '尚未收到 AI 桥接扩展连接。请确认 ComfyUI 可访问、已安装扩展；首次安装后重启 ComfyUI 并刷新面板。Docker 用户需确认扩展所在目录已持久化挂载。';
-    const setupLink = () => h('a', { href: 'https://github.com/mangfufu/dsh-comfyui-web#comfyui-extension-install', target: '_blank', rel: 'noopener noreferrer' }, '扩展安装说明');
-    return h('section', { className: 'dsh-comfy', 'aria-label': 'ComfyUI 工作台' },
+      ? (readLocale().active.startsWith('zh') ? installation.message : installation.messageEn || installation.message) : t('尚未收到 AI 桥接扩展连接。请确认 ComfyUI 可访问、已安装扩展；首次安装后重启 ComfyUI 并刷新面板。Docker 用户需确认扩展所在目录已持久化挂载。');
+    const setupLink = () => h('a', { href: readLocale().active.startsWith('zh') ? 'https://github.com/mangfufu/dsh-comfyui-web#comfyui-extension-install' : 'https://github.com/mangfufu/dsh-comfyui-web/blob/main/README.en.md#comfyui-extension-install', target: '_blank', rel: 'noopener noreferrer' }, t('扩展安装说明'));
+    return h('section', { className: 'dsh-comfy', 'aria-label': t('ComfyUI 工作台') },
       h('style', null, CSS),
       h('div', { className: 'dsh-comfy-bar' },
-        h('span', { className: 'dsh-comfy-state', role: 'status' }, h('i', { className: 'dsh-comfy-dot' + (!mcpEnabled ? ' off' : ready ? ' ready' : '') }), !mcpEnabled ? 'MCP 已关闭' : ready ? 'MCP · 共享画布已连接' : bridgeMissing ? 'AI 桥接扩展未连接' : '等待 ComfyUI'),
-        h('div', { className: 'dsh-comfy-zoom', role: 'group', 'aria-label': 'ComfyUI 界面缩放' },
-          h('button', { type: 'button', onClick: () => changeZoom(-0.05), disabled: zoom <= 0.5, 'aria-label': '缩小 ComfyUI 界面' }, '−'),
-          h('button', { type: 'button', onClick: () => setZoom(1), title: '恢复 100% 大小', 'aria-label': '当前缩放 ' + Math.round(zoom * 100) + '%，点击恢复 100%' }, Math.round(zoom * 100) + '%'),
-          h('button', { type: 'button', onClick: () => changeZoom(0.05), disabled: zoom >= 1.25, 'aria-label': '放大 ComfyUI 界面' }, '+')),
-        h('button', { type: 'button', className: 'dsh-comfy-privacy', role: 'switch', 'aria-checked': imagePrivacy, 'aria-label': '图片对话中模糊',
-          onClick: () => setImagePrivacy(!imagePrivacy), title: '只影响本插件在对话中返回的图片和视频；左上角的小眼睛可单独切换。' },
-          h('span', null, '图片对话中模糊'), h('span', { className: 'dsh-comfy-privacy-track', 'aria-hidden': true }),
-          h('span', { className: 'dsh-comfy-privacy-state', 'aria-hidden': true }, imagePrivacy ? '开' : '关')),
-        h('button', { type: 'button', onClick: () => { setReady(false); setEpoch(v => v + 1); }, title: '刷新 ComfyUI 页面' }, '刷新'),
-        h('button', { type: 'button', onClick: () => { setSettings(v => !v); setCopied(false); }, 'aria-expanded': settings }, 'MCP 设置')),
-      settings ? h('div', { className: 'dsh-comfy-settings', 'aria-label': 'MCP 设置' },
+        h('span', { className: 'dsh-comfy-state', role: 'status' }, h('i', { className: 'dsh-comfy-dot' + (!mcpEnabled ? ' off' : ready ? ' ready' : '') }), !mcpEnabled ? t('MCP 已关闭') : ready ? t('MCP · 共享画布已连接') : bridgeMissing ? t('AI 桥接扩展未连接') : t('等待 ComfyUI')),
+        h('div', { className: 'dsh-comfy-zoom', role: 'group', 'aria-label': t('ComfyUI 界面缩放') },
+          h('button', { type: 'button', onClick: () => changeZoom(-0.05), disabled: zoom <= 0.5, 'aria-label': t('缩小 ComfyUI 界面') }, '−'),
+          h('button', { type: 'button', onClick: () => setZoom(1), title: t('恢复 100% 大小'), 'aria-label': t('当前缩放 {percent}%，点击恢复 100%', { percent: Math.round(zoom * 100) }) }, Math.round(zoom * 100) + '%'),
+          h('button', { type: 'button', onClick: () => changeZoom(0.05), disabled: zoom >= 1.25, 'aria-label': t('放大 ComfyUI 界面') }, '+')),
+        h('button', { type: 'button', className: 'dsh-comfy-privacy', role: 'switch', 'aria-checked': imagePrivacy, 'aria-label': t('图片对话中模糊'),
+          onClick: () => setImagePrivacy(!imagePrivacy), title: t('只影响本插件在对话中返回的图片和视频；左上角的小眼睛可单独切换。') },
+          h('span', null, t('图片对话中模糊')), h('span', { className: 'dsh-comfy-privacy-track', 'aria-hidden': true }),
+          h('span', { className: 'dsh-comfy-privacy-state', 'aria-hidden': true }, imagePrivacy ? t('开') : t('关'))),
+        h('button', { type: 'button', onClick: () => { setReady(false); setEpoch(v => v + 1); }, title: t('刷新 ComfyUI 页面') }, t('刷新')),
+        h('button', { type: 'button', onClick: () => { setSettings(v => !v); setCopied(false); }, 'aria-expanded': settings }, t('MCP 设置'))),
+      settings ? h('div', { className: 'dsh-comfy-settings', 'aria-label': t('MCP 设置') },
         h('div', { className: 'dsh-comfy-settings-head' }, h('strong', null, 'ComfyUI MCP'),
           h('label', { className: 'dsh-comfy-switch' }, h('input', { type: 'checkbox', role: 'switch', checked: mcpEnabled, disabled: !connection || switching,
-            onChange: e => toggleMcp(e.target.checked) }), switching ? '保存中…' : '开启 MCP')),
-        h('p', null, mcpEnabled ? bridgeSeen ? 'MCP 已开启，当前对话的 AI 可直接读取、修改和运行画布。' : 'MCP 已开启，等待桥接扩展连接后可操作画布。' : 'MCP 已关闭，仍可手动编辑和生成。'),
+            onChange: e => toggleMcp(e.target.checked) }), switching ? t('保存中…') : t('开启 MCP'))),
+        h('p', null, mcpEnabled ? bridgeSeen ? t('MCP 已开启，当前对话的 AI 可直接读取、修改和运行画布。') : t('MCP 已开启，等待桥接扩展连接后可操作画布。') : t('MCP 已关闭，仍可手动编辑和生成。')),
         h('p', null, !bridgeSeen && installation?.status !== 'installed' ? installationHelp + ' ' : '', setupLink()),
         h('form', { onSubmit: connect },
-          h('label', { htmlFor: 'comfy-url-' + clientId.current }, 'ComfyUI 地址'),
+          h('label', { htmlFor: 'comfy-url-' + clientId.current }, t('ComfyUI 地址')),
           h('input', { id: 'comfy-url-' + clientId.current, type: 'url', required: true, value: url, onChange: e => setUrl(e.target.value) }),
-          h('button', { type: 'submit', disabled: saving || !connection }, saving ? '连接中…' : '保存并连接')),
+          h('button', { type: 'submit', disabled: saving || !connection }, saving ? t('连接中…') : t('保存并连接'))),
         connection?.mcp ? h(React.Fragment, null,
-          h('p', null, 'MCP 地址：', h('code', null, connection.mcp.endpoint)),
-          h('details', null, h('summary', null, '其他 AI 客户端的 MCP 配置'),
-            h('textarea', { readOnly: true, rows: 7, value: JSON.stringify(connection.mcp.clientConfig, null, 2), 'aria-label': 'MCP 客户端配置' }),
-            h('button', { type: 'button', onClick: copyConfig }, copied ? '已复制' : '复制配置'),
-            h('p', null, 'dsh 已自动接入；这份配置可用于本机其他支持 MCP 的客户端。'))) : null) : null,
-      error ? h('div', { className: 'dsh-comfy-note', role: 'alert' }, error) : null,
+          h('p', null, t('MCP 地址：'), h('code', null, connection.mcp.endpoint)),
+          h('details', null, h('summary', null, t('其他 AI 客户端的 MCP 配置')),
+            h('textarea', { readOnly: true, rows: 7, value: JSON.stringify(connection.mcp.clientConfig, null, 2), 'aria-label': t('MCP 客户端配置') }),
+            h('button', { type: 'button', onClick: copyConfig }, copied ? t('已复制') : t('复制配置')),
+            h('p', null, t('dsh 已自动接入；这份配置可用于本机其他支持 MCP 的客户端。')))) : null) : null,
+      error ? h('div', { className: 'dsh-comfy-note', role: 'alert' }, localizedMessage(error)) : null,
       bridgeMissing ? h('div', { className: 'dsh-comfy-note', role: 'alert' }, installationHelp, ' ', setupLink()) : null,
       src ? h('div', { className: 'dsh-comfy-viewport' }, h('iframe', { key: epoch, ref: frame, className: 'dsh-comfy-frame', src,
         style: { width: (100 / zoom) + '%', height: (100 / zoom) + '%', transform: 'scale(' + zoom + ')' },
-        title: 'ComfyUI 节点编辑与实时生成预览', allow: 'clipboard-read; clipboard-write; fullscreen', allowFullScreen: true,
-        onLoad: sendState, referrerPolicy: 'origin' })) : h('div', { className: 'dsh-comfy-empty' }, '正在连接本机 ComfyUI…'));
+        title: t('ComfyUI 节点编辑与实时生成预览'), allow: 'clipboard-read; clipboard-write; fullscreen', allowFullScreen: true,
+        onLoad: sendState, referrerPolicy: 'origin' })) : h('div', { className: 'dsh-comfy-empty' }, t('正在连接本机 ComfyUI…')));
   }
   function Entry({ open }) {
-    return h(React.Fragment, null, h('style', null, CSS), h('button', { type: 'button', className: 'dsh-comfy-entry', onClick: open, title: '在右侧打开 ComfyUI，可改节点、预览并让 AI 操作' },
+    useTranslations();
+    return h(React.Fragment, null, h('style', null, CSS), h('button', { type: 'button', className: 'dsh-comfy-entry', onClick: open, title: t('在右侧打开 ComfyUI，可改节点、预览并让 AI 操作') },
       h('svg', { width: 15, height: 15, viewBox: '0 0 20 20', fill: 'none', stroke: 'currentColor', 'aria-hidden': true }, h('rect', { x: 2, y: 3, width: 5, height: 5, rx: 1 }), h('rect', { x: 13, y: 12, width: 5, height: 5, rx: 1 }), h('path', { d: 'M7 5.5h4v9h2' })), 'ComfyUI'));
   }
   function apply(ctx) {
+    locale = ctx.locale;
+    ctx.effect(() => locale?.register(ID, { zh: ZH, en: EN }));
+    translate = locale?.bind(ID);
     ctx.effect(() => {
       const onStorage = event => { if (event.key === PRIVACY_KEY || event.key === null) setImagePrivacy(event.newValue === 'true', false); };
       window.addEventListener('storage', onStorage);
@@ -455,10 +567,10 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
       }
     }, ComfyTurnResults)));
     ctx.effect(() => ctx.sidebarRightTabs.register({ id: ID, kind: ID, keepMounted: true, title: () => 'ComfyUI',
-      guide: [{ id: 'comfyui', order: 35, title: () => 'ComfyUI', description: () => '节点编辑 · 实时预览 · AI 操作' }] }));
+      guide: [{ id: 'comfyui', order: 35, title: () => 'ComfyUI', description: () => t('节点编辑 · 实时预览 · AI 操作') }] }));
     ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({ name: 'sidebar.right.pane.tab', key: ID }, Body)));
     ctx.effect(() => ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({ name: 'conversation.session.header.utilities', id: ID, order: 35,
       inject: () => ({ open: () => ctx.sidebarRight.openTab(ID) }) }, Entry)));
   }
-  return { name: ID, inject: ['slots', 'sidebarRight', 'sidebarRightTabs', 'uiConversation'], apply };
+  return { name: ID, inject: ['slots', 'sidebarRight', 'sidebarRightTabs', 'uiConversation', 'locale'], apply };
 } });
