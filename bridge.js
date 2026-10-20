@@ -653,24 +653,31 @@
   // conversion (localized combos, DOM editors). Reporting it beside the canvas values is what
   // lets the audit tell "this label converts at queue time" from "this value really is invalid".
   // Strings are capped like widget values so one long prompt cannot flood the reply.
+  // Strings are capped well above any realistic enum (4 KB) so the audit compares the real
+  // submitted value; anything longer is listed in `serializedTruncated` and never judged.
+  const SERIALIZED_CAP = 4096;
   const promptValue = value => {
-    if (typeof value === 'string') return value.length > 200 ? value.slice(0, 200) + '…' : value;
+    if (typeof value === 'string') return value.length > SERIALIZED_CAP ? value.slice(0, SERIALIZED_CAP) + '…' : value;
     if (value === null || value === undefined) return null;
     if (typeof value !== 'object') return value;
     let text = '';
     try { text = JSON.stringify(value); } catch { text = String(value); }
-    return text.length > 200 ? text.slice(0, 200) + '…' : text;
+    return text.length > SERIALIZED_CAP ? text.slice(0, SERIALIZED_CAP) + '…' : text;
   };
   const promptInputs = async app => {
     try {
       const prompt = await app.graphToPrompt();
-      const map = {};
+      const map = {}, truncated = [];
       for (const [nodeId, entry] of Object.entries(prompt?.output || {})) {
         const inputs = {};
-        for (const [name, value] of Object.entries(entry?.inputs || {})) inputs[name] = promptValue(value);
+        for (const [name, value] of Object.entries(entry?.inputs || {})) {
+          const shown = promptValue(value);
+          if (typeof shown === 'string' && shown.length > SERIALIZED_CAP && shown.endsWith('…')) truncated.push(nodeId + '.' + name);
+          inputs[name] = shown;
+        }
         map[nodeId] = inputs;
       }
-      return { serializedInputs: map };
+      return { serializedInputs: map, ...(truncated.length ? { serializedTruncated: truncated.slice(0, 40) } : {}) };
     } catch (error) {
       return { serializedInputs: null, serializedError: String(error?.message || error) };
     }

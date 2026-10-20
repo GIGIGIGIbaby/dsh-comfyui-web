@@ -297,8 +297,16 @@ test('audit_graph carries the serialized prompt, and a failed serialization is n
     inputs: { steps: 20, mode: '稳定1.5.safetensors', text: 'x'.repeat(210) } } } });
   const audit = await command('audit_graph', { op: 'params' });
   assert.equal(audit.serializedInputs['1'].mode, '稳定1.5.safetensors', 'the value the queue would receive travels beside the canvas value');
-  assert.equal(audit.serializedInputs['1'].text.length, 201, 'strings are capped like widget values');
-  assert.match(audit.serializedInputs['1'].text, /…$/);
+  assert.equal(audit.serializedInputs['1'].text.length, 210, 'a normal value is carried whole: truncation would make the audit compare a prefix');
+  assert.equal(audit.serializedInputs['1'].text.endsWith('…'), false);
+  assert.equal(audit.serializedTruncated, undefined, 'nothing was cut, so nothing is flagged');
+
+  // A value beyond the 4 KB cap is the one case the audit cannot judge; it must say so instead
+  // of letting the prefix decide a verdict.
+  const long = await boot([plainNode()], { promptOutput: { '1': { class_type: 'KSampler', inputs: { steps: 20, text: 'y'.repeat(5000) } } } });
+  const capped = await long('audit_graph', { op: 'params' });
+  assert.equal(capped.serializedInputs['1'].text.length, 4097);
+  assert.deepEqual(capped.serializedTruncated, ['1.text']);
 
   // A structural audit never reads the serialized values, so it must not pay a full serialize.
   const structural = await command('audit_graph', { op: 'graph' });

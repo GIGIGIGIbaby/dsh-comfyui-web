@@ -171,6 +171,39 @@ test('the saver check trusts the server flag, not the node name', () => {
   assert.equal(declaredFalse.checks.find(c => c.id === 'saver-present').verdict, 'refuted');
 });
 
+test('a display node that declares output_node does not count as a file saver', () => {
+  // ShowText|pysssss has OUTPUT_NODE = True and a STRING output. Treating the flag alone as
+  // "writes a file" would promise disk output on a graph that only prints text.
+  const displayDefs = { ShowText: { output_node: true, output: ['STRING'], input: { required: {} } } };
+  const result = auditGraph({ page: { nodes: [node(9, 'ShowText')], linkCount: 0 }, defs: displayDefs });
+  assert.equal(result.checks.find(c => c.id === 'saver-present').verdict, 'refuted');
+  // It is still an execution root, so a gap on its dependency path is not excused.
+  const wired = auditGraph({ page: { nodes: [node(9, 'ShowText', { inputs: [{ name: 'text', type: 'STRING', link: 7 }] }),
+    node(10, 'MissingNode', { outputs: [{ name: 'text', type: 'STRING', links: [7] }] })], linkCount: 1 }, defs: displayDefs });
+  assert.equal(wired.checks.find(c => c.id === 'definitions-known').verdict, 'unresolved');
+});
+
+test('a bypassed saver is not counted as persistence', () => {
+  // graphToPrompt drops BYPASS nodes, so a mode-4 SaveVideo will not write anything.
+  const saverDefs = { SaveVideo: { output_node: true, output: ['VIDEO'], input: { required: {} } } };
+  const result = auditGraph({ page: { nodes: [node(1, 'SaveVideo', { mode: 4 })], linkCount: 0 }, defs: saverDefs });
+  assert.equal(result.checks.find(c => c.id === 'saver-present').verdict, 'refuted');
+});
+
+test('a value cut at the reply cap is unresolved, never refuted', () => {
+  const longLabel = '很长的枚举值'.repeat(60) + '…';
+  const defsLong = { Widget: { input: { required: { choice: [['短值']] } } } };
+  const canvas = auditParams({ page: { nodes: [node(1, 'Widget', { widgets: [{ name: 'choice', kind: 'dom', value: longLabel }] })] }, defs: defsLong });
+  assert.equal(canvas.checks.find(c => c.id === 'param-values').count, 0, 'a truncated canvas value cannot be judged');
+  assert.equal(canvas.checks.find(c => c.id === 'param-values-unverified').count, 1);
+  assert.equal(canvas.verdict, 'unresolved');
+
+  const serialized = auditParams({ page: { nodes: [node(1, 'Widget', { widgets: [{ name: 'choice', kind: 'dom', value: '显示值' }] })],
+    serializedInputs: { '1': { choice: '裁剪后的前缀…' } }, serializedTruncated: ['1.choice'] }, defs: defsLong });
+  assert.equal(serialized.checks.find(c => c.id === 'param-values').count, 0, 'a truncated submission is not a violation');
+  assert.match(serialized.checks.find(c => c.id === 'param-values-unverified').evidence[0].likely, /截断上限/);
+});
+
 // ---------------------------------------------------------------- param audit
 
 test('a combo whose option list is server-filled is not judged against an empty set', () => {
