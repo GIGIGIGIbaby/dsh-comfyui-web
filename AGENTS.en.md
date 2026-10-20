@@ -46,7 +46,7 @@ All three must hold. Until then, do not tell the user it is installed or fixed.
 
 **1. The server and a panel are both connected.** Call `server_info` and require: `connected: true`; at least one entry in `clients` with `ready: true`, `allowAI: true` and `connected: true`; `heartbeatAgeMs` in the low seconds (that is the page still polling).
 
-**2. The script in the page matches the plugin.** `server_info`'s `bridgeVersion` must equal `package.json`'s `version`, and `bridgeProtocol` must match; `clients[].refreshRequired` must be `false` -- when it is `true` the page is still running the old script and **the ComfyUI page has to be reloaded**; restarting dsh is not enough.
+**2. The script in the page matches the plugin.** `server_info.bridgeVersion` / `bridgeProtocol` are what the host read from `package.json` and `bridge.js` at startup; `syncClients[]` is what each panel reports. Take the entry whose `clientId` matches the `clients[]` entry for this conversation and require its `bridgeVersion` to equal `server_info.bridgeVersion` and its `refreshRequired` to be `false`. `refreshRequired` lives on `syncClients[]` only (`clients[]` has no such field) and compares the page's reported `bridgeProtocol` with the host's; when it is `true` the page is still running the old script and **the ComfyUI page has to be reloaded** (the panel's Refresh button does it); restarting dsh is not enough. It does not look at the version string, so compare versions yourself.
 
 **3. It really reads and really writes.**
 
@@ -63,9 +63,18 @@ When one of the three fails, fix the environment first (restart dsh, reload the 
 
 ## §3 Rules after you change or install something
 
-- **You changed `bridge.js`**: it is a script injected into the browser page, so the ComfyUI page must reload before it takes effect; restarting dsh alone does nothing.
-- **You changed `lib/*.js`, `client.js` or `package.json`**: the plugin is loaded when dsh starts, so dsh must be restarted.
-- **A version bump touches three places**: `package.json`'s `version`, the version constant in code (for example `bridgeVersion` / `bridgeProtocol` in `bridge.js`), and any rebuilt artifact. Miss one and criterion 2 never passes.
+Find the layer the change lives in before touching anything. Each layer loads on its own -- do not restart dsh on reflex:
+
+| Changed | Minimum action | What to verify |
+| --- | --- | --- |
+| `client.js` (panel UI) | Refresh the dsh web page. This file is the bundle the browser loads: `package.json`'s `./client` export points at it, there is no build step, and the page reads this file from disk when it loads it | The new label or behaviour shows up in the panel; no dsh restart needed |
+| `lib/*.js`, `cordis.patch.yml`, or `package.json`'s `dsh` fields / `version` | Load the plugin again; when the host offers no reload entry, dsh must be restarted. These modules are imported once when the plugin loads, and `version` is read at startup | Startup log is clean; `server_info.bridgeVersion` is the new version, and the changed tool / field is visible |
+| `bridge.js` (the script injected into the ComfyUI page) | Restart dsh first, then reload the ComfyUI page. The host reads the script into memory at startup and serves that copy from `/__dsh_comfyui/bridge.js`, so a page reload alone cannot pick up the new file; the old script already running in the page only re-runs on a reload | In `server_info`, the `syncClients[]` entry with the same `clientId` has a `bridgeVersion` equal to `server_info.bridgeVersion` and `refreshRequired` of `false` |
+| `comfy-extension.js` (the loader written into ComfyUI's extension directory) | Restart dsh so the file is rewritten, then reload the ComfyUI page; with `customNodesDir` it is a custom node, so restart ComfyUI | `clients[]` has an entry for this conversation with `ready` / `allowAI` / `connected` all `true` |
+
+The panel's Refresh button only remounts the embedded ComfyUI iframe; ComfyUI tabs opened in a normal browser must each reload the page, or they keep reporting the old script.
+
+- **A version bump touches three places**: `package.json`'s `version`, `bridgeVersion` in `bridge.js`, and the protocol number (`bridgeProtocol` in `bridge.js` plus `BRIDGE_PROTOCOL` in `lib/runtime.js`). Criterion 2 only sees it after the reload and page refresh above; miss one and criterion 2 never passes.
 - **Do not judge "old code is still running" from a byte difference between the served `bridge.js` and the one on disk**: `lib/runtime.js` substitutes a placeholder token with the real one when it serves that script, so the difference is expected. Read the version from `server_info`'s `bridgeVersion`, or from `GET /__dsh_comfyui/bootstrap` (`bridgeVersion` / `bridgeProtocol`).
 - **The bridge token changes on every dsh restart**: the token in `<DSH_HOME>/comfyui/connection.json` is replaced, so do not reuse the previous token when calling MCP.
 - **Run the tests after a change**: `npm test` (= `node --test test/*.test.mjs`) has to be green. Edit an assertion only when it is genuinely stale, and say why in the commit.
@@ -82,14 +91,17 @@ Paste this into a fresh session as-is:
 ```text
 You are maintaining the dsh-comfyui-web plugin. Before touching anything:
 1. Call server_info and confirm three things: connected=true; one entry in clients has ready/allowAI/connected
-   all true; refreshRequired=false. If any of them fails, fix the environment first (restart dsh, reload the
-   ComfyUI page, check the MCP switch in the panel) -- do not start editing the canvas.
+   all true; the syncClients entry with the same clientId has refreshRequired=false (clients has no such field).
+   If any of them fails, fix the environment first (restart dsh, reload the ComfyUI page, check the MCP switch
+   in the panel) -- do not start editing the canvas.
 2. Read and write node parameters with list_nodes (filter takes the node type) and update_nodes only;
    when a node is missing, get the real nodeId with list_nodes first. Never reuse an id from an earlier turn.
 3. After writing, read the value back with list_nodes detail="values" and confirm it really changed before
    reporting the result to the user.
 
-Changing bridge.js needs a ComfyUI page reload; changing lib/*.js needs a dsh restart.
+Changing client.js only needs a dsh page refresh; changing lib/*.js or package.json means loading the plugin
+again (restart dsh when there is no reload entry); changing bridge.js needs a dsh restart and then a ComfyUI
+page reload.
 ```
 
 ---

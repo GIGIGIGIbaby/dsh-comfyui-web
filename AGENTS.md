@@ -46,7 +46,7 @@
 
 **1. 服务与面板都连上了。** 调 `server_info`，要求：`connected: true`；`clients` 至少一项，且该项 `ready: true`、`allowAI: true`、`connected: true`；`heartbeatAgeMs` 是秒级数字（几秒以内说明页面还在轮询）。
 
-**2. 页面里的脚本与插件同版本。** `server_info` 的 `bridgeVersion` 应等于 `package.json` 的 `version`，`bridgeProtocol` 一致；`clients[].refreshRequired` 必须是 `false`——为 `true` 说明页面还跑着旧脚本，**必须刷新 ComfyUI 页面**，只重启 dsh 不够。
+**2. 页面里的脚本与插件同版本。** `server_info.bridgeVersion` / `bridgeProtocol` 是宿主启动时从 `package.json` 和 `bridge.js` 读进来的；`syncClients[]` 是各面板上报的实况。取与本对话 `clients[]` 同一 `clientId` 的那一项，要求 `bridgeVersion` 等于 `server_info.bridgeVersion`、`refreshRequired` 为 `false`。`refreshRequired` 只挂在 `syncClients[]` 上（`clients[]` 没有这个字段），判定的是页面汇报的 `bridgeProtocol` 与宿主不一致；它为 `true` 说明页面还跑着旧脚本，**必须刷新 ComfyUI 页面**（面板里的「刷新」即可），只重启 dsh 不够。它不看版本号，版本要自己比。
 
 **3. 真的读得出来、也写得进去。**
 
@@ -63,9 +63,18 @@ list_nodes { filter: "<节点类型>", detail: "values" }   → 回读，值确�
 
 ## §3 改完 / 装完的规矩
 
-- **改了 `bridge.js`**：它是注入到浏览器页面里执行的脚本，必须让 ComfyUI 页面重新加载才生效；只重启 dsh 不够。
-- **改了 `lib/*.js`、`client.js`、`package.json`**：插件在 dsh 启动时加载，必须重启 dsh 才生效。
-- **改版本号要三处同步**：`package.json` 的 `version`、代码里的版本常量（如 `bridge.js` 的 `bridgeVersion` / `bridgeProtocol`）、以及重建产物。任何一处漏掉都会让判据 2 永远不过。
+先看改动落在哪一层再动手，四层各自加载，不要一律重启 dsh：
+
+| 改了什么 | 最小动作 | 怎么验证 |
+| --- | --- | --- |
+| `client.js`（面板 UI） | 刷新 dsh 网页。它就是浏览器加载的那份 bundle：`package.json` 的 `./client` 导出直接指向该文件，仓库里没有构建步骤，页面加载时读的就是磁盘上这份 | 面板上出现新文案 / 新行为；不用重启 dsh |
+| `lib/*.js`、`cordis.patch.yml`、`package.json` 的 `dsh` 字段或 `version` | 让宿主重新加载插件；没有重载入口时重启 dsh。这些模块只在插件加载时 `import` 一次，`version` 也只在启动时读入 | 启动日志无报错；`server_info` 的 `bridgeVersion` 已是新版本号，改动后的工具 / 字段可见 |
+| `bridge.js`（注入 ComfyUI 页面的脚本） | 先重启 dsh，再刷新 ComfyUI 页面。宿主启动时把它读进内存，之后 `/__dsh_comfyui/bridge.js` 发的都是内存里那份，只刷新页面换不掉；页面里已在跑的旧脚本也只有刷新才会重跑 | `server_info` 返回的 `syncClients[]` 中，同一 `clientId` 那一项的 `bridgeVersion` 等于 `server_info.bridgeVersion`，`refreshRequired` 为 `false` |
+| `comfy-extension.js`（写进 ComfyUI 扩展目录的加载脚本） | 重启 dsh 重写该文件，再刷新 ComfyUI 页面；用 `customNodesDir` 时装的是自定义节点，要重启 ComfyUI | `clients[]` 里有本对话的条目，`ready` / `allowAI` / `connected` 均为 `true` |
+
+面板里的「刷新」只重载内嵌的 ComfyUI iframe；在普通浏览器里另开的 ComfyUI 标签页要各自刷新页面，否则它们上报的还是旧脚本。
+
+- **改版本号要三处同步**：`package.json` 的 `version`、`bridge.js` 里的 `bridgeVersion`、以及协议号（`bridge.js` 的 `bridgeProtocol` 与 `lib/runtime.js` 的 `BRIDGE_PROTOCOL`）。按上表重新加载并刷新页面对判据 2 才生效；任何一处漏掉，判据 2 永远不过。
 - **不要用「服务端下发的 bridge.js 与磁盘文件不一致」判定跑的是旧代码**：`lib/runtime.js` 在提供该脚本时会把占位 token 替换成真实 token，字节差是正常的。判断版本请看 `server_info` 的 `bridgeVersion`，或 `GET /__dsh_comfyui/bootstrap` 返回的 `bridgeVersion` / `bridgeProtocol`。
 - **每次重启 dsh，桥接 token 都会变**：`<DSH_HOME>/comfyui/connection.json` 里的 token 随之更新，不要复用上一次的 token 调 MCP。
 - **改完跑测试**：`npm test`（= `node --test test/*.test.mjs`）必须全绿。只在某条测试确实过时、且 commit 里写清理由时改断言。
@@ -82,13 +91,14 @@ list_nodes { filter: "<节点类型>", detail: "values" }   → 回读，值确�
 ```text
 你在维护 dsh-comfyui-web 插件。动手前先做三件事：
 1. 调 server_info 确认三件事：connected=true、clients 里有一项 ready/allowAI/connected 都为 true、
-   refreshRequired=false。任一不满足就先修环境（重启 dsh、刷新 ComfyUI 页面、检查面板 MCP 开关），
-   别急着改画布。
+   同一 clientId 在 syncClients 里那一项的 refreshRequired=false（clients 上没有这个字段）。
+   任一不满足就先修环境（重启 dsh、刷新 ComfyUI 页面、检查面板 MCP 开关），别急着改画布。
 2. 读写节点参数一律用 list_nodes（filter 填节点类型）和 update_nodes；
    找不到节点就先用 list_nodes 取真实 nodeId，不要复用上一轮调用里的 id。
 3. 写完用 list_nodes detail="values" 回读确认值真的变了，再向用户报告结果。
 
-改 bridge.js 要刷新 ComfyUI 页面，改 lib/*.js 要重启 dsh。
+改 client.js 刷新 dsh 网页即可；改 lib/*.js 或 package.json 要重新加载插件（没有重载入口就重启 dsh）；
+改 bridge.js 要重启 dsh 再刷新 ComfyUI 页面。
 ```
 
 ---
