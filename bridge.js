@@ -481,17 +481,44 @@
   }
   // Some packs keep a structured document in node.properties and render their editor from
   // it, so a freshly written value is ignored until that shadow is dropped — the same
-  // order of operations the packs use for their own "fill this in" buttons.
+  // order of operations the packs use for their own "fill this in" buttons. Reading them is
+  // harmless; deleting one without being able to attribute it to this widget is not.
   const shadowDocs = node => Object.entries(node.properties || {})
     .filter(([, value]) => value && typeof value === 'object' && Array.isArray(value.parts)).map(([key]) => key);
-  // A hidden original widget and the DOM widget that replaced it hold the same value;
-  // writing through the visible one is what makes the editor and the archive agree.
-  function writeTarget(node, widget) {
-    if (widgetKind(widget) !== 'hidden' && widgetKind(widget) !== 'shadowed') return { widget, reroutedFrom: null };
-    const sibling = (node.widgets || []).find(other => other !== widget && widgetSetter(other)
-      && String(widgetReadback(other) ?? '') === String(widget.value ?? ''));
-    return sibling ? { widget: sibling, reroutedFrom: widget.name } : { widget, reroutedFrom: null };
+  const mentionsOf = part => [part?.tag, part?.label, part?.fullLabel, part?.token]
+    .filter(text => typeof text === 'string' && text.trim() !== '');
+  // The one document that shadows this widget, or null. Attribution beats enumeration: a
+  // document is only this widget's when its key or its mentions name the widget, so an
+  // unrelated document on the same node survives a failed write (reviewer's reproduction).
+  function shadowDocFor(node, widget) {
+    const name = String(widget.name || '');
+    const declared = [widget.options?.shadowDoc, widget.options?.serializedWidget, widget.options?.widgetName]
+      .filter(key => typeof key === 'string' && key !== '');
+    const named = text => text === name || text.includes(name);
+    const candidates = [];
+    for (const [key, doc] of Object.entries(node.properties || {})) {
+      if (!doc || typeof doc !== 'object' || !Array.isArray(doc.parts)) continue;
+      const attributed = declared.includes(key) || named(key)
+        || doc.parts.some(part => mentionsOf(part).some(named));
+      if (attributed) candidates.push({ key, value: doc });
+    }
+    return candidates.length === 1 ? candidates[0] : null;
   }
+  // A hidden original widget and the DOM widget that replaced it hold the same value; writing
+  // through the visible one is what makes the editor and the archive agree. Ownership has to be
+  // confirmed — matching current values made two empty widgets interchangeable and sent a write
+  // into an unrelated field (reviewer's reproduction). Same name is LiteGraph's own convention
+  // for `addDOMWidget(name, …)`; packs that swap widgets record the name in options.
+  const ownsWidget = (other, name) => other.name === name
+    || other.options?.serializedWidget === name || other.options?.widgetName === name;
+  function writeTarget(node, widget) {
+    if (widgetKind(widget) !== 'hidden' && widgetKind(widget) !== 'shadowed') return { widget, reroutedFrom: null, resolved: true };
+    const owners = (node.widgets || []).filter(other => other !== widget && widgetSetter(other) && ownsWidget(other, widget.name));
+    if (owners.length !== 1) return { widget, reroutedFrom: null, resolved: false };
+    return { widget: owners[0], reroutedFrom: widget.name, resolved: true };
+  }
+  const unresolvedTarget = widget => ({ resolved: false,
+    hint: `控件 ${widget.name} 由一个未被声明归属的前端组件持有，无法安全确定写入目标；本次没有写入。` });
   // The front-end persists every graph change as a localStorage draft; when the origin's
   // quota is full the write itself fails and the user gets a toast the tool side can neither
   // see nor dismiss. A silent page-wide side effect deserves a number in the reply: measure
@@ -654,9 +681,15 @@
     try {
       if (typeof value === 'string' && String(widgetReadback(widget) ?? '') !== value) {
         stage = 'clear-shadow-docs';
-        cleared = shadowDocs(node);
-        if (cleared.length) { for (const key of cleared) delete node.properties[key]; apply(); }
-        else cleared = null;
+        // One attributable document, kept aside: a retry that still does not verify restores it,
+        // so a failed write leaves the node exactly as it found it.
+        const shadow = shadowDocFor(node, widget);
+        if (shadow) {
+          delete node.properties[shadow.key];
+          apply();
+          if (String(widgetReadback(widget) ?? '') === String(value)) cleared = [shadow.key];
+          else node.properties[shadow.key] = shadow.value;
+        }
       }
     } catch (error) { fail(error); }
     stage = 'read-back';
@@ -810,10 +843,14 @@
         const node = app.graph.getNodeById(args.nodeId), found = node?.widgets?.find(widget => widget.name === args.widget);
         if (!found || found.type === 'button') throw new Error('目标图片参数不存在，请先 list_nodes 获取准确 nodeId/widget');
         if (Array.isArray(found.options?.values) && !found.options.values.includes(args.value)) found.options.values.push(args.value);
-        const { widget, reroutedFrom } = writeTarget(node, found);
+        const { widget, reroutedFrom, resolved } = writeTarget(node, found);
+        // An owner that cannot be confirmed is a refused request, decided before anything is
+        // written: guessing would put the value into a control the caller never addressed.
+        if (!resolved) throw fail('无法确定控件 ' + args.widget + ' 的写入目标', unresolvedTarget(found).hint);
         const outcome = writeWidget(app, node, widget, args.value);
         return { nodeId: String(node.id), widget: widget.name, value: outcome.after, via: outcome.via, verified: outcome.verified,
-          ...(reroutedFrom ? { requestedWidget: reroutedFrom } : {}), ...(outcome.cleared ? { shadowDocsCleared: outcome.cleared } : {}) };
+          ...(reroutedFrom ? { requestedWidget: reroutedFrom } : {}),
+          ...(outcome.cleared ? { shadowDocsCleared: outcome.cleared } : {}) };
       }
       case 'list_edits': {
         const history = historyOf(app);
@@ -885,7 +922,8 @@
             throw fail('可编辑参数不存在：' + change.nodeId + '.' + change.widget,
               '节点 ' + change.nodeId + '（' + node.type + '）的可写控件名是 [' + names.join(', ') + ']：用其中之一，或先 list_nodes detail=values 看清 name。');
           }
-          const { widget, reroutedFrom } = writeTarget(node, found);
+          const { widget, reroutedFrom, resolved } = writeTarget(node, found);
+          if (!resolved) throw fail('无法确定控件 ' + change.widget + ' 的写入目标', unresolvedTarget(found).hint);
           const current = widgetReadback(widget);
           const kindOf = value => Array.isArray(value) ? 'array' : value === null ? 'null' : typeof value;
           if (typeof current === 'number' && (typeof change.value !== 'number' || !Number.isFinite(change.value))) throw fail(widget.name + ' 必须是数字', widget.name + ' 当前是数字 ' + current + '，提交的是 ' + kindOf(change.value) + ' ' + JSON.stringify(change.value) + '：传裸数字，别传字符串或对象。');

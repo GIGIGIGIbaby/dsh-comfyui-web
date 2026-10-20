@@ -61,17 +61,28 @@ const plainNode = () => ({ id: 1, type: 'KSampler', title: '', mode: 0, properti
   inputs: [], outputs: [] });
 
 // The AICG3D shape: `prompt` is hidden and its value is only reachable through the DOM
-// widget, which refuses to apply while a reference document shadows it.
-const editorNode = () => {
+// widget, which refuses to apply while a reference document shadows it. The pack declares
+// which widget it replaced — that declaration is what makes the reroute safe.
+const editorNode = (declare = true) => {
   const prompt = { name: 'prompt', type: 'hidden', hidden: true, value: '旧内容', options: { hidden: true }, callback: () => {} };
   const doc = () => node.properties['minimax_h3_prompt_reference_doc'];
   const node = { id: 2, type: 'AICG3D_H3', title: '', mode: 0, properties: { minimax_h3_prompt_reference_doc: { parts: ['a', 'b'] } },
     widgets: [prompt, { name: 'h3_prompt_mentions', type: 'h3_prompt_mentions', value: undefined, serialize: false,
       options: { serialize: false,
+        ...(declare ? { serializedWidget: 'prompt', shadowDoc: 'minimax_h3_prompt_reference_doc' } : {}),
         getValue: () => String(prompt.value || ''),
         setValue: value => { if (doc()) return; prompt.value = String(value); } } }],
     inputs: [], outputs: [] };
   return node;
+};
+
+// The reviewer's reproduction: a hidden `prompt` and an unrelated DOM `notes` are both empty,
+// so their values agree even though they have nothing to do with each other.
+const ambiguousNode = () => {
+  const prompt = { name: 'prompt', type: 'hidden', hidden: true, value: '', options: { hidden: true }, callback: () => {} };
+  const notes = { name: 'notes', type: 'text', value: '', options: { getValue: () => notes.value, setValue: value => { notes.value = String(value); } } };
+  return { id: 4, type: 'SomePackNode', title: '', mode: 0, properties: {},
+    widgets: [prompt, notes], inputs: [], outputs: [] };
 };
 
 const stubbornNode = () => ({ id: 3, type: 'SomeVueNode', title: '', mode: 0, properties: {},
@@ -105,8 +116,43 @@ test('writing a hidden prompt reroutes to the DOM widget and clears the shadowin
   assert.equal(node.widgets[0].value, '镜1：手腕举起座套', 'the archived value the prompt uses is updated');
 });
 
-test('a setter that refuses to apply is reported as unverified instead of success', async () => {
-  const command = await boot([stubbornNode()]);
+test('an undeclared owner is refused instead of guessed', async () => {
+  // Same node as the AICG3D shape, but the pack does not say which widget replaced `prompt`.
+  // The write is refused before anything changes: a lucky guess is not a confirmed relationship.
+  const node = editorNode(false);
+  const command = await boot([node]);
+  await assert.rejects(command('update_nodes', { changes: [{ nodeId: 2, widget: 'prompt', value: '新内容' }] }),
+    /无法确定控件 prompt 的写入目标/);
+  assert.equal(node.widgets[0].value, '旧内容', 'the hidden value is untouched');
+  assert.ok(node.properties['minimax_h3_prompt_reference_doc'], 'and so is the document');
+});
+
+test('the reviewer reproduction: an empty prompt and an empty notes are not interchangeable', async () => {
+  const node = ambiguousNode();
+  const command = await boot([node]);
+  await assert.rejects(command('update_nodes', { changes: [{ nodeId: 4, widget: 'prompt', value: 'hello' }] }),
+    /无法确定控件 prompt 的写入目标/);
+  assert.equal(node.widgets[1].value, '', 'notes did not receive the write');
+  assert.equal(node.widgets[0].value, '', 'and the prompt was not claimed as written');
+});
+
+test('a failed retry puts back the document it removed, and never touches unrelated ones', async () => {
+  // The setter refuses even with its document gone, so the retry cannot verify: the document
+  // must be restored exactly, and a second `parts` document that names nothing stays put.
+  const prompt = { name: 'prompt', type: 'hidden', hidden: true, value: 'old', options: { hidden: true } };
+  const doc = { parts: [{ type: 'text', text: 'shadow' }], keep: 'x' };
+  const unrelated = { parts: ['u'], keep: true };
+  const node = { id: 5, type: 'PackNode', title: '', mode: 0, properties: { pack_prompt_doc: doc, unrelated },
+    widgets: [prompt, { name: 'editor', type: 'custom', value: '', options: { serialize: false, serializedWidget: 'prompt', shadowDoc: 'pack_prompt_doc',
+      getValue: () => '', setValue: () => {} } }], inputs: [], outputs: [] };
+  const command = await boot([node]);
+  const result = await command('update_nodes', { changes: [{ nodeId: 5, widget: 'prompt', value: 'new' }] });
+  assert.equal(result.changed[0].verified, false);
+  assert.deepEqual(node.properties.pack_prompt_doc, doc, 'the attributable document is restored');
+  assert.deepEqual(node.properties.unrelated, unrelated, 'the unrelated document was never touched');
+});
+
+test('a setter that refuses to apply is reported as unverified instead of success', async () => {  const command = await boot([stubbornNode()]);
   const result = await command('update_nodes', { changes: [{ nodeId: 3, widget: 'text', value: 'new' }] });
   assert.equal(result.changed[0].verified, false);
   assert.equal(result.changed[0].after, 'kept');
