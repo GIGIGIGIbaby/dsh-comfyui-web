@@ -634,6 +634,32 @@
     }
     return map;
   };
+  // graphToPrompt() is what the queue would receive: it runs the front-end's own widget
+  // conversion (localized combos, DOM editors). Reporting it beside the canvas values is what
+  // lets the audit tell "this label converts at queue time" from "this value really is invalid".
+  // Strings are capped like widget values so one long prompt cannot flood the reply.
+  const promptValue = value => {
+    if (typeof value === 'string') return value.length > 200 ? value.slice(0, 200) + '…' : value;
+    if (value === null || value === undefined) return null;
+    if (typeof value !== 'object') return value;
+    let text = '';
+    try { text = JSON.stringify(value); } catch { text = String(value); }
+    return text.length > 200 ? text.slice(0, 200) + '…' : text;
+  };
+  const promptInputs = async app => {
+    try {
+      const prompt = await app.graphToPrompt();
+      const map = {};
+      for (const [nodeId, entry] of Object.entries(prompt?.output || {})) {
+        const inputs = {};
+        for (const [name, value] of Object.entries(entry?.inputs || {})) inputs[name] = promptValue(value);
+        map[nodeId] = inputs;
+      }
+      return { serializedInputs: map };
+    } catch (error) {
+      return { serializedInputs: null, serializedError: String(error?.message || error) };
+    }
+  };
   const diffSnapshot = (before, after) => {
     const changed = [];
     for (const [name, previous] of Object.entries(before)) {
@@ -971,25 +997,30 @@
         } catch (error) { await replaceCurrentWorkflow(app, before); throw error; }
         return { restored: true, nodes: nodes(app) };
       }
-      case 'audit_graph': return {
-        nodes: (app.graph._nodes || []).map(node => ({
-          id: String(node.id), type: node.type, title: node.title || '', mode: node.mode ?? 0,
-          widgets: (node.widgets || []).map(widget => ({
-            name: widget.name, kind: widgetKind(widget), type: widget.type,
-            value: typeof widget.value === 'string' && widget.value.length > 200 ? widget.value.slice(0, 200) + '…' : widget.value ?? null,
-            ...(Array.isArray(widget.options?.values) ? { shown: widget.options.values.slice(0, 40) } : {})
+      case 'audit_graph': {
+        const serialized = await promptInputs(app);
+        return {
+          nodes: (app.graph._nodes || []).map(node => ({
+            id: String(node.id), type: node.type, title: node.title || '', mode: node.mode ?? 0,
+            widgets: (node.widgets || []).map(widget => ({
+              name: widget.name, kind: widgetKind(widget), type: widget.type,
+              value: typeof widget.value === 'string' && widget.value.length > 200 ? widget.value.slice(0, 200) + '…' : widget.value ?? null,
+              ...(Array.isArray(widget.options?.values) ? { shown: widget.options.values.slice(0, 40) } : {})
+            })),
+            inputs: (node.inputs || []).map(input => ({ name: input.name, type: input.type, link: input.link ?? null })),
+            outputs: (node.outputs || []).map(output => ({ name: output.name, type: output.type, links: output.links || [] })),
+            shadowDocs: shadowDocs(node)
           })),
-          inputs: (node.inputs || []).map(input => ({ name: input.name, type: input.type, link: input.link ?? null })),
-          outputs: (node.outputs || []).map(output => ({ name: output.name, type: output.type, links: output.links || [] })),
-          shadowDocs: shadowDocs(node)
-        })),
-        linkCount: linkCount(app.graph),
-        workflowPath: activeWorkflowOf(app)?.path ?? null,
-        // The canvas autosaves itself into localStorage; when that quota is full the front-end
-        // throws a toast and stops persisting for the rest of the session. The tool side cannot
-        // prevent it, so it measures it and lets doctor judge it.
-        draftStorage: draftStorage()
-      };
+          // The serialized prompt is the only evidence of what the queue would actually carry.
+          ...serialized,
+          linkCount: linkCount(app.graph),
+          workflowPath: activeWorkflowOf(app)?.path ?? null,
+          // The canvas autosaves itself into localStorage; when that quota is full the front-end
+          // throws a toast and stops persisting for the rest of the session. The tool side cannot
+          // prevent it, so it measures it and lets doctor judge it.
+          draftStorage: draftStorage()
+        };
+      }
       case 'run': {
         const api = apiOf();
         if (!api?.queuePrompt) throw new Error('当前 ComfyUI 前端没有 queuePrompt 接口');

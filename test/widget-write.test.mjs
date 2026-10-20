@@ -22,7 +22,10 @@ async function boot(nodes, options = {}) {
   const workflow = { path: 'workflows/H3.json', filename: 'H3', isLoaded: true, isPersisted: true, isModified: false };
   const app = { rootGraph: graph, graph, canvas: {}, configuringGraph: false,
     extensionManager: { workflow: { activeWorkflow: workflow, openWorkflows: [workflow] } },
-    async graphToPrompt() { return { output: {} }; } };
+    async graphToPrompt() {
+      if (options.promptError) throw new Error(options.promptError);
+      return { output: options.promptOutput || {} };
+    } };
   vm.runInContext(code, vm.createContext({
     window: { parent: { postMessage() {} }, comfyAPI: { app: { app } }, addEventListener() {}, LiteGraph: { createNode: () => null } },
     crypto: { randomUUID: () => 'u' + Math.random() }, URL, URLSearchParams, console,
@@ -230,6 +233,23 @@ test('list_nodes and audit call a native widget plain, not dom', async () => {
   assert.deepEqual(widgets.map(w => [w.name, w.kind, w.writable]), [['steps', undefined, 'ok'], ['mode', undefined, 'ok'], ['filename_prefix', undefined, 'ok']]);
   const audit = await command('audit_graph');
   assert.deepEqual(audit.nodes.find(node => node.id === '4').widgets.map(w => w.kind), ['plain', 'plain', 'plain']);
+});
+
+test('audit_graph carries the serialized prompt, and a failed serialization is not fatal', async () => {
+  const node = plainNode();
+  node.widgets[1].value = '稳定1.5（推荐）';
+  const command = await boot([node], { promptOutput: { '1': { class_type: 'KSampler',
+    inputs: { steps: 20, mode: '稳定1.5.safetensors', text: 'x'.repeat(210) } } } });
+  const audit = await command('audit_graph');
+  assert.equal(audit.serializedInputs['1'].mode, '稳定1.5.safetensors', 'the value the queue would receive travels beside the canvas value');
+  assert.equal(audit.serializedInputs['1'].text.length, 201, 'strings are capped like widget values');
+  assert.match(audit.serializedInputs['1'].text, /…$/);
+
+  const broken = await boot([plainNode()], { promptError: 'serialize failed' });
+  const degraded = await broken('audit_graph');
+  assert.equal(degraded.serializedInputs, null, 'no evidence beats a guessed one');
+  assert.match(degraded.serializedError, /serialize failed/);
+  assert.equal(degraded.nodes.length, 1, 'the rest of the audit facts still arrive');
 });
 
 test('bind_image reports the widget that owns the value and whether it stuck', async () => {

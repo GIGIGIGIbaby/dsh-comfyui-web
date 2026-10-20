@@ -65,15 +65,37 @@ const defs = {
 };
 const node = (id, type, extra = {}) => ({ id: String(id), type, title: '', mode: 0, widgets: [], inputs: [], outputs: [], shadowDocs: [], ...extra });
 
-test('graph audit refutes a required connection that nothing feeds', () => {
+test('graph audit refutes a required connection on the way to an output node', () => {
   const page = { nodes: [node(1, 'KSampler', { inputs: [{ name: 'model', type: 'MODEL', link: 3 },
     { name: 'positive', type: 'CONDITIONING', link: 4 }, { name: 'negative', type: 'CONDITIONING', link: 5 },
-    { name: 'latent_image', type: 'LATENT', link: null }] })], linkCount: 3 };
+    { name: 'latent_image', type: 'LATENT', link: null }],
+  outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [9] }] }),
+  node(2, 'SaveImage', { inputs: [{ name: 'images', type: 'IMAGE', link: 9 }] })], linkCount: 4 };
   const result = auditGraph({ page, defs });
   assert.equal(result.verdict, 'refuted');
   const dangling = result.checks.find(check => check.id === 'dangling-required-input');
   assert.equal(dangling.verdict, 'refuted');
   assert.deepEqual(dangling.evidence[0], { nodeId: '1', type: 'KSampler', title: '', input: 'latent_image', needs: 'LATENT' });
+  assert.equal(result.unusedIncomplete, undefined, 'a wired chain has nothing left over');
+});
+
+test('an unused incomplete branch is advisory, not an execution blocker', () => {
+  // Reviewer's case: a valid output branch plus an unused, unconnected KSampler. ComfyUI
+  // validates required inputs through the output nodes, so the stray branch must not refute.
+  const chain = node(1, 'KSampler', {
+    inputs: [{ name: 'model', type: 'MODEL', link: 3 }, { name: 'positive', type: 'CONDITIONING', link: 4 },
+      { name: 'negative', type: 'CONDITIONING', link: 5 }, { name: 'latent_image', type: 'LATENT', link: 6 }],
+    outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [9] }] });
+  const save = node(2, 'SaveImage', { inputs: [{ name: 'images', type: 'IMAGE', link: 9 }] });
+  const stray = node(99, 'KSampler', { inputs: [{ name: 'model', type: 'MODEL', link: null },
+    { name: 'positive', type: 'CONDITIONING', link: null }, { name: 'negative', type: 'CONDITIONING', link: null },
+    { name: 'latent_image', type: 'LATENT', link: null }] });
+  const result = auditGraph({ page: { nodes: [chain, save, stray], linkCount: 4 }, defs });
+  assert.equal(result.verdict, 'supported', 'the runnable chain decides the verdict');
+  assert.equal(result.checks.find(check => check.id === 'dangling-required-input').verdict, 'supported');
+  assert.deepEqual(result.unusedIncomplete.nodes.map(item => [item.nodeId, item.input]),
+    [['99', 'model'], ['99', 'positive'], ['99', 'negative'], ['99', 'latent_image']]);
+  assert.match(result.unusedIncomplete.note, /不影响提交/);
 });
 
 test('a widget-backed input slot with no link is not an unwired required input', () => {
@@ -158,37 +180,87 @@ test('a combo whose option list is server-filled is not judged against an empty 
   };
   const page = { nodes: [node(1, 'SaveVideo', { widgets: [{ name: 'format', kind: 'dom', value: 'prores' }] }),
     node(2, 'HypernetworkLoader', { widgets: [{ name: 'hypernetwork_name', kind: 'dom', value: 'something.data' }] })] };
-  const values = auditParams({ page, defs: comboDefs }).checks.find(c => c.id === 'param-values');
+  const result = auditParams({ page, defs: comboDefs });
+  assert.equal(result.checks.find(c => c.id === 'param-values').count, 0,
+    'no serialized evidence means the mismatch cannot be called a definite failure');
+  assert.equal(result.verdict, 'unresolved');
+  const values = result.checks.find(c => c.id === 'param-values-unverified');
   assert.equal(values.count, 1, 'only the value the definition really rules out is reported');
   assert.equal(values.evidence[0].nodeId, '1');
   assert.deepEqual(values.evidence[0].accepted, ['auto', 'mp4']);
 });
 
-test('param audit catches canvas values the server would reject', () => {
+test('param audit separates definite failures from values that need serialized evidence', () => {
   const page = { nodes: [node(1, 'KSampler', { widgets: [{ name: 'seed', kind: 'plain', type: 'number', value: 99 },
     { name: 'steps', kind: 'plain', type: 'number', value: 20 }] }),
   node(2, 'CheckpointLoaderSimple', { widgets: [{ name: 'ckpt_name', kind: 'dom', type: 'combo', value: '稳定1.5（推荐）', shown: ['稳定1.5（推荐）', 'SD2'] }] })] };
   const result = auditParams({ page, defs });
   assert.equal(result.verdict, 'refuted');
   const values = result.checks.find(c => c.id === 'param-values');
-  assert.equal(values.count, 2, 'the out-of-range seed and the localized combo label are both flagged');
-  assert.deepEqual(values.evidence.map(item => item.widget), ['seed', 'ckpt_name']);
+  assert.equal(values.count, 1, 'the out-of-range seed is the only definite failure');
+  assert.deepEqual(values.evidence.map(item => item.widget), ['seed']);
   assert.equal(values.evidence[0].value, 99);
   assert.deepEqual(values.evidence[0].accepted, [0, 9], 'steps=20 is inside 1..50 so it is not reported');
+  const unverified = result.checks.find(c => c.id === 'param-values-unverified');
+  assert.equal(unverified.count, 1, 'the localized label has no serialized evidence, so it stays unresolved');
+  assert.deepEqual(unverified.evidence.map(item => item.widget), ['ckpt_name']);
 
-  const localized = auditParams({ page, defs: { ...defs, CheckpointLoaderSimple: { input: { required: { ckpt_name: [['sd1.safetensors']] } } } } });
-  const flagged = localized.checks.find(c => c.id === 'param-values').evidence.find(item => item.widget === 'ckpt_name');
+  const localized = auditParams({ page: { nodes: [page.nodes[1]] }, defs: { ...defs, CheckpointLoaderSimple: { input: { required: { ckpt_name: [['sd1.safetensors']] } } } } });
+  assert.equal(localized.verdict, 'unresolved', 'a localized label alone must not refute');
+  const flagged = localized.checks.find(c => c.id === 'param-values-unverified').evidence.find(item => item.widget === 'ckpt_name');
   assert.deepEqual(flagged.accepted, ['sd1.safetensors'], 'the reply carries the authoritative options');
-  assert.match(flagged.likely, /前端本地化|提交时转换/);
+  assert.match(flagged.likely, /序列化|前端/);
 
   const filtered = auditParams({ page, defs, filter: 'Checkpoint' });
   assert.equal(filtered.checkedNodes, 1);
-  assert.equal(filtered.checks.find(c => c.id === 'param-values').count, 1);
+  assert.equal(filtered.checks.find(c => c.id === 'param-values-unverified').count, 1);
 
   const withNotes = auditParams({ page: { nodes: [...page.nodes, node(99, 'MarkdownNote', { widgets: [{ name: 'text', kind: 'plain', value: '备注' }] })] }, defs });
   assert.equal(withNotes.checks.find(c => c.id === 'uncheckable').verdict, 'supported', 'unwired annotation nodes are not open questions');
   assert.deepEqual(withNotes.ignoredUncheckable.types, ['MarkdownNote']);
-  assert.equal(withNotes.checks.find(c => c.id === 'param-values').count, 2, 'the real violations are still reported');
+  assert.equal(withNotes.checks.find(c => c.id === 'param-values').count, 1, 'the real violation is still reported');
+  assert.equal(withNotes.checks.find(c => c.id === 'param-values-unverified').count, 1, 'and the open question rides along');
+});
+
+test('a localized label whose serialized value is accepted is unresolved, not a failure', () => {
+  // The page converts 稳定1.5（推荐） to sd1.safetensors at queue time. The serialized prompt is
+  // the evidence that this run works; the canvas label is not an API value.
+  const page = { nodes: [node(2, 'CheckpointLoaderSimple', {
+    widgets: [{ name: 'ckpt_name', kind: 'dom', type: 'combo', value: '稳定1.5（推荐）' }] })],
+  serializedInputs: { '2': { ckpt_name: 'sd1.safetensors' } } };
+  const result = auditParams({ page, defs });
+  assert.equal(result.verdict, 'unresolved');
+  assert.equal(result.checks.find(c => c.id === 'param-values').verdict, 'supported');
+  const item = result.checks.find(c => c.id === 'param-values-unverified').evidence[0];
+  assert.equal(item.value, 'sd1.safetensors', 'the submitted value is what the evidence reports');
+  assert.equal(item.canvasValue, '稳定1.5（推荐）');
+  assert.equal(item.source, 'graphToPrompt');
+  assert.match(item.likely, /前端已在排队时转换/);
+
+  // The same rule applied to a range: the serialized number is the truth, so a canvas value
+  // outside the range that serializes inside it is not a violation.
+  const numeric = { nodes: [node(1, 'KSampler', { widgets: [{ name: 'seed', kind: 'plain', type: 'number', value: 99 }] })],
+    serializedInputs: { '1': { seed: 3 } } };
+  assert.equal(auditParams({ page: numeric, defs }).verdict, 'supported');
+});
+
+test('a serialized value that is really invalid still refutes', () => {
+  const page = { nodes: [node(2, 'CheckpointLoaderSimple', {
+    widgets: [{ name: 'ckpt_name', kind: 'dom', type: 'combo', value: '稳定1.5（推荐）' }] })],
+  serializedInputs: { '2': { ckpt_name: '不存在.safetensors' } } };
+  const result = auditParams({ page, defs });
+  assert.equal(result.verdict, 'refuted');
+  const item = result.checks.find(c => c.id === 'param-values').evidence[0];
+  assert.equal(item.value, '不存在.safetensors', 'the reply names the value the queue would receive');
+  assert.equal(item.canvasValue, '稳定1.5（推荐）');
+  assert.match(item.likely, /序列化后的提交值/);
+
+  // Serialized evidence also makes a numeric violation definite even when the canvas agrees.
+  const numeric = { nodes: [node(1, 'KSampler', { widgets: [{ name: 'seed', kind: 'plain', type: 'number', value: 3 }] })],
+    serializedInputs: { '1': { seed: 120 } } };
+  const outOfRange = auditParams({ page: numeric, defs });
+  assert.equal(outOfRange.verdict, 'refuted');
+  assert.equal(outOfRange.checks.find(c => c.id === 'param-values').evidence[0].value, 120);
 });
 
 // ---------------------------------------------------------------- audit tool wiring
