@@ -305,8 +305,19 @@
       const size = charCount(store.getItem(key));
       try { store.removeItem(key); removed.push({ key, chars: size }); chars += size; } catch {}
     };
-    for (const key of listStorageKeys(historyPrefix)) if (!key.includes(mine)) drop(key);
+    // Superseded conflict backups are ours to reclaim unconditionally: one key is all that has
+    // ever been read back, and the per-client spelling is gone from the code.
     for (const key of listStorageKeys(CONFLICT_KEY)) drop(key);
+    // Another session's history is only expendable when its own timestamps say it is old. Under
+    // pressure the provably-old records go; a record that is fresh, or whose age cannot be
+    // established, is not the price of this store being full. If the space is still missing the
+    // caller reports `stored: false` and says what to close — losing someone's checkpoints to
+    // avoid one red toast trades a small annoyance for real data.
+    const cutoff = staleThreshold();
+    for (const key of historyKeysOfOthers(store, mine, keepKey)) {
+      const stamp = stampOfRecord(readRecord(store, key));
+      if (stamp !== null && stamp < cutoff) drop(key);
+    }
     return { removed, chars };
   }
   // History keys are per session, so every new DSH conversation leaves the previous one's graphs
@@ -314,6 +325,28 @@
   // calls "stale", so the caller can see the megabytes before they become a failed draft save.
   const HISTORY_MAX_AGE = 3 * 24 * 60 * 60 * 1000;
   const staleThreshold = () => Date.now() - HISTORY_MAX_AGE;
+  // A timestamp we can act on. Absence is not evidence of age: history records written before
+  // 0.5.12 carry no top-level `savedAt`, and reading that as "expired" deleted other sessions'
+  // fresh checkpoints the moment the page loaded. `time` on a checkpoint is written by
+  // `checkpoint()` and is the next best evidence, so a legacy record can still age out honestly.
+  const usableStamp = value => { const n = Number(value); return Number.isFinite(n) && n > 0 ? n : null; };
+  function stampOfRecord(record) {
+    const stored = usableStamp(record?.savedAt);
+    if (stored !== null) return stored;
+    let newest = null;
+    for (const list of [record?.undo, record?.redo]) {
+      if (!Array.isArray(list)) continue;
+      for (const entry of list) {
+        const at = usableStamp(entry?.time ?? entry?.at ?? entry?.savedAt);
+        if (at !== null && (newest === null || at > newest)) newest = at;
+      }
+    }
+    return newest;
+  }
+  const parseRecord = text => { try { return JSON.parse(text || 'null'); } catch { return null; } };
+  const readRecord = (store, key) => parseRecord(store.getItem(key));
+  const historyKeysOfOthers = (store, mine, keepKey) => listStorageKeys(historyPrefix)
+    .filter(key => !key.includes(mine) && key !== keepKey);
   // A snapshot left by a session whose tab closed days ago will never be read again, and it sits in
   // the same quota ComfyUI needs for its own drafts. Removing those on load is what keeps the store
   // usable across sessions; anything younger is left alone because the user may switch back to it.
@@ -328,9 +361,11 @@
     const cutoff = staleThreshold();
     for (const key of listStorageKeys(historyPrefix)) {
       if (key.includes(mine)) continue;
-      let savedAt = 0;
-      try { savedAt = Number(JSON.parse(store.getItem(key) || 'null')?.savedAt) || 0; } catch {}
-      if (!savedAt || savedAt < cutoff) drop(key);
+      // Only a positive timestamp older than the retention window justifies deleting another
+      // session's snapshots. A record we cannot date is kept: the cost of a few stale megabytes
+      // is a budget we can reclaim under pressure, the cost of guessing wrong is someone's work.
+      const stamp = stampOfRecord(readRecord(store, key));
+      if (stamp !== null && stamp < cutoff) drop(key);
     }
     return { removed, chars };
   }
@@ -486,9 +521,10 @@
           // it. Only one old enough that its tab cannot still be open is worth reporting as stale.
           let stale = false;
           if (!current) {
-            let savedAt = 0;
-            try { savedAt = Number(JSON.parse(value)?.savedAt) || 0; } catch {}
-            stale = !savedAt || savedAt < staleThreshold();
+            // Same rule as the prune: a snapshot is reported stale only when its own timestamps
+            // say so. A legacy record with no `savedAt` is unknown, not expired.
+            const stamp = stampOfRecord(parseRecord(value));
+            stale = stamp !== null && stamp < staleThreshold();
           }
           if (stale) { facts.staleChars += chars; facts.staleKeys += 1; }
           if (facts.ownKeys.length < 40) facts.ownKeys.push({ key: String(key), kind: 'history', chars, current, ...(stale ? { stale: true } : {}) });

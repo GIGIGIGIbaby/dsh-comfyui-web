@@ -313,11 +313,11 @@ test('a full store costs the undo snapshot, never the canvas write', async () =>
   assert.equal(result.changed[0].after, 31, 'the canvas write still happened');
   assert.equal(result.changed[0].verified, true);
   assert.equal(result.historyStore.stored, false, 'the reply admits the snapshot was lost');
-  assert.equal(result.historyStore.pruned.keys, 2, 'the dead session key and the dead conflict key were reclaimed');
-  assert.equal(result.historyStore.pruned.chars, foreign.length + dead.length);
+  assert.equal(result.historyStore.pruned.keys, 1, 'only the superseded conflict backup is reclaimed: a live record is not');
+  assert.equal(result.historyStore.pruned.chars, dead.length);
   assert.match(result.historyStore.note, /localStorage 已满/);
-  assert.equal(store.snapshot()[otherSession], undefined, 'the other session history is gone');
-  assert.equal(store.snapshot()['dsh.comfyui.sync-conflict.dead'], undefined, 'and so is the stale conflict backup');
+  assert.equal(store.snapshot()[otherSession], foreign, 'another conversation fresh history survives a full store');
+  assert.equal(store.snapshot()['dsh.comfyui.sync-conflict.dead'], undefined, 'and the stale conflict backup is gone');
 });
 
 test('a page load reclaims the snapshots whose sessions are long gone', async () => {
