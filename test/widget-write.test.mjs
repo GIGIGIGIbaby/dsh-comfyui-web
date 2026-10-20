@@ -119,40 +119,95 @@ test('writing a hidden prompt reroutes to the DOM widget and clears the shadowin
   assert.equal(node.widgets[0].value, '镜1：手腕举起座套', 'the archived value the prompt uses is updated');
 });
 
-test('an undeclared owner is refused instead of guessed', async () => {
-  // Same node as the AICG3D shape, but the pack does not say which widget replaced `prompt`.
-  // The write is refused before anything changes: a lucky guess is not a confirmed relationship.
+test('a hidden widget nobody replaced is written in place, and its own document is cleared', async () => {
+  // Same node as the AICG3D shape, but the pack does not declare which widget replaced `prompt`.
+  // There is nothing to resolve — the addressed control is the one written — and its own shadow
+  // document is cleared so the queue cannot keep carrying the old value.
   const node = editorNode(false);
+  const sibling = node.widgets[1];
   const command = await boot([node]);
-  await assert.rejects(command('update_nodes', { changes: [{ nodeId: 2, widget: 'prompt', value: '新内容' }] }),
-    /无法确定控件 prompt 的写入目标/);
-  assert.equal(node.widgets[0].value, '旧内容', 'the hidden value is untouched');
-  assert.ok(node.properties['minimax_h3_prompt_reference_doc'], 'and so is the document');
+  const result = await command('update_nodes', { changes: [{ nodeId: 2, widget: 'prompt', value: '新内容' }] });
+  assert.equal(result.changed[0].requestedWidget, undefined, 'no reroute was claimed');
+  assert.equal(result.changed[0].verified, true);
+  assert.equal(node.widgets[0].value, '新内容', 'the addressed widget received the value');
+  assert.equal(node.properties['minimax_h3_prompt_reference_doc'], undefined, 'its own document was cleared');
+  assert.equal(sibling.value, undefined, 'the undeclared sibling was not written');
 });
 
 test('the reviewer reproduction: an empty prompt and an empty notes are not interchangeable', async () => {
+  // Value equality used to redirect this write into `notes`. Nothing claims `prompt`, so the
+  // write stays on `prompt` — and `notes` must not move.
   const node = ambiguousNode();
   const command = await boot([node]);
-  await assert.rejects(command('update_nodes', { changes: [{ nodeId: 4, widget: 'prompt', value: 'hello' }] }),
-    /无法确定控件 prompt 的写入目标/);
+  const result = await command('update_nodes', { changes: [{ nodeId: 4, widget: 'prompt', value: 'hello' }] });
   assert.equal(node.widgets[1].value, '', 'notes did not receive the write');
-  assert.equal(node.widgets[0].value, '', 'and the prompt was not claimed as written');
+  assert.equal(node.widgets[0].value, 'hello', 'the addressed widget did');
+  assert.equal(result.changed[0].widget, 'prompt');
+});
+
+test('two claimants are refused instead of picking one', async () => {
+  const prompt = { name: 'prompt', type: 'hidden', hidden: true, value: '', options: { hidden: true } };
+  const claim = name => ({ name, type: 'custom', value: '', options: { serialize: false, serializedWidget: 'prompt', getValue: () => '', setValue: () => {} } });
+  const node = { id: 6, type: 'PackNode', title: '', mode: 0, properties: {},
+    widgets: [prompt, claim('editor_a'), claim('editor_b')], inputs: [], outputs: [] };
+  const command = await boot([node]);
+  await assert.rejects(command('update_nodes', { changes: [{ nodeId: 6, widget: 'prompt', value: 'x' }] }),
+    error => /无法确定控件/.test(error.message) && /同时被多个前端组件声明/.test(error.hint || ''));
+  assert.equal(prompt.value, '', 'nothing was written');
 });
 
 test('a failed retry puts back the document it removed, and never touches unrelated ones', async () => {
-  // The setter refuses even with its document gone, so the retry cannot verify: the document
-  // must be restored exactly, and a second `parts` document that names nothing stays put.
+  // The setter refuses even with its document gone, so the retry cannot verify. Track that the
+  // document really left the node during the retry, so the restore assertion cannot pass by
+  // accident (a test that never deletes proves nothing about restoring).
+  let sawWithoutDoc = false;
   const prompt = { name: 'prompt', type: 'hidden', hidden: true, value: 'old', options: { hidden: true } };
   const doc = { parts: [{ type: 'text', text: 'shadow' }], keep: 'x' };
   const unrelated = { parts: ['u'], keep: true };
   const node = { id: 5, type: 'PackNode', title: '', mode: 0, properties: { pack_prompt_doc: doc, unrelated },
     widgets: [prompt, { name: 'editor', type: 'custom', value: '', options: { serialize: false, serializedWidget: 'prompt', shadowDoc: 'pack_prompt_doc',
-      getValue: () => '', setValue: () => {} } }], inputs: [], outputs: [] };
+      getValue: () => '', setValue: () => { sawWithoutDoc = !node.properties.pack_prompt_doc; } } }], inputs: [], outputs: [] };
   const command = await boot([node]);
   const result = await command('update_nodes', { changes: [{ nodeId: 5, widget: 'prompt', value: 'new' }] });
   assert.equal(result.changed[0].verified, false);
+  assert.equal(sawWithoutDoc, true, 'the retry ran with the document removed');
   assert.deepEqual(node.properties.pack_prompt_doc, doc, 'the attributable document is restored');
   assert.deepEqual(node.properties.unrelated, unrelated, 'the unrelated document was never touched');
+});
+
+test('a setter that throws on the retry restores the document before the error escapes', async () => {
+  const prompt = { name: 'prompt', type: 'hidden', hidden: true, value: 'old', options: { hidden: true } };
+  const doc = { parts: [{ type: 'text', text: 'shadow' }] };
+  let calls = 0;
+  const node = { id: 7, type: 'PackNode', title: '', mode: 0, properties: { pack_prompt_doc: doc },
+    widgets: [prompt, { name: 'editor', type: 'custom', value: '', options: { serialize: false, serializedWidget: 'prompt', shadowDoc: 'pack_prompt_doc',
+      getValue: () => '', setValue: () => { calls += 1; if (calls > 1) throw new Error('boom'); } } }], inputs: [], outputs: [] };
+  const command = await boot([node]);
+  await assert.rejects(command('update_nodes', { changes: [{ nodeId: 7, widget: 'prompt', value: 'new' }] }), /boom/);
+  assert.deepEqual(node.properties.pack_prompt_doc, doc, 'a throwing retry still leaves the document in place');
+});
+
+test('a short widget name does not authorise deleting a similarly spelled document', async () => {
+  // `text` is a substring of `context_doc`; attribution is by whole token, so the unrelated
+  // document must never be offered up as this widget's shadow.
+  const unrelated = { parts: [{ type: 'text', text: 'keep me' }] };
+  const node = { id: 8, type: 'PackNode', title: '', mode: 0, properties: { context_doc: unrelated },
+    widgets: [{ name: 'text', type: 'dom', value: 'old', options: { getValue: () => '', setValue: () => {} } }], inputs: [], outputs: [] };
+  const command = await boot([node]);
+  const result = await command('update_nodes', { changes: [{ nodeId: 8, widget: 'text', value: 'new' }] });
+  assert.equal(result.changed[0].verified, false);
+  assert.equal(result.changed[0].shadowDocsCleared, undefined, 'nothing was cleared');
+  assert.deepEqual(node.properties.context_doc, unrelated, 'the unrelated document survived');
+});
+
+test('a refused bind_image does not touch the option list it would have extended', async () => {
+  const hidden = { name: 'image', type: 'hidden', hidden: true, value: '', options: { hidden: true, values: ['a'] } };
+  const claim = name => ({ name, type: 'custom', value: '', options: { serialize: false, serializedWidget: 'image', getValue: () => '', setValue: () => {} } });
+  const node = { id: 9, type: 'PackNode', title: '', mode: 0, properties: {}, widgets: [hidden, claim('a1'), claim('a2')], inputs: [], outputs: [] };
+  const command = await boot([node]);
+  await assert.rejects(command('bind_image', { nodeId: 9, widget: 'image', value: 'new.png' }),
+    error => /无法确定控件/.test(error.message) && /同时被多个前端组件声明/.test(error.hint || ''));
+  assert.deepEqual(hidden.options.values, ['a'], 'the refused request did not extend the combo');
 });
 
 test('a setter that refuses to apply is reported as unverified instead of success', async () => {  const command = await boot([stubbornNode()]);
@@ -240,13 +295,17 @@ test('audit_graph carries the serialized prompt, and a failed serialization is n
   node.widgets[1].value = '稳定1.5（推荐）';
   const command = await boot([node], { promptOutput: { '1': { class_type: 'KSampler',
     inputs: { steps: 20, mode: '稳定1.5.safetensors', text: 'x'.repeat(210) } } } });
-  const audit = await command('audit_graph');
+  const audit = await command('audit_graph', { op: 'params' });
   assert.equal(audit.serializedInputs['1'].mode, '稳定1.5.safetensors', 'the value the queue would receive travels beside the canvas value');
   assert.equal(audit.serializedInputs['1'].text.length, 201, 'strings are capped like widget values');
   assert.match(audit.serializedInputs['1'].text, /…$/);
 
+  // A structural audit never reads the serialized values, so it must not pay a full serialize.
+  const structural = await command('audit_graph', { op: 'graph' });
+  assert.equal(structural.serializedInputs, undefined, 'op=graph does not serialize the graph');
+
   const broken = await boot([plainNode()], { promptError: 'serialize failed' });
-  const degraded = await broken('audit_graph');
+  const degraded = await broken('audit_graph', { op: 'params' });
   assert.equal(degraded.serializedInputs, null, 'no evidence beats a guessed one');
   assert.match(degraded.serializedError, /serialize failed/);
   assert.equal(degraded.nodes.length, 1, 'the rest of the audit facts still arrive');

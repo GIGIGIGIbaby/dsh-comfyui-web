@@ -222,20 +222,24 @@ test('param audit separates definite failures from values that need serialized e
   assert.equal(withNotes.checks.find(c => c.id === 'param-values-unverified').count, 1, 'and the open question rides along');
 });
 
-test('a localized label whose serialized value is accepted is unresolved, not a failure', () => {
+test('a localized label whose serialized value is accepted is supported with a note, not a failure', () => {
   // The page converts 稳定1.5（推荐） to sd1.safetensors at queue time. The serialized prompt is
-  // the evidence that this run works; the canvas label is not an API value.
+  // the evidence that this run works; with that evidence the audit must not leave the workflow
+  // looking broken, because the tool instructions tell the model to repair anything unresolved.
   const page = { nodes: [node(2, 'CheckpointLoaderSimple', {
     widgets: [{ name: 'ckpt_name', kind: 'dom', type: 'combo', value: '稳定1.5（推荐）' }] })],
   serializedInputs: { '2': { ckpt_name: 'sd1.safetensors' } } };
   const result = auditParams({ page, defs });
-  assert.equal(result.verdict, 'unresolved');
+  assert.equal(result.verdict, 'supported');
   assert.equal(result.checks.find(c => c.id === 'param-values').verdict, 'supported');
-  const item = result.checks.find(c => c.id === 'param-values-unverified').evidence[0];
+  assert.equal(result.checks.find(c => c.id === 'param-values-unverified').verdict, 'supported');
+  assert.equal(result.convertedValues.count, 1, 'reported as information, not as an open question');
+  const item = result.convertedValues.evidence[0];
   assert.equal(item.value, 'sd1.safetensors', 'the submitted value is what the evidence reports');
   assert.equal(item.canvasValue, '稳定1.5（推荐）');
   assert.equal(item.source, 'graphToPrompt');
   assert.match(item.likely, /前端已在排队时转换/);
+  assert.match(result.convertedValues.note, /不要为了让体检更好看/);
 
   // The same rule applied to a range: the serialized number is the truth, so a canvas value
   // outside the range that serializes inside it is not a violation.

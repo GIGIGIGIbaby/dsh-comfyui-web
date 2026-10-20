@@ -302,8 +302,13 @@
     const mine = encodeURIComponent(location.origin + ':' + sessionId + ':');
     const drop = key => {
       if (key === keepKey) return;
-      const size = charCount(store.getItem(key));
-      try { store.removeItem(key); removed.push({ key, chars: size }); chars += size; } catch {}
+      // A read that throws must not abort a write that already succeeded on the canvas: this
+      // path runs inside the catch of a failed setItem, so it is already the last resort.
+      try {
+        const size = charCount(store.getItem(key));
+        store.removeItem(key);
+        removed.push({ key, chars: size }); chars += size;
+      } catch {}
     };
     // Superseded conflict backups are ours to reclaim unconditionally: one key is all that has
     // ever been read back, and the per-client spelling is gone from the code.
@@ -494,7 +499,12 @@
     const name = String(widget.name || '');
     const declared = [widget.options?.shadowDoc, widget.options?.serializedWidget, widget.options?.widgetName]
       .filter(key => typeof key === 'string' && key !== '');
-    const named = text => text === name || text.includes(name);
+    // Whole-token matching, not substring: a widget called `text` must not claim `context_doc`,
+    // and an empty name must claim nothing at all. `<pack>_<name>_reference_doc` still matches
+    // because `prompt` is one of its tokens.
+    const tokensOf = text => String(text).replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase()
+      .split(/[^a-z0-9\u4e00-\u9fff]+/).filter(Boolean);
+    const named = text => name !== '' && tokensOf(text).includes(name.toLowerCase());
     const candidates = [];
     for (const [key, doc] of Object.entries(node.properties || {})) {
       if (!doc || typeof doc !== 'object' || !Array.isArray(doc.parts)) continue;
@@ -514,11 +524,16 @@
   function writeTarget(node, widget) {
     if (widgetKind(widget) !== 'hidden' && widgetKind(widget) !== 'shadowed') return { widget, reroutedFrom: null, resolved: true };
     const owners = (node.widgets || []).filter(other => other !== widget && widgetSetter(other) && ownsWidget(other, widget.name));
-    if (owners.length !== 1) return { widget, reroutedFrom: null, resolved: false };
+    // Two claimants is the case that must not be guessed at: either could be the editor.
+    if (owners.length > 1) return { widget, reroutedFrom: null, resolved: false };
+    // No claimant means nobody replaced this widget. Writing it in place is not a guess about
+    // ownership — it is the addressed control — and refusing it would break every pack that
+    // hides a control without putting an editor on top of it.
+    if (owners.length === 0) return { widget, reroutedFrom: null, resolved: true };
     return { widget: owners[0], reroutedFrom: widget.name, resolved: true };
   }
   const unresolvedTarget = widget => ({ resolved: false,
-    hint: `控件 ${widget.name} 由一个未被声明归属的前端组件持有，无法安全确定写入目标；本次没有写入。` });
+    hint: `控件 ${widget.name} 同时被多个前端组件声明为自己，无法安全确定写入目标；本次没有写入。` });
   // The front-end persists every graph change as a localStorage draft; when the origin's
   // quota is full the write itself fails and the user gets a toast the tool side can neither
   // see nor dismiss. A silent page-wide side effect deserves a number in the reply: measure
@@ -677,12 +692,14 @@
   // A failed write has to say which step failed and what to try instead; a bare
   // "Cannot destructure property 'e' of 'undefined'" tells the caller nothing.
   const writeHint = (kind, node, widget) => {
-    const shadow = shadowDocs(node);
+    // Only the document attributable to THIS widget is ever touched; listing every `parts`
+    // document here would suggest the write cleaned things it deliberately left alone.
+    const shadow = shadowDocFor(node, widget);
     const base = kind === 'dom' || kind === 'shadowed' || kind === 'hidden'
       ? '该控件由前端组件自己持有状态（kind=' + kind + '），写控件回读不一致就代表没写进去。'
       : '控件回读值与提交值不一致，面板可能拒绝了这次写入（kind=' + kind + '）。';
     const paths = [];
-    if (shadow.length) paths.push('写它的 shadow 源 node.properties[' + shadow.map(k => JSON.stringify(k)).join(' / ') + ']（update_nodes 已尝试清除，仍失败就说明文档格式有额外约束）');
+    if (shadow) paths.push('写它的 shadow 源 node.properties[' + JSON.stringify(shadow.key) + ']（这一次已尝试清除这一份并重试，仍失败就说明文档格式有额外约束）');
     paths.push('用该节点包自带的写入入口（例如 AICG3D 的 globalThis.AICG3D_H3.setPromptText(node, value, {notifyGraphChange:false, preserveNodeSize:true})），它才会同步刷新 UI 与 properties');
     paths.push('或改磁盘上的工作流 JSON，再用 load_workflow（workflowJson 传字符串）+ save_workflow 整图替换');
     return base + ' 可行路径：' + paths.map((p, i) => '(' + (i + 1) + ') ' + p).join('；') + '。不要重试同一调用。';
@@ -705,14 +722,22 @@
     try { apply(); } catch (error) { fail(error); }
     let cleared;
     try {
-      if (typeof value === 'string' && String(widgetReadback(widget) ?? '') !== value) {
+      // A hidden/shadowed widget is not serialized as-is even when its own value assignment
+      // "sticks": a document can decide what the queue carries. Clear the attributable document
+      // for those kinds even on a matching read-back, or the reply verifies a value nobody queues.
+      const shadowable = kind === 'hidden' || kind === 'shadowed';
+      if (typeof value === 'string' && (String(widgetReadback(widget) ?? '') !== value || shadowable)) {
         stage = 'clear-shadow-docs';
         // One attributable document, kept aside: a retry that still does not verify restores it,
         // so a failed write leaves the node exactly as it found it.
         const shadow = shadowDocFor(node, widget);
         if (shadow) {
           delete node.properties[shadow.key];
-          apply();
+          // A retry that throws must not leave the node missing its document: restore first,
+          // then let the caller see the failure. Deleting and walking away is the exact
+          // data loss the review asked to rule out.
+          try { apply(); }
+          catch (error) { node.properties[shadow.key] = shadow.value; throw error; }
           if (String(widgetReadback(widget) ?? '') === String(value)) cleared = [shadow.key];
           else node.properties[shadow.key] = shadow.value;
         }
@@ -868,11 +893,12 @@
       case 'bind_image': {
         const node = app.graph.getNodeById(args.nodeId), found = node?.widgets?.find(widget => widget.name === args.widget);
         if (!found || found.type === 'button') throw new Error('目标图片参数不存在，请先 list_nodes 获取准确 nodeId/widget');
-        if (Array.isArray(found.options?.values) && !found.options.values.includes(args.value)) found.options.values.push(args.value);
         const { widget, reroutedFrom, resolved } = writeTarget(node, found);
         // An owner that cannot be confirmed is a refused request, decided before anything is
         // written: guessing would put the value into a control the caller never addressed.
         if (!resolved) throw fail('无法确定控件 ' + args.widget + ' 的写入目标', unresolvedTarget(found).hint);
+        // The option list is a mutation of the node too, so it waits until ownership is settled.
+        if (Array.isArray(widget.options?.values) && !widget.options.values.includes(args.value)) widget.options.values.push(args.value);
         const outcome = writeWidget(app, node, widget, args.value);
         return { nodeId: String(node.id), widget: widget.name, value: outcome.after, via: outcome.via, verified: outcome.verified,
           ...(reroutedFrom ? { requestedWidget: reroutedFrom } : {}),
@@ -998,7 +1024,9 @@
         return { restored: true, nodes: nodes(app) };
       }
       case 'audit_graph': {
-        const serialized = await promptInputs(app);
+        // Only the value audit needs the serialized prompt; a structural check would pay a full
+        // graph serialize for evidence it never reads.
+        const serialized = args?.op === 'params' ? await promptInputs(app) : {};
         return {
           nodes: (app.graph._nodes || []).map(node => ({
             id: String(node.id), type: node.type, title: node.title || '', mode: node.mode ?? 0,
