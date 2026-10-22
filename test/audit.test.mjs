@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { ComfyRuntime } from '../lib/runtime.js';
 import { callComfyTool } from '../lib/mcp.js';
 import { MCP_TOOLS } from '../lib/tool-definitions.js';
-import { auditGraph, auditParams, defInputs } from '../lib/audit.js';
+import { auditGraph, auditParams, defInputs, paramViolations } from '../lib/audit.js';
 
 // ---------------------------------------------------------------- definitions
 
@@ -145,11 +145,15 @@ test('graph audit separates intentional bypass, shadowed widgets and a missing s
   assert.equal(annotation.verdict, 'refuted', 'the missing saver still refutes on its own merits');
 });
 
-test('the saver check trusts the server flag, not the node name', () => {
-  // comfyui-AICG3D writes files from AICG3D_H3SequenceCombine: no "save" in the name, no
-  // "videocombine" either, so the old name regex reported "结果不落盘" on a graph that does
-  // write. The server's own output_node flag is the authority; the regex is only a fallback.
+test('a saver is a save-shaped name; output_node plus a media slot is only a question', () => {
+  // comfyui-AICG3D's AICG3D_H3SequenceCombine has no "save" in its name, so it is listed in
+  // OUTPUT_HINTS after reading the pack's source (h3easy/nodes.py:12289 writes into
+  // folder_paths.get_output_directory()). The flag alone cannot carry that conclusion:
+  // KJNodes' ImageAndMaskPreview subclasses SaveImage and redirects it to the temp directory,
+  // and rgthree's RgthreeImageComparer subclasses PreviewImage behind a name matching no pattern.
   const aicgDefs = { AICG3D_H3SequenceCombine: { output_node: true, output: ['VIDEO', 'STRING'], input: { required: {} } },
+    ImageAndMaskPreview: { output_node: true, output: ['IMAGE', 'MASK'], input: { required: { image: ['IMAGE'] } } },
+    RgthreeImageComparer: { output_node: true, output: ['IMAGE'], input: { required: { image1: ['IMAGE'] } } },
     PreviewImage: { output_node: true, output: ['IMAGE'], input: { required: { images: ['IMAGE'] } } },
     Reroute: { output_node: false, input: { required: {} } } };
   const page = { nodes: [node(195, 'AICG3D_H3SequenceCombine'), node(300, 'PreviewImage')], linkCount: 2 };
@@ -159,16 +163,48 @@ test('the saver check trusts the server flag, not the node name', () => {
   assert.deepEqual(saver.evidence.map(item => item.nodeId), ['195']);
   assert.equal(saver.evidence[0].source, 'object_info.output_node');
 
+  // The reviewer's reproduction: a temp-writing preview as the only terminal node used to answer
+  // "会落盘". `ImageAndMaskPreview` carries the preview word, the comparer does not — both have to
+  // end up as a question, not as a promise.
+  for (const type of ['ImageAndMaskPreview', 'RgthreeImageComparer']) {
+    const only = auditGraph({ page: { nodes: [node(7, type, { outputs: [{ name: 'images', type: 'IMAGE', links: [] }] })], linkCount: 0 }, defs: aicgDefs });
+    const found = only.checks.find(c => c.id === 'saver-present');
+    assert.notEqual(found.verdict, 'supported', type + ' declares output_node with an image output and writes nothing to the output folder');
+    assert.equal(found.verdict, 'unresolved');
+    assert.match(found.hint, /type:"output"/);
+  }
+
   const previewOnly = auditGraph({ page: { nodes: [node(300, 'PreviewImage')], linkCount: 0 }, defs: aicgDefs });
   const previewCheck = previewOnly.checks.find(c => c.id === 'saver-present');
   assert.equal(previewCheck.verdict, 'unresolved',
     'a preview claims output_node: true but drops no file — it is not a saver, and "preview only" is a legitimate state, not a defect');
-  assert.match(previewCheck.evidence[0].note, /只有预览节点/);
-  assert.deepEqual(previewCheck.evidence[0].previews.map(item => item.nodeId), ['300']);
+  assert.deepEqual(previewCheck.evidence.map(item => item.nodeId), ['300']);
+  assert.match(previewCheck.evidence[0].note, /浏览器/);
 
   // An explicit false from the server outranks a name that looks like a saver.
   const declaredFalse = auditGraph({ page: { nodes: [node(1, 'Reroute')], linkCount: 0 }, defs: aicgDefs });
   assert.equal(declaredFalse.checks.find(c => c.id === 'saver-present').verdict, 'refuted');
+});
+
+test('a websocket display node is not believed as a file saver', () => {
+  // custom_nodes/websocket_image_save.py: SaveImageWebsocket declares OUTPUT_NODE = True with
+  // RETURN_TYPES = () and pushes the image over the progress websocket — it writes no file, so the
+  // save-shaped name promised an output that get_image could never find.
+  // The other half of this test matters more: on this machine six save-shaped types report an empty
+  // output list and five of them genuinely write files (a ComfyUI saver returns only a `ui` dict),
+  // so "no output slots" cannot be the rule — that version traded one false positive for five
+  // false negatives, which the live /object_info scan caught before it shipped.
+  const defs = { SaveImageWebsocket: { output_node: true, output: [], input: { required: { images: ['IMAGE'] } } },
+    SaveImageWithAlpha: { output_node: true, output: [], input: { required: { images: ['IMAGE'] } } },
+    SaveImageDataSetToFolder: { output_node: true, output: [], input: { required: { images: ['IMAGE'] } } } };
+  const ws = auditGraph({ page: { nodes: [node(4, 'SaveImageWebsocket')], linkCount: 0 }, defs });
+  const saver = ws.checks.find(c => c.id === 'saver-present');
+  assert.equal(saver.verdict, 'unresolved', 'a websocket display node is reported, not believed');
+  assert.match(saver.evidence[0].note, /不写文件/);
+  for (const type of ['SaveImageWithAlpha', 'SaveImageDataSetToFolder']) {
+    const real = auditGraph({ page: { nodes: [node(5, type)], linkCount: 0 }, defs });
+    assert.equal(real.checks.find(c => c.id === 'saver-present').verdict, 'supported', type + ' writes files despite an empty output list');
+  }
 });
 
 test('a display node that declares output_node does not count as a file saver', () => {
@@ -281,16 +317,22 @@ test('a localized label whose serialized value is accepted is supported with a n
   assert.equal(auditParams({ page: numeric, defs }).verdict, 'supported');
 });
 
-test('a serialized value that is really invalid still refutes', () => {
+test('a serialized value outside the domain is a question, not a verdict — but a range is', () => {
+  // Why the combo half cannot be refuted from /object_info alone: a node that declares
+  // `VALIDATE_INPUTS(self, **kwargs)` skips ComfyUI's own enumeration check, and 26 such
+  // definitions exist on this machine (10 with the kwargs form). Refuting one tells the model to
+  // "repair" a canvas value that queues fine — which is how a working localized enum gets broken.
+  // The numeric half stays definite: the server enforces min/max on a serialized number.
   const page = { nodes: [node(2, 'CheckpointLoaderSimple', {
     widgets: [{ name: 'ckpt_name', kind: 'dom', type: 'combo', value: '稳定1.5（推荐）' }] })],
   serializedInputs: { '2': { ckpt_name: '不存在.safetensors' } } };
   const result = auditParams({ page, defs });
-  assert.equal(result.verdict, 'refuted');
-  const item = result.checks.find(c => c.id === 'param-values').evidence[0];
+  assert.equal(result.verdict, 'unresolved', 'an open question must not read as a hard failure, nor as a clean pass');
+  const item = result.checks.find(c => c.id === 'param-values-unverified').evidence[0];
   assert.equal(item.value, '不存在.safetensors', 'the reply names the value the queue would receive');
   assert.equal(item.canvasValue, '稳定1.5（推荐）');
-  assert.match(item.likely, /序列化后的提交值/);
+  assert.match(item.likely, /VALIDATE_INPUTS/);
+  assert.match(item.likely, /先 run/);
 
   // Serialized evidence also makes a numeric violation definite even when the canvas agrees.
   const numeric = { nodes: [node(1, 'KSampler', { widgets: [{ name: 'seed', kind: 'plain', type: 'number', value: 3 }] })],
@@ -335,4 +377,20 @@ test('audit is registered as a read-only tool', () => {
   assert.ok(audit);
   assert.equal(audit.annotations.readOnlyHint, true, 'audit must stay exempt from the write lease');
   assert.deepEqual(audit.inputSchema.properties.op.enum, ['graph', 'params']);
+});
+
+test('a serialized field that missed the truncated-name list is still not refuted', () => {
+  // The reviewer's 41-field reproduction: `serializedTruncated` is what keeps a value cut at the
+  // reply cap out of the comparison, so a list that filled up early used to let the next field be
+  // judged on its 4 KB prefix — a definite "提交会被拒绝" on a value nobody truncated on purpose.
+  // Two things close it: the bridge raises the name list far above any real graph, and an
+  // out-of-domain serialized value is a question rather than a verdict.
+  const widgets = Array.from({ length: 41 }, (_, index) => ({ name: 'f' + index, kind: 'combo', type: 'combo', value: '稳定1.5（推荐）' }));
+  const defs = { Widget: { input: { required: Object.fromEntries(widgets.map(widget => [widget.name, [['权威值']]])) } } };
+  const nodes = [{ id: '3', type: 'Widget', title: '', mode: 0, widgets, inputs: [], outputs: [] }];
+  const serialized = Object.fromEntries(widgets.map(widget => [widget.name, 'L'.repeat(4096) + '…']));
+  const listed = widgets.slice(0, 40).map(widget => '3.' + widget.name);
+  const violations = paramViolations(nodes, defs, { '3': serialized }, listed);
+  assert.equal(violations.bad.length, 0, 'no field, including the 41st outside the list, may be refuted');
+  assert.equal(violations.unverified.length, 41, 'all of them are open questions about what the queue received');
 });

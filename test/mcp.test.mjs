@@ -215,6 +215,15 @@ test('native reference tools fence attachment IDs to their session and protect t
   await apply(ctx);
   const reference = { attachmentId: 'own-image', mediaType: 'image/png', width: 1, height: 1, bytes: 7 };
   const exec = { agent: { session: { id: 'own', deriveMessages: () => [{ role: 'user', content: [{ type: 'image', attachment: reference }] }] } } };
+  // Claiming the write lease now requires a conversation with a connected panel. This test is
+  // about attachment fencing and the event stream, so hand every session a page rather than
+  // pretending the upload path should work without one.
+  const originalAcquire = ComfyRuntime.prototype.acquireLease;
+  ComfyRuntime.prototype.acquireLease = function (sessionId, force) {
+    this.clients.set('panel-' + sessionId, { id: 'panel-' + sessionId, sessionId, ready: true, allowAI: true, visible: true, seen: Date.now(), queue: [] });
+    return originalAcquire.call(this, sessionId, force);
+  };
+  t.after(() => { ComfyRuntime.prototype.acquireLease = originalAcquire; });
   const listing = await tools.find(tool => tool.name === 'mcp__comfyui__list_reference_images').execute({}, exec);
   assert.equal(listing.structuredContent.images[0].attachmentId, 'own-image');
   const upload = tools.find(tool => tool.name === 'mcp__comfyui__upload_image');

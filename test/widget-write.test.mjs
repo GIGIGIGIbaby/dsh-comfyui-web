@@ -15,13 +15,33 @@ async function boot(nodes, options = {}) {
   const timers = [], replies = [], commands = [];
   const graph = {
     _nodes: nodes, links: options.links || [],
-    serialize: () => ({ nodes: nodes.map(n => ({ id: n.id, type: n.type, widgets_values: (n.widgets || []).map(w => w.value) })), links: [], groups: [] }),
-    setDirtyCanvas() {},
+    serialize: () => ({ nodes: nodes.map(n => ({ id: n.id, type: n.type, widgets_values: (n.widgets || []).map(w => w.value),
+      mode: n.mode ?? 0, properties: n.properties ?? {} })), links: graph.links, groups: [] }),
+    // `onDirty` runs inside the settle window: the bridge marks the canvas dirty as the last step of
+    // a write, and only then waits for the page's debounce, so this is the deterministic place to
+    // reproduce a pack taking the value back after the write-time read-back already matched.
+    setDirtyCanvas() { if (options.onDirty) options.onDirty(); },
     getNodeById(id) { return nodes.find(node => String(node.id) === String(id)); }
   };
   const workflow = { path: 'workflows/H3.json', filename: 'H3', isLoaded: true, isPersisted: true, isModified: false };
   const app = { rootGraph: graph, graph, canvas: {}, configuringGraph: false,
     extensionManager: { workflow: { activeWorkflow: workflow, openWorkflows: [workflow] } },
+    // The bridge restores a snapshot through the page's own loader, so the fake has to answer it the
+    // same way: rebuild the node objects in place (every closure here captures `nodes`) and keep
+    // each widget's metadata, so a restored graph looks like the one the write happened on.
+    async loadGraphData(data) {
+      const previous = new Map(nodes.map(node => [String(node.id), node]));
+      const rebuilt = (data?.nodes || []).map(saved => {
+        const old = previous.get(String(saved.id));
+        const widgets = (saved.widgets_values || []).map((value, index) => ({
+          ...(old?.widgets?.[index] || { name: 'widget' + index, type: 'string', options: {}, callback() {} }), value }));
+        return { id: saved.id, type: saved.type, title: old?.title || '', mode: saved.mode ?? 0,
+          properties: saved.properties ?? {}, widgets, inputs: old?.inputs || [], outputs: old?.outputs || [] };
+      });
+      nodes.length = 0; nodes.push(...rebuilt);
+      graph.links = data?.links || [];
+      return true;
+    },
     async graphToPrompt() {
       if (options.promptError) throw new Error(options.promptError);
       return { output: options.promptOutput || {} };
@@ -119,10 +139,11 @@ test('writing a hidden prompt reroutes to the DOM widget and clears the shadowin
   assert.equal(node.widgets[0].value, '镜1：手腕举起座套', 'the archived value the prompt uses is updated');
 });
 
-test('a hidden widget nobody replaced is written in place, and its own document is cleared', async () => {
+test('a hidden widget nobody replaced is written in place, and an undeclared document survives', async () => {
   // Same node as the AICG3D shape, but the pack does not declare which widget replaced `prompt`.
-  // There is nothing to resolve — the addressed control is the one written — and its own shadow
-  // document is cleared so the queue cannot keep carrying the old value.
+  // There is nothing to resolve — the addressed control is the one written. The document is NOT
+  // cleared: with no declaration there is no evidence it belongs to this widget, and a delete the
+  // retry cannot undo is the one mistake this path must never make. The reply names it instead.
   const node = editorNode(false);
   const sibling = node.widgets[1];
   const command = await boot([node]);
@@ -130,8 +151,27 @@ test('a hidden widget nobody replaced is written in place, and its own document 
   assert.equal(result.changed[0].requestedWidget, undefined, 'no reroute was claimed');
   assert.equal(result.changed[0].verified, true);
   assert.equal(node.widgets[0].value, '新内容', 'the addressed widget received the value');
-  assert.equal(node.properties['minimax_h3_prompt_reference_doc'], undefined, 'its own document was cleared');
+  assert.deepEqual(node.properties['minimax_h3_prompt_reference_doc'], { parts: ['a', 'b'] }, 'an unattributable document is left alone');
+  assert.deepEqual(result.changed[0].shadowDocsRemaining, ['minimax_h3_prompt_reference_doc'], 'and reported as an open question');
+  assert.match(result.warning, /无法确认属于这个控件/);
   assert.equal(sibling.value, undefined, 'the undeclared sibling was not written');
+});
+
+test('writing a widget whose input slot is wired says the value cannot reach the queue', async () => {
+  // Third-round N5-b, measured on the real canvas: node 198's `prompt` is fed by a
+  // PrimitiveStringMultiline over a link, so `graphToPrompt()` submits ["209",0] — the widget write
+  // verified and stayed verified, and none of it could ever be submitted. The reply has to name that
+  // instead of leaving `verified:true` to be read as "the prompt changed".
+  const prompt = { name: 'prompt', type: 'hidden', hidden: true, value: '', options: { hidden: true }, callback: () => {} };
+  const node = { id: 198, type: 'AICG3D_H3SequenceSegment', title: '', mode: 0, properties: {}, widgets: [prompt],
+    inputs: [{ name: 'prompt', type: 'STRING', link: 377 }], outputs: [] };
+  const command = await boot([node]);
+  const result = await command('update_nodes', { changes: [{ nodeId: 198, widget: 'prompt', value: '新提示词' }] });
+  assert.equal(result.changed[0].verified, true, 'the canvas did take the value');
+  assert.equal(result.changed[0].inputIsWired, true);
+  assert.deepEqual(result.wiredInputs, [{ nodeId: '198', widget: 'prompt', linkId: 377 }]);
+  assert.match(result.warning, /连线/);
+  assert.match(result.nextSteps[0], /改连线另一端的节点/);
 });
 
 test('the reviewer reproduction: an empty prompt and an empty notes are not interchangeable', async () => {
@@ -198,6 +238,104 @@ test('a short widget name does not authorise deleting a similarly spelled docume
   assert.equal(result.changed[0].verified, false);
   assert.equal(result.changed[0].shadowDocsCleared, undefined, 'nothing was cleared');
   assert.deepEqual(node.properties.context_doc, unrelated, 'the unrelated document survived');
+});
+
+test('a same-name claimant is reported as a reroute, not as an in-place write', async () => {
+  // LiteGraph renames duplicates (`prompt#1`), so two widgets literally sharing the name come from a
+  // pack that built them another way. Writing the first is what every other page lookup does, but a
+  // `requestedWidget` equal to the asked-for name made the reroute invisible in the reply.
+  const hidden = { name: 'prompt', type: 'hidden', hidden: true, value: '旧', options: { hidden: true }, callback: () => {} };
+  const dom = { name: 'prompt', type: 'custom', value: '旧', options: { serialize: false,
+    getValue: () => hidden.value, setValue: value => { hidden.value = String(value); } } };
+  const node = { id: 11, type: 'PackNode', title: '', mode: 0, properties: {}, widgets: [hidden, dom], inputs: [], outputs: [] };
+  const command = await boot([node]);
+  const result = await command('update_nodes', { changes: [{ nodeId: 11, widget: 'prompt', value: '新' }] });
+  assert.equal(result.changed[0].requestedWidget, 'prompt', 'the addressed name and the written name are the same string');
+  assert.equal(result.changed[0].rerouted, true, 'and the reply still says another widget received it');
+  assert.equal(result.changed[0].sameNameWidgets, 2);
+  assert.deepEqual(result.ambiguousTargets.map(item => [item.nodeId, item.widget, item.sameName]), [['11', 'prompt', 2]]);
+  assert.equal(hidden.value, '新', 'the DOM widget owns the value');
+});
+
+test('a DOM control that accepts the value keeps its own text mirror in step', async () => {
+  // Second-round report N5: the write reached the queue (`verified:true`), yet the pack's document
+  // still held the old 5104-character text, so the editor repaints from it and any pack-side sync
+  // writes the old text back into the widget. A plain text mirror can be kept in step.
+  const text = '镜2：镜头下压，路面反光';
+  const doc = { version: 1, text, parts: [{ type: 'text', text }] };
+  const hidden = { name: 'prompt', type: 'hidden', hidden: true, value: text, options: { hidden: true }, callback: () => {} };
+  const editor = { name: 'h3_prompt_mentions', type: 'custom', value: text,
+    options: { serialize: false, shadowDoc: 'minimax_h3_prompt_reference_doc',
+      getValue: () => String(hidden.value || ''), setValue: value => { hidden.value = String(value); editor.value = String(value); } } };
+  const node = { id: 13, type: 'AICG3D_H3SequenceSegment', title: '', mode: 0, properties: { minimax_h3_prompt_reference_doc: doc },
+    widgets: [hidden, editor], inputs: [], outputs: [] };
+  const command = await boot([node]);
+  const next = text + '，远处有车灯扫过';
+  const result = await command('update_nodes', { changes: [{ nodeId: 13, widget: 'h3_prompt_mentions', value: next }] });
+  assert.equal(result.changed[0].verified, true);
+  assert.equal(result.changed[0].shadowDocsSynced.join(), 'minimax_h3_prompt_reference_doc', 'the mirror is updated instead of deleted');
+  assert.equal(node.properties.minimax_h3_prompt_reference_doc.text, next);
+  // Field-by-field: the rewritten document was built inside the page realm, so its array/objects
+  // have a different prototype and strict deep-equal would fail on that alone.
+  assert.equal(node.properties.minimax_h3_prompt_reference_doc.parts.length, 1);
+  assert.equal(node.properties.minimax_h3_prompt_reference_doc.parts[0].type, 'text');
+  assert.equal(node.properties.minimax_h3_prompt_reference_doc.parts[0].text, next);
+  assert.equal(result.warning, undefined, 'a kept-in-step document is not an open question');
+});
+
+test('a DOM control never deletes the mention structure it did not need to touch', async () => {
+  // The same node whose document carries `<Picture n>` references: a plain string cannot represent
+  // them, so the document is left exactly as it was and the divergence is reported — deleting it to
+  // make the reply look clean would destroy references the pack rebuilds the prompt from.
+  const text = '镜3：@角色 走过积水路面';
+  const doc = { version: 1, text, parts: [{ type: 'text', text: '镜3：' }, { type: 'mention', tag: '<Picture 3>' }] };
+  const hidden = { name: 'prompt', type: 'hidden', hidden: true, value: text, options: { hidden: true }, callback: () => {} };
+  const editor = { name: 'h3_prompt_mentions', type: 'custom', value: text,
+    options: { serialize: false, shadowDoc: 'minimax_h3_prompt_reference_doc',
+      getValue: () => String(hidden.value || ''), setValue: value => { hidden.value = String(value); editor.value = String(value); } } };
+  const node = { id: 14, type: 'AICG3D_H3SequenceSegment', title: '', mode: 0, properties: { minimax_h3_prompt_reference_doc: doc },
+    widgets: [hidden, editor], inputs: [], outputs: [] };
+  const command = await boot([node]);
+  const result = await command('update_nodes', { changes: [{ nodeId: 14, widget: 'h3_prompt_mentions', value: '镜3：@角色 跑过积水' }] });
+  assert.equal(result.changed[0].verified, true, 'the widget and the queue did take the new text');
+  assert.deepEqual(node.properties.minimax_h3_prompt_reference_doc, doc, 'the document is untouched');
+  assert.deepEqual(result.changed[0].shadowDocsRemaining, ['minimax_h3_prompt_reference_doc'], 'and the divergence is reported');
+  assert.match(result.warning, /引用文档/);
+});
+
+test('an undeclared document whose text mirrors the value is still claimed', async () => {
+  // The real AICG3D shape: the pack never declares `shadowDoc`, but every one of its own syncs
+  // writes `widget.value` and `doc.text` together (`syncPromptFromEditor`), so the document is
+  // provably the mirror of this control. Two proofs — the key names the widget as a whole token
+  // and the texts are identical — is what keeps this path working without guessing.
+  const text = '镜1：手腕举起座套，镜头缓慢推近';
+  const doc = { version: 1, text, parts: [{ type: 'text', text }] };
+  const prompt = { name: 'prompt', type: 'hidden', hidden: true, value: text, options: { hidden: true }, callback: () => {} };
+  const node = { id: 9, type: 'AICG3D_H3', title: '', mode: 0, properties: { minimax_h3_prompt_reference_doc: doc },
+    widgets: [prompt, { name: 'video_reference', type: 'boolean', value: false, options: {}, callback: () => {} }], inputs: [], outputs: [] };
+  const command = await boot([node]);
+  const result = await command('update_nodes', { changes: [{ nodeId: 9, widget: 'prompt', value: text + '，背景是夜里的高速路口' }] });
+  assert.deepEqual(result.changed[0].shadowDocsCleared, ['minimax_h3_prompt_reference_doc'], 'the mirror is evidence enough to clear the shadow');
+  assert.equal(result.warning, undefined, 'a cleared document is not an open question');
+  assert.equal(node.properties.minimax_h3_prompt_reference_doc, undefined);
+});
+
+test('a neighbour sharing a token with the document key does not clear it', async () => {
+  // The reviewer's over-claim: `video_reference` contains the `reference` token of
+  // `minimax_h3_prompt_reference_doc`. Its value is a boolean, so the mirror proof fails and the
+  // prompt document — another control's shadow — stays exactly where it was.
+  const text = '一段足够长的提示词，用来证明镜像判据';
+  const doc = { version: 1, text, parts: [{ type: 'text', text }] };
+  const prompt = { name: 'prompt', type: 'hidden', hidden: true, value: text, options: { hidden: true }, callback: () => {} };
+  const ref = { name: 'video_reference', type: 'boolean', value: false, options: {}, callback: () => {} };
+  const node = { id: 10, type: 'AICG3D_H3', title: '', mode: 0, properties: { minimax_h3_prompt_reference_doc: doc },
+    widgets: [prompt, ref], inputs: [], outputs: [] };
+  const command = await boot([node]);
+  const result = await command('update_nodes', { changes: [{ nodeId: 10, widget: 'video_reference', value: true }] });
+  assert.equal(result.changed[0].verified, true);
+  assert.equal(result.changed[0].shadowDocsCleared, undefined, 'a boolean write never clears the prompt document');
+  assert.deepEqual(node.properties.minimax_h3_prompt_reference_doc, doc, 'the document is untouched');
+  assert.equal(prompt.value, text, 'and the prompt it shadows is untouched too');
 });
 
 test('a refused bind_image does not touch the option list it would have extended', async () => {
@@ -424,7 +562,7 @@ test('the draft store is measured together with the keys the bridge itself write
   });
   const storage = (await command('audit_graph')).draftStorage;
   assert.equal(storage.usedChars, 120, 'ComfyUI draft keys only');
-  assert.equal(storage.historyChars, foreign.length);
+  assert.equal(storage.bridgeHistoryChars, foreign.length);
   assert.equal(storage.conflictChars, 75);
   assert.equal(storage.ownChars, foreign.length + 75, 'the bridge own keys are part of the same quota');
   assert.equal(storage.totalChars, 120 + storage.ownChars);
@@ -473,7 +611,7 @@ test('a page load reclaims the snapshots whose sessions are long gone', async ()
   assert.ok(after[mine], 'this session keeps its own history however old it is');
   const storage = (await command('audit_graph')).draftStorage;
   assert.equal(storage.staleChars, 0, 'what survived the sweep is not reported as stale');
-  assert.equal(storage.historyChars, after[recent].length + after[mine].length);
+  assert.equal(storage.bridgeHistoryChars, after[recent].length + after[mine].length);
 });
 
 test('stale snapshots are reported before they are the reason a draft save fails', async () => {
@@ -503,7 +641,23 @@ test('list_edits reports how much of the shared store its own snapshots hold', a
   const edits = await command('list_edits');
   assert.equal(edits.maxCheckpoints, 20);
   assert.equal(edits.budget, 1_500_000);
-  assert.ok(edits.historyChars > 0, 'the snapshots are counted, not assumed to be free');
+  assert.ok(edits.workflowHistoryChars > 0, 'the snapshots are counted, not assumed to be free');
+});
+
+test('the conflict backup the notice promises can be read back', async () => {
+  // The notice tells the user 另一页版本已备份到浏览器. Until `list_edits` measured the slot, nothing
+  // in the codebase ever read that key, so the sentence described a backup nobody could confirm
+  // (second-round report, P2-3 follow-up). Size, age and node count — not the graph itself.
+  const savedAt = Date.now() - 60_000;
+  const store = fakeStorage({ 'dsh.comfyui.sync-conflict': JSON.stringify({ savedAt, workflow: { nodes: [{ id: 1 }, { id: 2 }], links: [] } }) });
+  const command = await boot([plainNode()], { localStorage: store });
+  const edits = await command('list_edits');
+  assert.equal(edits.conflictBackup.present, true);
+  assert.equal(edits.conflictBackup.nodes, 2);
+  assert.equal(edits.conflictBackup.savedAt, savedAt);
+  assert.equal(edits.conflictBackup.workflow, undefined, 'the backed-up graph itself stays out of the reply');
+  const none = await boot([plainNode()], { localStorage: fakeStorage() });
+  assert.equal((await none('list_edits')).conflictBackup.present, false, 'and an empty slot says so instead of being silent');
 });
 
 test('links stored in a Map are followed, not silently reported as none', async () => {
@@ -576,4 +730,134 @@ test('a batch of pure parameters does not pay the settle wait', async () => {
   const result = await command('update_nodes', { changes: [{ nodeId: 1, widget: 'steps', value: 33 }] });
   assert.equal(result.settledMs, undefined, 'nothing is wired below node 1, so nothing can cascade');
   assert.equal(result.cascaded, undefined);
+});
+
+test('a pack that takes the value back on the same node is caught with nothing wired below', async () => {
+  // The reviewer's fake success: a hidden control verifies at write time, then the pack's own
+  // editor repaints it a few hundred milliseconds later, and the queued prompt is the old text.
+  // The settle re-read used to be skipped whenever the node had no downstream links.
+  const prompt = { name: 'prompt', type: 'hidden', hidden: true, value: '旧文案', options: { hidden: true },
+    callback: () => {} };
+  const node = { id: 12, type: 'PackNode', title: '', mode: 0, properties: {}, widgets: [prompt], inputs: [], outputs: [] };
+  let reverts = 0;
+  const command = await boot([node], { onDirty: () => {
+    if (prompt.value === '新文案' && reverts === 0) { prompt.value = '旧文案'; reverts += 1; }
+  } });
+  const result = await command('update_nodes', { changes: [{ nodeId: 12, widget: 'prompt', value: '新文案' }] });
+  assert.ok(reverts > 0, 'the page really did take the value back before the re-read');
+  assert.equal(result.settledMs, 600, 'a pack-driven control always pays the re-read, links or not');
+  assert.deepEqual(result.lateChange.map(item => [item.widget, item.now]), [['prompt', 'overwritten']]);
+  assert.equal(result.changed[0].verified, false, 'the reply no longer claims a value the page took back');
+  assert.equal(result.changed[0].after, '旧文案', 'and reports what the widget holds after the debounce');
+});
+
+// ---------------------------------------------------------------- undo snapshots as one chain
+//
+// Each checkpoint used to be a whole `graph.serialize()`: about 135 KB per AI write on the H3
+// canvases, so eleven of them ate 1.49 MB of a ~5 MB browser quota and the oldest steps began being
+// dropped while the user still wanted to walk back. The store now keeps one full anchor plus a patch
+// per later entry — only acceptable if it is byte-exact, so every test below compares a reconstructed
+// graph against the state captured live at the time.
+
+const bigPrompt = marker => marker + ': ' + 'x'.repeat(4000);
+// A canvas with several long prompts, because that is where the copies hurt: one write touches one
+// node, and a single-node fixture would make a patch as big as the graph it replaces.
+const promptNodes = (count = 8, marker = 'init') => Array.from({ length: count }, (_, index) => ({
+  id: 21 + index, type: 'AICG3D_H3SequenceSegment', title: '', mode: 0, properties: {},
+  widgets: [{ name: 'prompt', type: 'string', value: bigPrompt(marker + index), options: {}, callback() {} },
+    { name: 'steps', type: 'number', value: 20, options: {}, callback() {} }],
+  inputs: [{ name: 'prompt_in', type: 'STRING', link: null }], outputs: [] }));
+const HISTORY_KEY = 'dsh.comfyui.history.' + encodeURIComponent('http://comfy.test:own:workflows/H3.json');
+const promptsOf = nodes => JSON.stringify(nodes.map(node => node.widgets[0].value));
+
+test('a chain of parameter writes rebuilds every earlier graph byte for byte', async () => {
+  const nodes = promptNodes();
+  const command = await boot(nodes);
+  const captured = [];
+  for (let i = 0; i < 6; i += 1) {
+    captured.push(promptsOf(nodes));
+    await command('update_nodes', { changes: [{ nodeId: 21 + i, widget: 'prompt', value: bigPrompt('W' + i) }] });
+  }
+
+  const edits = await command('list_edits');
+  assert.deepEqual(edits.checkpoints.map(item => item.encoded), ['delta', 'delta', 'delta', 'delta', 'delta', 'full'],
+    'the oldest checkpoint is the anchor and every later one stores only what moved');
+  assert.deepEqual(edits.checkpoints.map(item => item.nodes), [8, 8, 8, 8, 8, 8], 'a patch still reports its node count');
+  assert.ok(edits.workflowHistoryChars * 3 < edits.workflowFullChars,
+    'chain ' + edits.workflowHistoryChars + ' vs full copies ' + edits.workflowFullChars + ': the saving has to be measurable');
+
+  for (let i = 0; i < 6; i += 1) {
+    await command('undo');
+    assert.equal(promptsOf(nodes), captured[5 - i], 'undo #' + (i + 1) + ' restores the exact graph');
+  }
+  await command('update_nodes', { changes: [{ nodeId: 21, widget: 'steps', value: 7 }] });
+  await command('undo');
+  assert.equal(promptsOf(nodes), captured[0], 'a write after the walk-back still diffs against the right parent');
+});
+
+test('a v1 history of full copies is folded into a chain on load, losslessly', async () => {
+  // The real store is full of these today. Loading it must compact it without changing what any
+  // checkpoint restores to, or the saving arrives as data loss.
+  const graphOf = (nodeId, marker) => ({ nodes: promptNodes().map(node => ({
+    id: node.id, type: node.type, mode: 0, properties: {},
+    widgets_values: [node.id === nodeId ? bigPrompt(marker) : node.widgets[0].value, node.widgets[1].value]
+  })), links: [], groups: [] });
+  const nodes = promptNodes();
+  const store = fakeStorage({ [HISTORY_KEY]: JSON.stringify({ version: 1, savedAt: Date.now(), expectedHash: null,
+    undo: [{ id: 'cp-1', time: Date.now() - 3000, label: 'update_nodes', workflow: graphOf(23, 'A') },
+      { id: 'cp-2', time: Date.now() - 2000, label: 'update_nodes', workflow: graphOf(26, 'B') }], redo: [] }) });
+  const command = await boot(nodes, { localStorage: store });
+
+  const edits = await command('list_edits');
+  assert.deepEqual(edits.checkpoints.map(item => item.encoded), ['delta', 'full'],
+    'the later full copy became a patch against the anchor, in place');
+  assert.ok(edits.workflowHistoryChars < edits.workflowFullChars,
+    'compacted ' + edits.workflowHistoryChars + ' < full copies ' + edits.workflowFullChars);
+
+  await command('restore_edit', { checkpointId: 'cp-2' });
+  assert.equal(nodes.find(node => node.id === 26).widgets[0].value, bigPrompt('B'),
+    'the patched entry rebuilds what its full copy held');
+  assert.equal(nodes.find(node => node.id === 21).widgets[0].value, bigPrompt('init0'),
+    'and an untouched node comes through unchanged');
+  await command('restore_edit', { checkpointId: 'cp-1' });
+  assert.equal(nodes.find(node => node.id === 23).widgets[0].value, bigPrompt('A'), 'the anchor restores as before');
+});
+
+test('dropping the oldest step hands the anchor forward, so the survivors still rebuild', async () => {
+  // The cap removes the head, and the head is where the full graph lives. Materialising the
+  // successor *after* the drop is impossible — its patch points at deleted data — so this ordering is
+  // the test: twenty steps must all still restore, including the oldest survivor.
+  const nodes = promptNodes(4);
+  const command = await boot(nodes);
+  const captured = [];
+  for (let i = 0; i < 22; i += 1) {
+    captured.push(promptsOf(nodes));
+    await command('update_nodes', { changes: [{ nodeId: 21 + (i % 4), widget: 'prompt', value: bigPrompt('m' + i) }] });
+  }
+
+  const edits = await command('list_edits');
+  assert.equal(edits.checkpoints.length, 20, 'the cap holds at twenty steps');
+  assert.equal(edits.checkpoints.filter(item => item.encoded === 'full').length, 1, 'exactly one anchor after the head moved');
+  assert.equal(edits.checkpoints.at(-1).encoded, 'full', 'and it is the oldest survivor');
+  await command('restore_edit', { checkpointId: edits.checkpoints.at(-1).checkpointId });
+  assert.equal(promptsOf(nodes), captured[2], 'the handed-forward anchor restores the graph it replaced');
+  await command('restore_edit', { checkpointId: edits.checkpoints[0].checkpointId });
+  assert.equal(promptsOf(nodes), captured[21], 'and the newest step still rebuilds through the chain');
+});
+
+test('a chain with no anchor anywhere is dropped rather than restored from a guess', async () => {
+  const nodes = promptNodes(1, 'ok');
+  const store = fakeStorage();
+  const first = await boot(nodes, { localStorage: store });
+  await first('update_nodes', { changes: [{ nodeId: 21, widget: 'prompt', value: bigPrompt('fine') }] });
+  const stored = JSON.parse(store.snapshot()[HISTORY_KEY]);
+  assert.ok(stored.undo[0].workflow, 'the first entry is the anchor before it is broken');
+  stored.undo = [{ ...stored.undo[0], workflow: undefined }];
+  store.setItem(HISTORY_KEY, JSON.stringify(stored));
+
+  const command = await boot(nodes, { localStorage: store });
+  const before = promptsOf(nodes);
+  const edits = await command('list_edits');
+  assert.equal(edits.checkpoints.length, 0, 'an un-anchorable entry is not offered back as restorable');
+  assert.equal(promptsOf(nodes), before, 'the canvas was not touched');
 });

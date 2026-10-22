@@ -177,3 +177,33 @@ test('browser bridge edits actual named widgets, validates whole batch and resto
   await command('undo'); assert.equal(widget.value, 'original');
   assert.equal((await command('run')).result.prompt_id, 'test-prompt'); assert.equal(submitted, 1);
 });
+
+test('the served bridge carries the plugin version, never a literal that can drift', async t => {
+  // P0-3: bridge.js used to hard-code its own version, so a locally re-versioned package made
+  // doctor's bridge-version check fail forever — with a cure ("刷新页面") that cannot fix a
+  // bookkeeping gap. The runtime now substitutes package.json's version into the served copy;
+  // a leftover placeholder anywhere in the file would reintroduce the permanent red.
+  const upstream = http.createServer((req, res) => { res.setHeader('Content-Type', 'application/json'); res.end('{}'); });
+  await new Promise(r => upstream.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise(r => upstream.close(r)));
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-comfy-version-'));
+  const runtime = await new ComfyRuntime(join(dir, 'config.json'), { port: 0, url: `http://127.0.0.1:${upstream.address().port}` }).start();
+  t.after(() => runtime.stop());
+  const version = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
+  const served = await (await fetch(runtime.frameOrigin + '/__dsh_comfyui/bridge.js')).text();
+  assert.equal(runtime.bridgeVersion, version, 'the runtime reports the package version it serves');
+  // The version placeholder sits inside quotes in the source already, so the injection must be
+  // raw. JSON.stringify here produced `'"0.5.12-…"'` — a version wrapped in literal quote
+  // characters — which keeps doctor's version check red forever, i.e. the very defect this test
+  // was written to pin. Asserting the exact literal shape is what catches that class of mistake.
+  assert.ok(served.includes("const versionLiteral = '" + version + "'"), 'the page receives the version as the plain quoted literal');
+  assert.ok(!served.includes("'\"" + version + "\"'"), 'no extra quoting inside the string literal');
+  for (const placeholder of ['__DSH_BRIDGE_VERSION__', '__DSH_BRIDGE_TOKEN__']) {
+    assert.equal(served.split(placeholder).length - 1, 0, placeholder + ' must not survive into the page');
+  }
+  // Second-round report N6: the token is readable by any local process through three unauthenticated
+  // GETs. That is a deliberate local trust boundary (loopback bind, and the same secret already lives
+  // in ~/.dsh/comfyui/connection.json), so the running surface has to say it rather than let a green
+  // server_info imply the token is confidential.
+  assert.match(runtime.status().localTrustBoundary, /本机任意进程可读/);
+});

@@ -17,8 +17,12 @@ const fakeStorage = (entries = {}, options = {}) => {
   return {
     get length() { return data.size; },
     key(index) { return [...data.keys()][index] ?? null; },
-    getItem(key) { return data.has(key) ? data.get(key) : null; },
+    getItem(key) {
+      if (options.unreadable && String(key).includes(options.unreadable)) throw new Error('SecurityError: unreadable key');
+      return data.has(key) ? data.get(key) : null;
+    },
     setItem(key, value) {
+      if (options.refuseWrites) throw new Error('QuotaExceededError');
       if (failures > 0 && String(key).startsWith('dsh.comfyui.history.')) { failures -= 1; throw new Error('QuotaExceededError'); }
       data.set(String(key), String(value));
     },
@@ -104,8 +108,8 @@ test('a full store does not answer by erasing another session live history', asy
   const keys = Object.keys(store.snapshot());
   assert.ok(keys.includes(historyKey('fresh')), 'a live foreign snapshot is not the price of a full store');
   assert.ok(!keys.includes(historyKey('stale')), 'a provably old foreign snapshot is reclaimed');
-  assert.ok(!keys.includes('dsh.comfyui.sync-conflict'), 'superseded conflict backups are reclaimed first');
-  assert.ok(!keys.includes('dsh.comfyui.sync-conflict.dead'), 'per-client conflict backups are reclaimed first');
+  assert.ok(keys.includes('dsh.comfyui.sync-conflict'), 'the conflict backup the notice points at survives — reclaiming it would make that promise false');
+  assert.ok(!keys.includes('dsh.comfyui.sync-conflict.dead'), 'per-client conflict backups, which nothing reads back, are reclaimed first');
 });
 
 test('an undated foreign snapshot is reported as unknown, not stale', async () => {
@@ -117,4 +121,28 @@ test('an undated foreign snapshot is reported as unknown, not stale', async () =
   const entry = storage.ownKeys.find(item => item.kind === 'history');
   assert.equal(entry.current, false);
   assert.equal(entry.stale, undefined);
+});
+
+test('a readable store that refuses every write says unavailable', async () => {
+  // `available` only proves the store could be enumerated. Private windows and some embedded
+  // webviews hand back a readable store that rejects every setItem — that is the fault the user
+  // actually sees as a permanent 保存草稿失败 banner, so it has to be measured, not assumed.
+  const store = fakeStorage({ 'Comfy.Workflow.Draft.v2:a': 'x'.repeat(10) }, { refuseWrites: true });
+  const command = await boot([plainNode()], { localStorage: store });
+  const storage = (await command('audit_graph')).draftStorage;
+  assert.equal(storage.available, true, 'enumeration still works');
+  assert.equal(storage.unavailable, true, 'the probe write is what proves the store is dead');
+  assert.match(storage.blocking, /可读但写不进/);
+});
+
+test('one unreadable key does not blind the whole measurement', async () => {
+  const store = fakeStorage({
+    'Comfy.Workflow.Draft.v2:dead': 'x'.repeat(50),
+    [historyKey('other')]: 'not json at all'
+  }, { unreadable: 'Draft.v2:dead' });
+  const command = await boot([plainNode()], { localStorage: store });
+  const storage = (await command('audit_graph')).draftStorage;
+  assert.equal(storage.unavailable, false, 'a hostile key is not a read-only store');
+  assert.equal(storage.unreadableKeys, 1);
+  assert.equal(storage.staleKeys, 0, 'an undatable foreign record is kept out of the stale total');
 });

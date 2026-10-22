@@ -3,8 +3,16 @@
   if (window.__DSH_COMFYUI_BRIDGE_ACTIVE__) return;
   window.__DSH_COMFYUI_BRIDGE_ACTIVE__ = true;
   const bridgeProtocol = 6;
-  const bridgeVersion = '0.5.12';
+  // The host knows its own version; a literal here drifts the moment the package is
+  // re-versioned locally, and `doctor` would then blame the page for a bookkeeping gap. The
+  // served path substitutes the single occurrence below; the extension path reads it from
+  // bootstrap. A copy that went through neither reports `null`: a version check that compares the
+  // placeholder against a package version is permanently red, and the cure it offered ("刷新页面")
+  // cannot fix an injection that never happened.
   const bootstrap = window.__DSH_COMFYUI_BOOTSTRAP__ || {};
+  const versionLiteral = '__DSH_BRIDGE_VERSION__';
+  const bridgeVersion = bootstrap.bridgeVersion
+    || (versionLiteral === '__DSH_BRIDGE_' + 'VERSION__' ? null : versionLiteral);
   let token = bootstrap.token || __DSH_BRIDGE_TOKEN__;
   const bridgeBase = bootstrap.bridgeBase || location.origin;
   const query = new URLSearchParams(location.search);
@@ -187,8 +195,10 @@
       // that edit and the original revision so normal conflict recovery sees it.
       if (editedWhileWaiting) { forceSync = true; synchronization.deferred++; return; }
       if (update.conflict && changed && editSequence > acknowledgedEditSequence) {
-        rememberConflict(update.workflow);
-        notify({ warning: '另一页也修改了工作流，已保留本页编辑；另一页版本已备份到浏览器，正在重新同步。' });
+        const backed = rememberConflict(update.workflow);
+        notify({ warning: '另一页也修改了工作流，已保留本页编辑；'
+          + (backed ? '另一页版本已备份到浏览器（dsh.comfyui.sync-conflict），正在重新同步。'
+            : '另一页版本没能备份（浏览器存储写不进去），正在重新同步。') });
         // Keep the unsent local edit and retry against the revision just observed.
         // An idle page has no changed content, so it cannot win this retry.
         revision = update.revision; initialized = true; forceSync = true; synchronization.conflicts++;
@@ -281,15 +291,31 @@
     }
     return keys;
   }
+  // What the store actually pays for: the serialised entry, so a patch is measured as a patch.
   function historyCharsOf(history) {
-    const size = list => (Array.isArray(list) ? list : []).reduce((total, item) => total + charCount(JSON.stringify(item?.workflow)), 0);
+    const size = list => (Array.isArray(list) ? list : []).reduce((total, item) => total + charCount(JSON.stringify(item)), 0);
     return size(history?.undo) + size(history?.redo);
+  }
+  // What the same history would cost as full graphs — the number that makes the encoding visible to
+  // the caller instead of a char count whose meaning changed.
+  function historyFullCharsOf(history) {
+    let total = 0;
+    for (const list of [history?.undo, history?.redo]) {
+      for (let i = 0; i < (Array.isArray(list) ? list.length : 0); i += 1) {
+        try { total += charCount(JSON.stringify(list[i].workflow || workflowAt(list, i))); } catch {}
+      }
+    }
+    return total;
   }
   // Oldest checkpoints go first: undo needs the newest one, and a snapshot the user cannot reach
   // is worth less than a store that can still accept the front-end's own drafts.
   function trimHistory(history, budget = HISTORY_BUDGET) {
     let dropped = 0;
-    while (history.undo.length > 1 && historyCharsOf(history) > budget) { history.undo.shift(); dropped += 1; }
+    // The oldest entries go first. Dropping the head takes the anchor with it, so the new head is
+    // materialised back into a full graph before anything else is measured.
+    // Undo drops its oldest step (the anchor moves forward); redo drops its newest, which is also
+    // the end of its chain and needs no re-anchoring at all.
+    while (history.undo.length > 1 && historyCharsOf(history) > budget) { dropOldest(history.undo); dropped += 1; }
     while (history.redo.length > 1 && historyCharsOf(history) > budget) { history.redo.pop(); dropped += 1; }
     return dropped;
   }
@@ -310,9 +336,11 @@
         removed.push({ key, chars: size }); chars += size;
       } catch {}
     };
-    // Superseded conflict backups are ours to reclaim unconditionally: one key is all that has
-    // ever been read back, and the per-client spelling is gone from the code.
-    for (const key of listStorageKeys(CONFLICT_KEY)) drop(key);
+    // The per-client spelling is dead code: nothing ever read those keys back, so they were one
+    // full graph per page load. The canonical slot is different — the conflict notice promises the
+    // other page's version is recoverable from the browser, and `draftStorage` reports its size, so
+    // deleting it here would make that sentence false the first time the store gets tight.
+    for (const key of listStorageKeys(CONFLICT_KEY)) if (key !== CONFLICT_KEY) drop(key);
     // Another session's history is only expendable when its own timestamps say it is old. Under
     // pressure the provably-old records go; a record that is fresh, or whose age cannot be
     // established, is not the price of this store being full. If the space is still missing the
@@ -349,7 +377,9 @@
     return newest;
   }
   const parseRecord = text => { try { return JSON.parse(text || 'null'); } catch { return null; } };
-  const readRecord = (store, key) => parseRecord(store.getItem(key));
+  // One hostile key — a value another extension wrote in a shape this origin cannot read, or a
+  // key the browser refuses to expose — must not stop the sweep from dating the records after it.
+  const readRecord = (store, key) => { try { return parseRecord(store.getItem(key)); } catch { return null; } };
   const historyKeysOfOthers = (store, mine, keepKey) => listStorageKeys(historyPrefix)
     .filter(key => !key.includes(mine) && key !== keepKey);
   // A snapshot left by a session whose tab closed days ago will never be read again, and it sits in
@@ -360,8 +390,14 @@
     if (!store || typeof store.removeItem !== 'function') return { removed, chars };
     const mine = encodeURIComponent(location.origin + ':' + sessionId + ':');
     const drop = key => {
-      const size = charCount(store.getItem(key));
-      try { store.removeItem(key); removed.push({ key, chars: size }); chars += size; } catch {}
+      // Measuring the value happens on somebody else's record, and a store that throws on one
+      // unreadable key must not abort the whole sweep — the caller only catches, so the remaining
+      // keys would silently never be reclaimed.
+      try {
+        const size = charCount(store.getItem(key));
+        store.removeItem(key);
+        removed.push({ key, chars: size }); chars += size;
+      } catch {}
     };
     const cutoff = staleThreshold();
     for (const key of listStorageKeys(historyPrefix)) {
@@ -375,11 +411,12 @@
     return { removed, chars };
   }
   // Conflict backups used to be one key per clientId and never read back, so they accumulated one
-  // full graph per page load. One overwritten slot is all the value they ever had.
+  // full graph per page load. One overwritten slot, stamped with the time it was taken and read back
+  // by `list_edits` (conflictFacts) — a backup nothing can report on is not a backup.
   function rememberConflict(workflow) {
     const store = historyStore(); if (!store?.setItem) return false;
     try {
-      const text = JSON.stringify(workflow);
+      const text = JSON.stringify({ savedAt: Date.now(), workflow });
       if (charCount(text) > CONFLICT_BUDGET) { store.removeItem?.(CONFLICT_KEY); return false; }
       store.setItem(CONFLICT_KEY, text);
       // Drop the per-client keys written by older bridges so they stop occupying the quota.
@@ -387,12 +424,146 @@
       return true;
     } catch { return false; }
   }
+  // Whether the slot the conflict notice promises actually holds anything, measured from the one
+  // key that is read back. The workflow itself is never returned here: a whole graph in a read-only
+  // reply is the payload shape this plugin spent a release eliminating.
+  function conflictFacts() {
+    const store = historyStore();
+    let text = null;
+    try { text = store?.getItem?.(CONFLICT_KEY) ?? null; } catch { return { present: false, unreadable: true }; }
+    if (!text) return { present: false };
+    const record = parseRecord(text);
+    const graph = record?.workflow ?? record;
+    const nodes = Array.isArray(graph?.nodes) ? graph.nodes.length : undefined;
+    return { present: true, key: CONFLICT_KEY, chars: charCount(text),
+      ...(usableStamp(record?.savedAt) !== null ? { savedAt: usableStamp(record.savedAt) } : {}),
+      ...(nodes !== undefined ? { nodes } : {}),
+      note: '这是另一页冲突时存下的图，不会自动覆盖当前画布；要取回它需要一次显式动作（load_workflow 需要先拿到内容）。' };
+  }
+  // ---------------------------------------------------------------- undo history: one chain, not N copies.
+  // A checkpoint used to be a full `graph.serialize()` — on the H3 canvases that live here that is
+  // ~135 KB per AI write, so 11 checkpoints ate 1.49 MB of a ~5 MB quota and `trimHistory` began
+  // eating the oldest undo steps while the user still wanted them. Consecutive checkpoints differ by
+  // the few widgets one call touched, so the anchor keeps the full graph and every later entry keeps
+  // only what moved. Reconstruction walks forward from the anchor, and a conversion is committed only
+  // when the rebuilt graph is byte-identical to the full snapshot it replaced: a compression that
+  // cannot be proven lossless is a corruption waiting to happen.
+  const nodeIdOf = node => String(node?.id);
+  function sameJson(a, b) { try { return JSON.stringify(a ?? null) === JSON.stringify(b ?? null); } catch { return false; } }
+  function diffWorkflow(previous, next) {
+    const remaining = new Map((previous?.nodes || []).map(node => [nodeIdOf(node), node]));
+    const patch = { nodes: {}, removed: [] };
+    for (const node of next?.nodes || []) {
+      const key = nodeIdOf(node);
+      const old = remaining.get(key);
+      if (!old || !sameJson(old, node)) patch.nodes[key] = node;
+      remaining.delete(key);
+    }
+    for (const key of remaining.keys()) patch.removed.push(key);
+    // Links, groups and the rest go in whole when they differ: they are small next to a prompt, and a
+    // per-link diff would be a second encoder to trust.
+    if (!sameJson(previous?.links, next?.links)) patch.links = next?.links ?? [];
+    for (const field of ['groups', 'config', 'extra', 'version', 'dsh_workflow_uuid']) {
+      if (!sameJson(previous?.[field], next?.[field])) patch[field] = next?.[field] ?? null;
+    }
+    return patch;
+  }
+  function applyWorkflowPatch(previous, patch) {
+    const removed = new Set(patch?.removed || []);
+    const replaced = patch?.nodes || {};
+    // Order is preserved and new nodes appended: some packs key widgets off array position, so a
+    // reordered merge would load a different-looking canvas.
+    const merged = (previous?.nodes || []).filter(node => !removed.has(nodeIdOf(node)));
+    for (const [id, node] of Object.entries(replaced)) {
+      const index = merged.findIndex(existing => nodeIdOf(existing) === id);
+      if (index >= 0) merged[index] = node; else merged.push(node);
+    }
+    const next = { ...previous, nodes: merged };
+    for (const field of ['links', 'groups', 'config', 'extra', 'version', 'dsh_workflow_uuid']) {
+      if (patch && field in patch) next[field] = patch[field];
+    }
+    return next;
+  }
+  // The state of entry `index`, rebuilt forward from whichever entry still holds a full graph.
+  function workflowAt(list, index) {
+    let state = null;
+    for (let i = 0; i <= index; i += 1) {
+      const entry = list?.[i];
+      if (!entry || typeof entry !== 'object') throw new Error('撤销链在第 ' + (i + 1) + ' 项缺失，无法重建');
+      if (entry.workflow) { state = entry.workflow; continue; }
+      if (!entry.patch) throw new Error('撤销链在第 ' + (i + 1) + ' 项既无快照也无增量，无法重建');
+      if (!state) throw new Error('撤销链的开头是增量，缺少可重建的锚点');
+      state = applyWorkflowPatch(state, entry.patch);
+    }
+    if (!state || !Array.isArray(state.nodes)) throw new Error('撤销快照重建结果不是工作流');
+    // Cloned at the exit, shared inside: `loadGraphData` may mutate what it is handed, and the stored
+    // chain must never be the object a page just edited.
+    return clone(state);
+  }
+  // Whenever the head of a chain moves, the new head has to become a full anchor. The order is the
+  // whole point: the successor can only be materialised while its parent is still in the list, so
+  // anchoring happens before the drop, never after (after is unrecoverable by construction).
+  function anchorHistoryHead(list) {
+    if (!Array.isArray(list) || !list.length) return list;
+    if (!list[0].workflow) {
+      try { list[0] = { ...list[0], workflow: workflowAt(list, 0) }; delete list[0].patch; }
+      catch { list.shift(); return anchorHistoryHead(list); }   // a head with no anchor anywhere is not restorable
+    }
+    return list;
+  }
+  // Remove the oldest entry, handing the anchor forward first.
+  function dropOldest(list) {
+    if (!Array.isArray(list) || !list.length) return;
+    if (list.length > 1) {
+      try { list[1] = { ...list[1], workflow: workflowAt(list, 1) }; delete list[1].patch; } catch {}
+    }
+    list.shift();
+    anchorHistoryHead(list);
+  }
+  // The cap drops from the head too, one entry at a time for the same reason.  is the
+  // checkpoint the current command is about to restore: evicting the step the user asked for is how
+  // a restore of the oldest survivor used to answer 「没有该快照」 — one entry over the cap costs
+  // nothing, deleting the only copy of a graph costs the undo.
+  function capHistory(list, max, keepId) {
+    while (Array.isArray(list) && list.length > max) {
+      if (keepId && list[0] && list[0].id === keepId) break;
+      dropOldest(list);
+    }
+    return list;
+  }
+  // Rewrite redundant full snapshots as patches against their predecessor, entry by entry, keeping the
+  // whole one whenever the rebuild does not match byte for byte.
+  function compactHistoryList(list) {
+    let saved = 0;
+    for (let i = 1; i < list.length; i += 1) {
+      const entry = list[i];
+      if (!entry?.workflow) continue;
+      const previous = workflowAt(list, i - 1);
+      const patch = diffWorkflow(previous, entry.workflow);
+      const candidate = { ...entry, patch }; delete candidate.workflow;
+      let rebuilt = null;
+      try { rebuilt = workflowAt([...list.slice(0, i), candidate], i); } catch {}
+      if (rebuilt && sameJson(rebuilt, entry.workflow)) {
+        saved += charCount(JSON.stringify(entry)) - charCount(JSON.stringify(candidate));
+        list[i] = candidate;
+      }
+    }
+    return saved;
+  }
+
   function historyOf(app) {
     const key = historyKey(app);
     if (!histories.has(key)) {
       let saved;
       try { saved = JSON.parse(globalThis.localStorage?.getItem?.(key) || 'null'); } catch {}
-      const history = saved?.version === 1 && Array.isArray(saved.undo) && Array.isArray(saved.redo) ? saved : { version: 1, undo: [], redo: [] };
+      // v1 records are full-graph chains and stay readable; v2 is the delta chain. An old bridge
+      // fails its own `version === 1` test on a v2 record and starts a clean history, which is the
+      // safe direction: it cannot restore a graph it would misread.
+      const known = Array.isArray(saved?.undo) && Array.isArray(saved?.redo) && (saved.version === 1 || saved.version === 2);
+      const history = known
+        ? { version: 2, undo: saved.undo, redo: saved.redo, ...(saved.expectedHash ? { expectedHash: saved.expectedHash } : {}) }
+        : { version: 2, undo: [], redo: [] };
+      for (const list of [history.undo, history.redo]) { anchorHistoryHead(list); compactHistoryList(list); }
       trimHistory(history);
       histories.set(key, history);
     }
@@ -431,7 +602,16 @@
     for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
     return String(hash >>> 0);
   }
-  const checkpoint = (app, label) => ({ id: randomUUID(), time: Date.now(), label, workflow: snapshot(app) });
+  // `parent` is the state the previous entry of the same list describes; with none, this entry is the
+  // anchor. The node count is recorded on the entry because a patch does not carry a node list, and
+  // `list_edits` must not rebuild eleven graphs just to print eleven numbers.
+  function checkpoint(app, label, parent) {
+    const workflow = snapshot(app);
+    const entry = { id: randomUUID(), time: Date.now(), label, nodes: (workflow.nodes || []).length };
+    if (parent) entry.patch = diffWorkflow(parent, workflow);
+    else entry.workflow = workflow;
+    return entry;
+  }
   function workflowStore(app) {
     const store = app.extensionManager?.workflow;
     if (!store?.getWorkflowByPath || !store?.createNewTemporary) throw new Error('此 ComfyUI 前端未提供工作流标签页接口，请更新前端');
@@ -490,27 +670,39 @@
   // harmless; deleting one without being able to attribute it to this widget is not.
   const shadowDocs = node => Object.entries(node.properties || {})
     .filter(([, value]) => value && typeof value === 'object' && Array.isArray(value.parts)).map(([key]) => key);
-  const mentionsOf = part => [part?.tag, part?.label, part?.fullLabel, part?.token]
-    .filter(text => typeof text === 'string' && text.trim() !== '');
-  // The one document that shadows this widget, or null. Attribution beats enumeration: a
-  // document is only this widget's when its key or its mentions name the widget, so an
-  // unrelated document on the same node survives a failed write (reviewer's reproduction).
-  function shadowDocFor(node, widget) {
-    const name = String(widget.name || '');
-    const declared = [widget.options?.shadowDoc, widget.options?.serializedWidget, widget.options?.widgetName]
-      .filter(key => typeof key === 'string' && key !== '');
-    // Whole-token matching, not substring: a widget called `text` must not claim `context_doc`,
-    // and an empty name must claim nothing at all. `<pack>_<name>_reference_doc` still matches
-    // because `prompt` is one of its tokens.
-    const tokensOf = text => String(text).replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase()
-      .split(/[^a-z0-9\u4e00-\u9fff]+/).filter(Boolean);
-    const named = text => name !== '' && tokensOf(text).includes(name.toLowerCase());
+  // Attribution has two tiers. Declared: the key is named in the widget's own options, or equals
+  // the widget's name — that is the pack telling us. Undeclared: two independent proofs are
+  // required, because a cleared document cannot be un-cleared (reviewer's P2-1). The key has to
+  // name this control as a whole token, AND the document text has to be identical to the value
+  // being replaced. The H3 pack keeps `widget.value === doc.text` on every sync of its own
+  // (`syncPromptFromEditor` writes both), so a real prompt document passes; `video_reference` on
+  // the same node shares the `reference` token but its value is a boolean, so it cannot claim the
+  // 5k-character prompt document the way pure token matching used to allow.
+  const tokens = text => String(text).replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase()
+    .split(/[^a-z0-9\u4e00-\u9fff]+/).filter(Boolean);
+  const docText = doc => {
+    if (typeof doc?.text === 'string') return doc.text;
+    if (!Array.isArray(doc?.parts)) return null;
+    return doc.parts.map(part => (typeof part === 'string' ? part : String(part?.text ?? ''))).join('');
+  };
+  // A document that is only a text mirror can be kept in step with a write. Anything else (mention
+  // or dialogue parts, which is how AICG3D carries `<Picture n>` references) has no representation
+  // for an arbitrary new string, and rewriting it would silently drop the references the queue
+  // needs — so those are reported, never rewritten. Note the pack's own sync writes both `text`
+  // and the single text part, which is why `text` is the field to compare.
+  const plainTextDoc = doc => Array.isArray(doc?.parts) && doc.parts.length === 1
+    && doc.parts[0] && typeof doc.parts[0] === 'object' && (doc.parts[0].type ?? 'text') === 'text'
+    && typeof doc.text === 'string';
+  function shadowDocFor(node, widget, currentText = '') {
+    const declared = [widget.options?.shadowDoc, widget.options?.serializedWidget,
+      widget.options?.widgetName, widget.name].filter(key => typeof key === 'string' && key !== '');
+    const name = String(widget.name || '').toLowerCase();
     const candidates = [];
     for (const [key, doc] of Object.entries(node.properties || {})) {
       if (!doc || typeof doc !== 'object' || !Array.isArray(doc.parts)) continue;
-      const attributed = declared.includes(key) || named(key)
-        || doc.parts.some(part => mentionsOf(part).some(named));
-      if (attributed) candidates.push({ key, value: doc });
+      const claimed = declared.includes(key)
+        || (name !== '' && tokens(key).includes(name) && currentText !== '' && docText(doc) === currentText);
+      if (claimed) candidates.push({ key, value: doc });
     }
     return candidates.length === 1 ? candidates[0] : null;
   }
@@ -540,8 +732,8 @@
   // the keys ComfyUI uses for drafts so a caller can tell "full" from "normal".
   function draftStorage() {
     const facts = { available: false, usedChars: 0, keys: [], persistSetting: null, blocking: null,
-      ownChars: 0, historyChars: 0, conflictChars: 0, conflictKeys: 0, ownKeys: [], totalChars: 0,
-      staleChars: 0, staleKeys: 0, staleAfterMs: HISTORY_MAX_AGE };
+      ownChars: 0, bridgeHistoryChars: 0, conflictChars: 0, conflictKeys: 0, ownKeys: [], totalChars: 0,
+      staleChars: 0, staleKeys: 0, staleAfterMs: HISTORY_MAX_AGE, unavailable: false, unreadableKeys: 0 };
     try {
       const store = storageStore();
       if (!store) {
@@ -552,12 +744,15 @@
       const mine = encodeURIComponent(location.origin + ':' + sessionId + ':');
       for (let index = 0; index < store.length; index += 1) {
         const key = store.key(index);
-        const value = store.getItem(key) ?? '';
+        let value = '';
+        // Same reason as the sweep: a key that throws on read is one unreadable key, not a
+        // reason to report nothing about the store the user is asking about.
+        try { value = store.getItem(key) ?? ''; } catch { value = ''; facts.unreadableKeys = (facts.unreadableKeys ?? 0) + 1; }
         const chars = charCount(value);
         // The bridge owns keys in the same quota. Counting only ComfyUI's drafts answered
         // "how full is the store" with a number that could be near zero while the store was full.
         if (String(key).startsWith(historyPrefix)) {
-          facts.historyChars += chars;
+          facts.bridgeHistoryChars += chars;
           const current = String(key).includes(mine);
           // A snapshot from another session is not necessarily junk: the user may switch back to
           // it. Only one old enough that its tab cannot still be open is worth reporting as stale.
@@ -584,9 +779,23 @@
         facts.keys.push({ key, chars });
         facts.usedChars += chars;
       }
-      facts.ownChars = facts.historyChars + facts.conflictChars;
+      facts.ownChars = facts.bridgeHistoryChars + facts.conflictChars;
       facts.totalChars = facts.usedChars + facts.ownChars;
       facts.persistSetting = store.getItem('Comfy.Workflow.Persist');
+      // `available` only proves the store could be enumerated. Private-browsing and some embedded
+      // webviews hand back a readable store that rejects every write, which is exactly the case
+      // doctor warns about — so warn on evidence, not on an absence that can never occur.
+      if (typeof store.setItem === 'function') {
+        try { store.setItem('dsh.comfyui.storage-probe', '1'); }
+        catch (error) {
+          facts.unavailable = true;
+          facts.blocking = 'localStorage 可读但写不进（' + (error.message || String(error))
+            + '）：草稿与撤销历史无法落盘，画布改动只活在当前页面。';
+        }
+        // Cleaning up is its own risk: a store that allows writes but throws on removal must not
+        // be reported as read-only because of a leftover 1-byte key.
+        try { store.removeItem?.('dsh.comfyui.storage-probe'); } catch {}
+      }
     } catch (error) { facts.blocking = error.message || String(error); }
     return facts;
   }
@@ -677,7 +886,9 @@
         }
         map[nodeId] = inputs;
       }
-      return { serializedInputs: map, ...(truncated.length ? { serializedTruncated: truncated.slice(0, 40) } : {}) };
+      // The names are short and the list is what keeps a cut value from being judged: a
+      // smaller bound here would let field 41 onward be refuted on its prefix.
+      return { serializedInputs: map, ...(truncated.length ? { serializedTruncated: truncated.slice(0, 500) } : {}) };
     } catch (error) {
       return { serializedInputs: null, serializedError: String(error?.message || error) };
     }
@@ -713,6 +924,11 @@
   };
   function writeWidget(app, node, widget, value) {
     const setter = widgetSetter(widget), kind = widgetKind(widget);
+    // An undeclared document is claimed by proving it mirrors this widget, and the text it mirrors
+    // is the value the widget held BEFORE this write — after `apply()` the widget carries the new
+    // value and the document still carries the old one, so reading it later could never match.
+    let valueBefore = '';
+    try { valueBefore = String(widgetReadback(widget) ?? ''); } catch {}
     const apply = () => {
       if (setter) setter.call(widget, value, writeContext(app, node));
       else { widget.value = value; widget.callback?.(value, app.canvas, node); }
@@ -727,26 +943,42 @@
       throw wrapped;
     };
     try { apply(); } catch (error) { fail(error); }
-    let cleared;
+    // A hidden/shadowed/dom widget is not serialized as-is even when its own value assignment
+    // "sticks": a document can decide what the queue carries, or what the panel shows next time it
+    // repaints. Those kinds go through the document stage even on a matching read-back; any other
+    // kind only when its read-back disagrees.
+    const shadowAware = kind === 'hidden' || kind === 'shadowed' || kind === 'dom';
+    let cleared, synced, diverged;
     try {
-      // A hidden/shadowed widget is not serialized as-is even when its own value assignment
-      // "sticks": a document can decide what the queue carries. Clear the attributable document
-      // for those kinds even on a matching read-back, or the reply verifies a value nobody queues.
-      const shadowable = kind === 'hidden' || kind === 'shadowed';
-      if (typeof value === 'string' && (String(widgetReadback(widget) ?? '') !== value || shadowable)) {
+      if (typeof value === 'string' && (shadowAware || String(widgetReadback(widget) ?? '') !== value)) {
         stage = 'clear-shadow-docs';
         // One attributable document, kept aside: a retry that still does not verify restores it,
         // so a failed write leaves the node exactly as it found it.
-        const shadow = shadowDocFor(node, widget);
+        const shadow = shadowDocFor(node, widget, valueBefore);
         if (shadow) {
-          delete node.properties[shadow.key];
-          // A retry that throws must not leave the node missing its document: restore first,
-          // then let the caller see the failure. Deleting and walking away is the exact
-          // data loss the review asked to rule out.
-          try { apply(); }
-          catch (error) { node.properties[shadow.key] = shadow.value; throw error; }
-          if (String(widgetReadback(widget) ?? '') === String(value)) cleared = [shadow.key];
-          else node.properties[shadow.key] = shadow.value;
+          // A DOM control that already took the value owns a live editor rendered from the
+          // document. Deleting the model of a control that answered would trade a good write for a
+          // blank panel, so when the document is nothing but a text mirror the write is copied into
+          // it instead — the shape the pack itself keeps in sync
+          // (comfyui-AICG3D h3easy/nodes.py:660, minimax_h3_easy_ui_v4.js:4351). A document with
+          // mention parts cannot be mirrored from a plain string, so it is left alone and reported:
+          // the queue has the new text, the editor will show the old one until the pack resyncs.
+          const sticks = String(widgetReadback(widget) ?? '') === String(value);
+          if (kind === 'dom' && sticks && plainTextDoc(shadow.value)) {
+            node.properties[shadow.key] = { ...shadow.value, text: value, parts: [{ ...shadow.value.parts[0], text: value }] };
+            synced = [shadow.key];
+          } else if (kind === 'dom' && sticks) {
+            diverged = [shadow.key];
+          } else {
+            delete node.properties[shadow.key];
+            // A retry that throws must not leave the node missing its document: restore first,
+            // then let the caller see the failure. Deleting and walking away is the exact
+            // data loss the review asked to rule out.
+            try { apply(); }
+            catch (error) { node.properties[shadow.key] = shadow.value; throw error; }
+            if (String(widgetReadback(widget) ?? '') === String(value)) cleared = [shadow.key];
+            else node.properties[shadow.key] = shadow.value;
+          }
         }
       }
     } catch (error) { fail(error); }
@@ -755,8 +987,13 @@
     try { after = widgetReadback(widget); } catch (error) { fail(error); }
     app.graph.setDirtyCanvas(true, true);
     const verified = String(after ?? '') === String(value);
+    // A document this widget cannot claim is left in place — deleting an unattributable one is
+    // the irreversible mistake — but it is also the reason a verified read-back may still not be
+    // what the queue carries. Naming the survivors turns a silent no-op into a visible question.
+    const remaining = shadowAware && !cleared && !synced ? shadowDocs(node) : [];
     return { kind, via: setter ? (widget.options?.setValue ? 'dom-setter' : 'native-setter') : kind === 'plain' ? 'value+callback' : kind,
-      verified, after, cleared, ...(verified ? {} : { hint: writeHint(kind, node, widget) }) };
+      verified, after, cleared, synced, diverged, ...(remaining.length ? { shadowDocsRemaining: remaining } : {}),
+      ...(verified ? {} : { hint: writeHint(kind, node, widget) }) };
   }
   // Writing one widget can make the pack rewrite the nodes wired below it (AICG3D's prompt
   // editor refills segments ~400ms after a change). Snapshot those nodes first, let the
@@ -770,8 +1007,13 @@
   }
   async function followUpWrite(app, edits, outcomes, watched) {
     const report = {};
-    // No wiring below the touched nodes means no cascade to wait for: stay fast.
-    if (!watched.length) return report;
+    // No wiring below the touched nodes means no cascade to wait for — but only for a plain
+    // parameter. A pack-driven control (hidden / shadowed / dom, or one whose document survived)
+    // is exactly the kind an editor takes back a few hundred milliseconds later, and skipping the
+    // re-read there would verify a value the page already removed.
+    const needsSettle = watched.length > 0 || outcomes.some(outcome =>
+      outcome.kind !== 'plain' || outcome.cleared || outcome.shadowDocsRemaining);
+    if (!needsSettle) return report;
     await settle(SETTLE_MS);
     const late = [];
     outcomes.forEach((outcome, index) => {
@@ -904,26 +1146,52 @@
         // An owner that cannot be confirmed is a refused request, decided before anything is
         // written: guessing would put the value into a control the caller never addressed.
         if (!resolved) throw fail('无法确定控件 ' + args.widget + ' 的写入目标', unresolvedTarget(found).hint);
-        // The option list is a mutation of the node too, so it waits until ownership is settled.
-        if (Array.isArray(widget.options?.values) && !widget.options.values.includes(args.value)) widget.options.values.push(args.value);
+        // The option list is a mutation of the node too, so it waits until ownership is
+        // settled — and it is taken back when the write did not land, or a refused attempt
+        // would leave a value on the canvas that nothing ever chose.
+        const options = widget.options;
+        const hadValue = Array.isArray(options?.values) && options.values.includes(args.value);
+        if (Array.isArray(options?.values) && !hadValue) options.values.push(args.value);
         const outcome = writeWidget(app, node, widget, args.value);
+        if (!outcome.verified && !hadValue) {
+          const added = options.values.indexOf(args.value);
+          if (added >= 0) options.values.splice(added, 1);
+        }
         return { nodeId: String(node.id), widget: widget.name, value: outcome.after, via: outcome.via, verified: outcome.verified,
-          ...(reroutedFrom ? { requestedWidget: reroutedFrom } : {}),
-          ...(outcome.cleared ? { shadowDocsCleared: outcome.cleared } : {}) };
+          ...(reroutedFrom ? { requestedWidget: reroutedFrom, rerouted: true } : {}),
+          ...(outcome.cleared ? { shadowDocsCleared: outcome.cleared } : {}),
+          ...(outcome.synced ? { shadowDocsSynced: outcome.synced } : {}),
+          ...(outcome.shadowDocsRemaining ? { shadowDocsRemaining: outcome.shadowDocsRemaining } : {}) };
       }
       case 'list_edits': {
         const history = historyOf(app);
         return { workflowPath: activeWorkflowOf(app).path, checkpoints: [...history.undo].reverse().map(item => ({
-          checkpointId: item.id, time: item.time, label: item.label, nodes: item.workflow.nodes.length
+          checkpointId: item.id, time: item.time, label: item.label,
+          nodes: item.nodes ?? (item.workflow?.nodes || []).length,
+          // Which half of the chain this entry is: the anchor keeps the graph, the rest keep a patch.
+          encoded: item.workflow ? 'full' : 'delta', chars: charCount(JSON.stringify(item))
         })), canRedo: history.redo.length > 0,
           // Undo depth is capped on purpose; say so instead of letting "only 3 checkpoints" look
           // like a bug, and show the chars this workflow currently occupies.
-          historyChars: historyCharsOf(history), budget: HISTORY_BUDGET, maxCheckpoints: HISTORY_MAX };
+          // `workflowHistoryChars`, not `historyChars`: `draftStorage` reports the sum over every
+          // session's snapshots under that name, and the two numbers differ by an order of magnitude
+          // on the same canvas (third-round observation 1).
+          workflowHistoryChars: historyCharsOf(history), workflowFullChars: historyFullCharsOf(history),
+          budget: HISTORY_BUDGET, maxCheckpoints: HISTORY_MAX,
+          // The conflict notice tells the user the other page's version is backed up in the browser.
+          // A promise nothing can read back is not a backup, so measure the slot here — its size,
+          // age and node count, never the graph itself, which would flood the reply.
+          conflictBackup: conflictFacts()}
+        ;
       }
       case 'restore_edit': {
-        const saved = historyOf(app).undo.find(item => item.id === args.checkpointId);
-        if (!saved) throw new Error('当前工作流没有该快照，请先 list_edits');
-        await replaceCurrentWorkflow(app, saved.workflow); return { restored: true, checkpointId: saved.id, nodes: nodes(app) };
+        const history = historyOf(app);
+        const index = history.undo.findIndex(item => item.id === args.checkpointId);
+        if (index < 0) throw new Error('当前工作流没有该快照，请先 list_edits');
+        let workflow;
+        try { workflow = workflowAt(history.undo, index); }
+        catch (error) { throw new Error('该快照无法重建（' + error.message + '）：没有改动画布。可以用 list_edits 换一个快照，或 load_workflow 从磁盘整图替换。'); }
+        await replaceCurrentWorkflow(app, workflow); return { restored: true, checkpointId: history.undo[index].id, nodes: nodes(app) };
       }
       case 'list_workflows': {
         const store = workflowStore(app);
@@ -990,7 +1258,8 @@
           if (typeof current === 'boolean' && typeof change.value !== 'boolean') throw fail(widget.name + ' 必须是布尔值', widget.name + ' 当前是布尔 ' + current + '，提交的是 ' + kindOf(change.value) + '：传 true/false，别传 0/1 或字符串。');
           if (Array.isArray(widget.options?.values) && !widget.options.values.includes(change.value)) throw fail(widget.name + ' 的值不在可选项中；' + optionHint(widget.options.values), '当前值是 ' + JSON.stringify(current) + '，可选值见错误正文；若可选项看起来像本地化显示名，说明该 pack 在提交时做转换，改用 load_workflow 整图替换更稳。');
           if (typeof change.value === 'number' && ((widget.options?.min != null && change.value < widget.options.min) || (widget.options?.max != null && change.value > widget.options.max))) throw fail(widget.name + ' 超出节点允许的范围', widget.name + ' 允许范围是 [' + (widget.options?.min ?? '-∞') + ', ' + (widget.options?.max ?? '+∞') + ']，当前值 ' + current + '，提交值 ' + change.value + '。');
-          return { node, widget, reroutedFrom, value: change.value, before: clone(current) };
+          const sameName = (node.widgets || []).filter(w => w.name === change.widget).length;
+          return { node, widget, reroutedFrom, sameName, value: change.value, before: clone(current) };
         });
         // Snapshot the wired-down nodes before the first write, then read the canvas again once
         // the pack's autofill debounce has landed. A batch of pure parameters touches nothing
@@ -999,16 +1268,80 @@
         const results = edits.map(edit => ({ edit, outcome: writeWidget(app, edit.node, edit.widget, edit.value) }));
         const followUp = await followUpWrite(app, edits, results.map(entry => entry.outcome), watched);
         const unverified = results.filter(entry => !entry.outcome.verified);
+        const shadowed = results.filter(entry => entry.outcome.shadowDocsRemaining);
+        const duplicated = results.filter(entry => entry.edit.sameName > 1);
+        // N5-b: an input slot that carries a link does not use the widget value at all —
+        // `graphToPrompt()` writes the reference ["<node>", <slot>] into `prompt[nodeId].inputs`.
+        // Writing such a widget therefore verifies on the canvas and changes nothing in the queue.
+        // The reviewer's node 198 is exactly this: `prompt` is wired to a PrimitiveStringMultiline.
+        const wiredInputs = results.map(({ edit }) => {
+          const slot = (edit.node.inputs || []).find(input => input.name === (edit.reroutedFrom || edit.widget.name));
+          return slot && slot.link != null ? { nodeId: String(edit.node.id), widget: edit.widget.name, linkId: slot.link } : null;
+        }).filter(Boolean);
+        // N8: with a rich reference document the write is valid for exactly one serialization. The
+        // pack patches `app.graphToPrompt` to re-sync the widget from the editor DOM
+        // (minimax_h3_easy_ui_v4.js:3328 → syncPromptFromEditor at :4343), and the editor was
+        // rendered from the old document — measured on this machine: the value survived 3 s of
+        // silence, then a `get_workflow(mode=full)`/`audit(op=params)` triggered a serialize and
+        // ~1.4 s later the widget was back to the old 5104-character text. The settle cannot catch
+        // that (it is not a debounce), so the limit has to be stated where the write is answered.
+        const revertedWrites = results.filter(entry => entry.outcome.diverged).map(({ edit, outcome }) => ({
+          nodeId: String(edit.node.id), widget: edit.widget.name, docs: outcome.diverged,
+          note: '该控件的值由节点包自己的编辑器持有：本次写入只在下一次序列化前有效，'
+            + 'pack 的 graphToPrompt 补丁会用编辑器现状把值同步回旧文档。要持久改就写文档本身（该包自带写入口）或用 load_workflow 整图替换。'
+        }));
+        const warnings = [], nextSteps = [];
+        if (unverified.length) {
+          warnings.push(unverified.length + ' 项写入后回读与提交值不一致（verified:false）：该控件的状态由前端组件自己持有，写控件不会生效，别把它当成改好了。每条 changed 里的 hint 给出了可执行的替代路径。');
+          nextSteps.push(...unverified.map(({ edit }) => 'node ' + edit.node.id + '.' + edit.widget.name + ' → 读该条 hint，别重复同一调用'));
+        }
+        if (wiredInputs.length) {
+          warnings.push(wiredInputs.length + ' 项写进了画布控件，但同名输入槽上有连线（wiredInputs，changed[].inputIsWired=true）：提交时队列里走的是连线来源的值，本次写入不会进队列。');
+          nextSteps.push(...wiredInputs.map(item => 'node ' + item.nodeId + '.' + item.widget + ' → 值来自连线 ' + item.linkId + '，改连线另一端的节点，或断开该输入'));
+        }
+        const unattributed = shadowed.filter(entry => !entry.outcome.diverged);
+        if (unverified.length === 0 && shadowed.length) {
+          const causes = [];
+          if (unattributed.length) causes.push(unattributed.length + ' 份无法确认属于这个控件，所以没有删除');
+          const mirrored = shadowed.length - unattributed.length;
+          if (mirrored) causes.push(mirrored + ' 份属于刚写的控件、但内含 @引用/对话结构，纯文本没法镜像（见 revertedWrites）');
+          warnings.push('写完后节点上仍有与提交值不同步的引用文档（changed[].shadowDocsRemaining）：' + causes.join('；')
+            + '。跑一次 run + get_image/audit(op=params) 看提交值；要持久改就用该包自带的写入入口或 load_workflow 整图替换。');
+          nextSteps.push(...shadowed.map(({ edit, outcome }) => 'node ' + edit.node.id + '.' + edit.widget.name
+            + ' → 文档 ' + outcome.shadowDocsRemaining.join(', ')
+            + (outcome.diverged ? ' 属于本控件但含结构，别用纯文本覆盖它' : ' 未归属，别改写控件名去猜它')));
+        }
         return {
           changed: results.map(({ edit, outcome }) => ({
             nodeId: String(edit.node.id), widget: edit.widget.name,
-            ...(edit.reroutedFrom ? { requestedWidget: edit.reroutedFrom } : {}),
+            ...(edit.reroutedFrom ? { requestedWidget: edit.reroutedFrom, rerouted: true } : {}),
+            ...(edit.sameName > 1 ? { sameNameWidgets: edit.sameName } : {}),
             before: edit.before, after: outcome.after, via: outcome.via, verified: outcome.verified,
             ...(outcome.cleared ? { shadowDocsCleared: outcome.cleared } : {}),
+            ...(outcome.synced ? { shadowDocsSynced: outcome.synced } : {}),
+            ...(outcome.diverged ? { shadowDocsDiverged: outcome.diverged } : {}),
+            ...(outcome.shadowDocsRemaining ? { shadowDocsRemaining: outcome.shadowDocsRemaining } : {}),
+            ...(wiredInputs.some(item => item.nodeId === String(edit.node.id)
+              && item.widget === (edit.reroutedFrom || edit.widget.name)) ? { inputIsWired: true } : {}),
             ...(outcome.hint ? { hint: outcome.hint } : {})
           })),
+          ...(wiredInputs.length ? { wiredInputs } : {}),
+          ...(revertedWrites.length ? { revertedWrites } : {}),
           ...followUp,
-          ...(unverified.length ? { warning: unverified.length + ' 项写入后回读与提交值不一致（verified:false）：该控件的状态由前端组件自己持有，写控件不会生效，别把它当成改好了。每条 changed 里的 hint 给出了可执行的替代路径。', nextSteps: unverified.map(({ edit }) => 'node ' + edit.node.id + '.' + edit.widget.name + ' → 读该条 hint，别重复同一调用') } : {})
+          // One sentence per cause actually present, joined — never one clause describing a set with
+          // two different reasons. The batch wording used to contradict the per-item notes in the
+          // same reply (third-round N11: node 107 diverged, node 198 unattributed, and the batch said
+          // "无法确认属于这个控件" for both).
+          ...(warnings.length ? { warning: warnings.join(' '), nextSteps } : {}),
+          // LiteGraph renames a duplicate (`prompt#1`), so two widgets literally sharing one name
+          // means a pack built them another way and which one the panel shows cannot be known from
+          // here. Writing the first is what the page's own lookups do, so the write stays — but a
+          // `requestedWidget` equal to the asked-for name used to make a reroute indistinguishable
+          // from an in-place write, so both facts are now reported.
+          ...(duplicated.length ? { ambiguousTargets: duplicated.map(({ edit }) => ({
+            nodeId: String(edit.node.id), widget: edit.widget.name, sameName: edit.sameName,
+            note: '该节点上有 ' + edit.sameName + ' 个同名控件，写入的是数组里的第一个；面板显示的是不是它无法从数据判断。'
+          })) } : {})
         };
       }
       case 'load_workflow': {
@@ -1022,10 +1355,17 @@
         const source = command.action === 'undo' ? history.undo : history.redo;
         if (!source.length) throw new Error('当前工作流已切换或没有可' + (command.action === 'undo' ? '撤销' : '重做') + '的 AI 修改');
         if (history.expectedHash && history.expectedHash !== graphHash(app)) throw new Error('工作流又被手动或其他页面修改了，请先 list_edits，再明确使用 restore_edit 恢复所需快照');
-        const before = snapshot(app), reverse = checkpoint(app, command.action);
+        const before = snapshot(app);
+        // The reverse step goes onto the opposite list; its parent is that list's current tail, so
+        // both chains stay rebuildable forward from their own anchor.
+        const target = command.action === 'undo' ? history.redo : history.undo;
+        const reverse = checkpoint(app, command.action, target.length ? workflowAt(target, target.length - 1) : null);
         try {
-          await replaceCurrentWorkflow(app, source.pop().workflow);
-          (command.action === 'undo' ? history.redo : history.undo).push(reverse);
+          const index = source.length - 1;
+          const restoredWorkflow = workflowAt(source, index);
+          source.pop();
+          await replaceCurrentWorkflow(app, restoredWorkflow);
+          target.push(reverse); anchorHistoryHead(target);
           history.expectedHash = graphHash(app); saveHistory(app, history);
         } catch (error) { await replaceCurrentWorkflow(app, before); throw error; }
         return { restored: true, nodes: nodes(app) };
@@ -1073,7 +1413,10 @@
     const app = appOf();
     if (!allowAI || !graphReady(app)) return executeAction(command);
     const before = snapshot(app), history = clone(historyOf(app)), pending = clone(history);
-    pending.undo.push(checkpoint(app, command.action)); pending.undo = pending.undo.slice(-HISTORY_MAX); pending.redo = [];
+    // The new entry diffs against the state its predecessor describes, so a parameter write costs
+    // the widgets it touched, not another copy of the graph.
+    const parent = pending.undo.length ? workflowAt(pending.undo, pending.undo.length - 1) : null;
+    pending.undo.push(checkpoint(app, command.action, parent)); capHistory(pending.undo, HISTORY_MAX, command.args?.checkpointId); pending.redo = [];
     // The pre-write and post-write saves can both reclaim keys; the reply has to report the total,
     // or a write that pruned its way through looks like it reclaimed nothing.
     const reclaimed = [];
@@ -1112,7 +1455,13 @@
     if (e.stage) reply.stage = e.stage;
     if (e.widgetKind) reply.widgetKind = e.widgetKind;
     if (e.hint) reply.hint = e.hint;
-    else reply.hint = '页面侧抛了异常，按 stack 里的文件:行号定位；若来自自定义节点包的 setter，改用该包自带的写入入口或整图替换（load_workflow），不要重复同一调用。';
+    // Third-round N10: this used to assert "a page exception — read the stack, it is probably a
+    // custom node setter", but the majority of unhinted failures are ordinary business refusals
+    // (a workflow path that does not exist, a missing node) with no stack and no setter involved.
+    // A hint that names the wrong cause sends the model to fix something that was never broken, so
+    // the fallback states what it actually knows and puts the two branches in check order.
+    else reply.hint = '这条失败没有分类提示。先按错误正文判断是哪一类：说「不存在/不可选/超出范围/需要 X」的是校验拒绝，改正参数再发一次；'
+      + '带 stack 且指向前端或自定义节点包 setter 的才是页面异常，那种情况别重复同一调用，改用该包自带的写入入口或整图替换（load_workflow）。';
     return reply;
   }
   async function handleCommands() {

@@ -79,13 +79,30 @@ test('a busy queue and a nearly full store are warnings, never a failed verdict'
   assert.match(checks['draft-storage'].note, /5M/);
 });
 
-test('a store the front-end already gave up on is reported with its own cause and cure', () => {
+test('a store that cannot be written is reported with its own cause and cure', () => {
   const report = doctorReport(facts({ draftStorage: { available: true, usedChars: 200, ownChars: 0, totalChars: 200, unavailable: true, keys: [], ownKeys: [] } }));
   assert.equal(report.kind, 'ok', 'a draft-store fault must not read as "the tools are broken"');
   const storage = byId(report)['draft-storage'];
   assert.equal(storage.ok, null);
-  assert.match(storage.note, /标记为不可用/);
-  assert.match(storage.note, /刷新页面/);
+  assert.match(storage.note, /能读不能写/);
+  assert.match(storage.note, /Comfy.Workflow.Persist/);
+});
+
+test('an unconfirmed saver is an open question, not a broken environment', () => {
+  // `saver-present: unresolved` means the audit saw an output node whose name does not prove it
+  // writes a file (rgthree's comparer, KJNodes' preview). Failing doctor for that would send the
+  // model to "fix" a canvas that may be fine; passing it as confirmed would promise a file that
+  // never arrives. Neither: report it and ask for a run.
+  const uncertain = doctorReport(facts({ graph: { verdict: 'unresolved', workflowPath: 'workflows/H3.json',
+    checks: [{ id: 'saver-present', verdict: 'unresolved' }] } }));
+  assert.equal(uncertain.kind, 'ok', 'an unproven saver must not read as "the tools are broken"');
+  assert.equal(byId(uncertain)['disk-output'].ok, null);
+  assert.match(byId(uncertain)['disk-output'].note, /temp/);
+
+  const none = doctorReport(facts({ graph: { verdict: 'refuted', workflowPath: 'workflows/H3.json',
+    checks: [{ id: 'saver-present', verdict: 'refuted' }] } }));
+  assert.equal(byId(none)['disk-output'].ok, false, 'no candidate at all is still a hard failure');
+  assert.match(byId(none)['disk-output'].note, /get_image/);
 });
 
 test('a page that never connected says so once and skips what it cannot see', () => {

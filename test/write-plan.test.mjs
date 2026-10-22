@@ -185,6 +185,24 @@ test('a value the front-end debounce overwrites is reported as a partial write, 
   assert.deepEqual(envelope.lateChange.map(item => item.now), ['overwritten']);
 });
 
+test('the settle evidence reaches the caller, not only the page result', () => {
+  // Third-round N9: `settledMs` was read inside one sentence of copy and never copied into the
+  // envelope, so every MCP reply looked like it had not waited even when the page had spent 600ms
+  // diffing. The five existing assertions all read the raw page result, which is why 193 green
+  // tests could not see the gap.
+  const envelope = writeEnvelope({
+    changed: [{ nodeId: '195', widget: 'text', before: '', after: '镜1', via: 'dom-setter', verified: true }],
+    settledMs: 600,
+    revertedWrites: [{ nodeId: '195', widget: 'text', docs: ['pack_doc'], note: '只在下一次序列化前有效' }],
+    wiredInputs: [{ nodeId: '198', widget: 'prompt', linkId: 377 }],
+    ambiguousTargets: [{ nodeId: '198', widget: 'prompt', sameName: 2 }]
+  }, [{ nodeId: 195, widget: 'text', value: '镜1' }]);
+  assert.equal(envelope.settledMs, 600, 'the wait the page paid is part of the reply');
+  assert.deepEqual(envelope.revertedWrites.map(item => item.docs), [['pack_doc']]);
+  assert.deepEqual(envelope.wiredInputs.map(item => item.linkId), [377]);
+  assert.deepEqual(envelope.ambiguousTargets.map(item => item.sameName), [2]);
+});
+
 test('the draft store is described honestly whether it was measurable or not', () => {
   const unreadable = draftEnvelope({ available: false, blocking: '当前页面没有可枚举的 localStorage' });
   assert.equal(unreadable.unavailable, '当前页面没有可枚举的 localStorage');
