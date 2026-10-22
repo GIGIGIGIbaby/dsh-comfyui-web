@@ -13,13 +13,13 @@ const node = (id, type, widgets) => ({ id: String(id), type, title: '', widgets 
 
 const nodes = [
   node(195, 'AICG3DPromptSegmentSplit', [
-    { name: 'mode', type: 'combo', kind: 'dom', value: '分隔线 ---', writable: 'risky', choices: ['分隔线 ---', '每行一段'] },
-    { name: 'max_segments', type: 'number', kind: 'dom', value: 4, writable: 'risky' }
+    { name: 'mode', type: 'combo', kind: 'dom', value: '分隔线 ---', choices: ['分隔线 ---', '每行一段'] },
+    { name: 'max_segments', type: 'number', kind: 'dom', value: 4 }
   ]),
   node(78, 'KSampler', [
-    { name: 'steps', type: 'number', kind: 'plain', value: 25, writable: 'ok', min: 1, max: 100 },
-    { name: 'mode', type: 'combo', kind: 'plain', value: 'T2VA', writable: 'ok', choices: ['T2VA', 'I2VA'] },
-    { name: 'queue', type: 'button', kind: 'button', writable: 'no' }
+    { name: 'steps', type: 'number', kind: 'plain', value: 25, min: 1, max: 100 },
+    { name: 'mode', type: 'combo', kind: 'plain', value: 'T2VA', choices: ['T2VA', 'I2VA'] }
+    // buttons are filtered out page-side, so they never appear in these facts at all (R6-8)
   ])
 ];
 
@@ -58,16 +58,20 @@ test('a stale nodeId answers with the ids that are actually on the canvas', () =
   assert.match(plan.blocked[0].nextSteps, /list_nodes/);
 });
 
-test('a wrong widget name lists the writable names instead of the refused one', () => {
+test('a wrong widget name lists the controls that exist instead of the refused one', () => {
   const plan = planWrites({ defs, nodes, changes: [{ nodeId: 78, widget: 'step', value: 3 }] });
   assert.equal(plan.blocked[0].code, 'widget-not-found');
-  assert.deepEqual(plan.blocked[0].accepted, ['steps', 'mode', 'queue']);
+  assert.deepEqual(plan.blocked[0].accepted, ['steps', 'mode'], 'buttons are not in the fact list at all');
 });
 
-test('a button is not a parameter and says which action replaces it', () => {
+test('a button is not a parameter, and the answer names the action that replaces it', () => {
+  // `list_nodes` filters buttons out page-side, so asking for one arrives as a control that does not
+  // exist — the old `writable:"no"` fact that made a separate code possible never existed in practice.
   const plan = planWrites({ defs, nodes, changes: [{ nodeId: 78, widget: 'queue', value: true }] });
-  assert.equal(plan.blocked[0].code, 'widget-not-writable');
-  assert.match(plan.blocked[0].nextSteps, /run|save_workflow/);
+  assert.equal(plan.blocked[0].code, 'widget-not-found');
+  assert.match(plan.blocked[0].nextSteps, /按钮不是参数/);
+  assert.match(plan.blocked[0].nextSteps, /run \/ save_workflow/);
+  assert.ok(plan.blocked[0].accepted.includes('steps'), 'the controls that really exist are still listed');
 });
 
 test('a value outside the server options names the accepted ones', () => {

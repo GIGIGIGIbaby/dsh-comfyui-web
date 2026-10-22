@@ -497,3 +497,20 @@ test('the write census classifies every control as writable, conditional, or imp
   const scoped = auditWrites({ page, defs: {}, filter: 'ShowText' });
   assert.equal(scoped.nodeCount, 1, 'filter narrows the census to the node asked about');
 });
+
+test('a capped census says which list was cut, and only that one', () => {
+  // The first version of the note claimed 「blocked 8 条只列 30」 — arithmetic that sent a reader looking
+  // for 22 missing rows. The note names only the lists that are actually longer than the cap.
+  const many = (count, kind) => Array.from({ length: count }, (_, index) => ({ name: 'w' + index, kind,
+    hasSetter: false, hasGetter: false, serializes: false, inOptions: null, optionCount: null, step: null, wired: 7, mirror: false, props: [] }));
+  const big = auditWrites({ page: { workflowPath: 'p', nodes: [{ id: '1', type: 'T', title: '', mode: 0, subgraph: null,
+    widgetCount: 41, shadowDocs: [], widgets: many(41, 'plain') }] }, defs: {} });
+  assert.equal(big.blocked, 41);
+  assert.equal(big.blockedItems.length, 30);
+  assert.match(big.truncated, /^blocked 共 41 条/);
+  assert.doesNotMatch(big.truncated, /conditional 共/, 'conditional was not truncated, so the note must not mention it');
+
+  const small = auditWrites({ page: { workflowPath: 'p', nodes: [{ id: '1', type: 'T', title: '', mode: 0, subgraph: null,
+    widgetCount: 2, shadowDocs: [], widgets: many(2, 'plain') }] }, defs: {} });
+  assert.equal(small.truncated, undefined, 'nothing was cut, nothing is claimed');
+});

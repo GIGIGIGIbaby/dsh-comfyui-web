@@ -1256,17 +1256,10 @@
   // Predict whether update_nodes can make this widget stick, before the caller spends a write
   // on it. 'ok' = plain value write; 'risky' = a DOM/panel-owned control whose setter may throw
   // or silently disagree (call it, then trust only verified); 'no' = button/no widget.
-  function writability(widget) {
-    const kind = widgetKind(widget);
-    if (kind === 'plain') return 'ok';
-    if (kind === 'button') return 'no';
-    return 'risky';
-  }
   function nodes(app) {
     return (app.graph._nodes || []).map(n => ({ id: String(n.id), type: n.type, title: n.title, mode: n.mode,
       widgets: (n.widgets || []).filter(w => w.type !== 'button').map(w => ({ name: w.name, type: w.type, value: w.value ?? null,
         ...(widgetKind(w) === 'plain' ? {} : { kind: widgetKind(w) }),
-        writable: writability(w),
         ...(Array.isArray(w.options?.values) ? { choices: w.options.values } : {}),
         ...(typeof w.options?.min === 'number' ? { min: w.options.min, max: w.options.max ?? null } : {}),
         // The granularity the panel applies to its own numbers. Without it a caller cannot tell a

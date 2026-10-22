@@ -24,3 +24,12 @@ test('graph schemas require fields per action and mutation hints reflect affecte
   assert.equal(MCP_TOOLS.find(tool => tool.name === 'switch_workflow').annotations.idempotentHint, true);
   assert.equal(MCP_TOOLS.find(tool => tool.name === 'new_workflow').annotations.idempotentHint, false);
 });
+
+test('list_nodes no longer advertises a writability pre-judgement', () => {
+  // R6-8: the removed `writable` field predicted success from the widget kind and was wrong in both
+  // directions. The description must not resurrect that promise, and must point at the census instead.
+  const listed = MCP_TOOLS.find(tool => tool.name === 'list_nodes');
+  assert.doesNotMatch(listed.description, /writable 只说明|writable 是/);
+  assert.match(listed.description, /audit\(op=writes\)/);
+  assert.match(listed.description, /verified/, 'per-write proof is the only authority');
+});

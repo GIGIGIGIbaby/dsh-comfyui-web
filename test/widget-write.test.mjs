@@ -457,7 +457,11 @@ test('list_nodes and audit call a native widget plain, not dom', async () => {
   const command = await boot([nativeNode()]);
   const listed = await command('list_nodes');
   const widgets = listed.nodes.find(node => node.id === '4').widgets;
-  assert.deepEqual(widgets.map(w => [w.name, w.kind, w.writable]), [['steps', undefined, 'ok'], ['mode', undefined, 'ok'], ['filename_prefix', undefined, 'ok']]);
+  assert.deepEqual(widgets.map(w => [w.name, w.kind]), [['steps', undefined], ['mode', undefined], ['filename_prefix', undefined]]);
+  // R6-8: `writable` is gone. It could only be derived from the widget kind, so it said `ok` for
+  // controls that still failed on a step and `risky` for most of a canvas; the answer it pretended to
+  // give is now `audit(op=writes)`, and `verified` is the per-write truth.
+  assert.equal(widgets[0].writable, undefined, 'list_nodes no longer guesses at writability');
   const audit = await command('audit_graph');
   assert.deepEqual(audit.nodes.find(node => node.id === '4').widgets.map(w => w.kind), ['plain', 'plain', 'plain']);
 });
