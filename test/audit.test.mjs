@@ -98,6 +98,39 @@ test('an unused incomplete branch is advisory, not an execution blocker', () => 
   assert.match(result.unusedIncomplete.note, /不影响提交/);
 });
 
+test('a shared producer does not pull its sibling branch into the execution closure', () => {
+  // The reviewer's minimal graph on #10, and the reason reach has to be directed:
+  //   Source ──► SaveImage          (the output branch)
+  //         └──► UnusedProcessor    (consumes the same source, feeds nothing, `model` unwired)
+  // Pairing both ends of a link as peers makes the processor reachable "through" the saver, and the
+  // audit refutes a graph the queue would run fine. Missing inputs on a node that really is an
+  // ancestor of the output still have to refute — that half is the second page below.
+  const shared = { ...defs,
+    EmptyImage: { input: { required: { width: ['INT'], height: ['INT'] } }, output: ['IMAGE'] },
+    UnusedProcessor: { input: { required: { image: ['IMAGE'], model: ['MODEL'] } }, output: ['IMAGE'] } };
+  const source = node(1, 'EmptyImage', { outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [20, 21] }] });
+  const save = node(2, 'SaveImage', { inputs: [{ name: 'images', type: 'IMAGE', link: 20 }] });
+  const sibling = node(3, 'UnusedProcessor', { inputs: [{ name: 'image', type: 'IMAGE', link: 21 },
+    { name: 'model', type: 'MODEL', link: null }], outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [] }] });
+
+  const result = auditGraph({ page: { nodes: [source, save, sibling], linkCount: 2 }, defs: shared });
+  assert.equal(result.checks.find(check => check.id === 'dangling-required-input').verdict, 'supported',
+    'the gap sits on a branch that feeds no output, so the queue does not ask about it');
+  assert.equal(result.verdict, 'supported', 'and it must not decide the verdict either');
+  assert.deepEqual(result.unusedIncomplete.nodes.map(item => [item.nodeId, item.input]), [['3', 'model']],
+    'reported as advice about the leftover node, which is what it is');
+
+  // Same three node types, but now the processor IS on the way to the save node.
+  const mid = node(11, 'UnusedProcessor', { inputs: [{ name: 'image', type: 'IMAGE', link: 30 },
+    { name: 'model', type: 'MODEL', link: null }], outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [31] }] });
+  const onChain = auditGraph({ page: { nodes: [node(10, 'EmptyImage', { outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [30] }] }),
+    mid, node(12, 'SaveImage', { inputs: [{ name: 'images', type: 'IMAGE', link: 31 }] })], linkCount: 2 }, defs: shared });
+  const dangling = onChain.checks.find(check => check.id === 'dangling-required-input');
+  assert.equal(dangling.verdict, 'refuted', 'a real dependency with a missing required input still fails');
+  assert.deepEqual(dangling.evidence.map(item => [item.nodeId, item.input]), [['11', 'model']]);
+  assert.equal(onChain.verdict, 'refuted');
+});
+
 test('a widget-backed input slot with no link is not an unwired required input', () => {
   // Real shape: the page lists combo widgets among node.inputs with link null, and V3
   // dynamic combos (SaveVideo.format) are spelled with a class-code-looking label.
