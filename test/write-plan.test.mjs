@@ -387,3 +387,14 @@ test('audit(op=writes) asks the page for the flags-only census and returns the c
 
   await assert.rejects(callComfyTool(rt, 'audit', { op: 'nonsense' }, { dshSessionId: 'A' }), /graph \/ params \/ writes/);
 });
+
+test('a page without the census action is told to refresh, not reported as broken', async t => {
+  const rt = await runtime(); t.after(() => rt.stop());
+  rt.clients.set('pA', { id: 'pA', sessionId: 'A', ready: true, allowAI: true, visible: true, seen: Date.now(), queue: [] });
+  rt.command = async (sessionId, action) => {
+    if (action === 'audit_writes') throw new Error('未知面板操作：audit_writes');
+    throw new Error('unexpected action ' + action);
+  };
+  await assert.rejects(callComfyTool(rt, 'audit', { op: 'writes' }, { dshSessionId: 'A' }),
+    /刷新该页面（F5）后再用 audit\(op=writes\)/);
+});
