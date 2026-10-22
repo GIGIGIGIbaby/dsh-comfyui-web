@@ -1527,3 +1527,60 @@ test('a save reports which moment reached the disk, and the page can be asked ag
   const failed2 = await command('update_nodes', { changes: [{ nodeId: 999, widget: 'x', value: 1 }] }).catch(error => error);
   assert.equal(failed2.dirtyMarked, true, 'and it is the front-end answer, not a guess from this call');
 });
+
+test('save_as reports the fingerprints of the copy it wrote, not of the tab it left behind', async () => {
+  // Round 8, caught on the live panel: `save_as_workflow` switched the tab to the copy, wrote the
+  // copy's state to disk and then hashed `active.changeTracker.activeState` — the tab it had just
+  // abandoned — against the live canvas. Loading a graph lets the pack refill its own parameters
+  // (AICG3D, measured ~300 ms after a load; the reason the two hashes are taken at all), so the copy's
+  // state and the abandoned tab's state are different objects, and the reply claimed a save that had
+  // just matched the canvas did not (`canvasMatchesSaved:false`, hashes 2868680163 vs 636010683).
+  const node = showTextNode('当前值');
+  const command = await boot([node]);
+  const store = command.app.extensionManager.workflow, active = store.activeWorkflow;
+  const canvasState = JSON.parse(JSON.stringify(command.graph.serialize()));
+  active.directory = 'workflows';
+  active.changeTracker = { activeState: canvasState, initialState: canvasState, prepareForSave() {} };
+  Object.defineProperty(active, 'activeState', { configurable: true, get() { return this.changeTracker?.activeState ?? null; } });
+  const written = [];
+  store.createNewTemporary = () => { throw new Error('unused in this test'); };
+  store.getWorkflowByPath = path => store.openWorkflows.find(item => item.path === path);
+  store.saveWorkflow = async workflow => { written.push({ path: workflow.path, state: JSON.parse(JSON.stringify(workflow.activeState)) }); };
+  store.saveAs = (source, path) => {
+    const copy = { path, filename: '_probe', isLoaded: true, isPersisted: false, isModified: false,
+      directory: 'workflows', changeTracker: { activeState: JSON.parse(JSON.stringify(source.activeState)) } };
+    Object.defineProperty(copy, 'activeState', { configurable: true, get() { return this.changeTracker?.activeState ?? null; } });
+    // `ComfyWorkflowWithChangeTracker.prepareForSave()` captures the canvas into the tracker it belongs
+    // to — the copy's, never the source's — and that is the exact object `save()` serializes out.
+    copy.changeTracker.prepareForSave = () => { copy.changeTracker.activeState = JSON.parse(JSON.stringify(command.graph.serialize())); };
+    store.openWorkflows.push(copy);
+    return copy;
+  };
+  const load = command.app.loadGraphData.bind(command.app);
+  command.app.loadGraphData = async (data, ...rest) => {
+    const ok = await load(data, ...rest);
+    const target = rest[2];
+    if (target) store.activeWorkflow = target;
+    // The pack doing what it does after a load: rewriting one of its own widgets, which lands in the
+    // freshly loaded canvas and therefore in the copy's captured state but not in the abandoned tab's.
+    if (target && target !== active) command.nodes[0].widgets[0].value = '包在加载后自己重填';
+    return ok;
+  };
+
+  const reply = await command('save_as_workflow', { name: '_probe' });
+  assert.equal(reply.saved, true);
+  assert.equal(reply.workflow.path, 'workflows/_probe.json', 'and the tab really did move to the copy');
+  assert.equal(written.length, 1, 'one file, written from the copy');
+  assert.equal(written[0].state.nodes[0].widgets_values[0], '包在加载后自己重填',
+    'the bytes on disk are the loaded canvas, refill included');
+  assert.equal(reply.canvasMatchesSaved, true,
+    'the moment written and the moment measured are the same workflow, so a save with no drift says so');
+  assert.ok(reply.savedStateHash && reply.canvasHash);
+
+  // The abandoned tab is not a free source of hashes either way: ask again from the copy's tab and a
+  // later refill is still reported as drift, so `canvasMatchesSaved:false` only ever means drift.
+  command.nodes[0].widgets[0].value = '又过了一分钟，包又改了一次';
+  const later = await command('graph_fingerprint');
+  assert.equal(later.canvasMatchesSaved, false, 'a real move after the save is still visible');
+  assert.notEqual(later.canvasHash, reply.savedStateHash);
+});

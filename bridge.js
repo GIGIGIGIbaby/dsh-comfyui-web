@@ -1398,6 +1398,11 @@
         // is written to disk (R6-1: save_as lost ShowText's value; R6-2: switching tabs lost it too).
         const stateRefresh = await refreshActiveState(app);
         const targetPath = name ? (active.directory || active.path.slice(0, active.path.lastIndexOf('/'))) + '/' + name.replace(/\.json$/i, '') + '.json' : active.path;
+        // Which workflow object the bytes on disk came from. The saveAs path switches the tab to the copy
+        // before writing it, so `active` is no longer the thing that was saved by the time the hashes are
+        // taken — pairing the old tab's cached state with the new tab's canvas reported `canvasMatchesSaved:
+        // false` on a save that had just written that exact canvas (round 8, caught live).
+        let savedWorkflow = active;
         if (targetPath === active.path) {
           if (command.action === 'save_as_workflow') throw new Error('另存时请使用一个新的文件名称');
           await store.saveWorkflow(active);
@@ -1411,6 +1416,7 @@
             await store.saveWorkflow(active);
           } else {
             const target = store.saveAs(active, targetPath);
+            savedWorkflow = target;
             try { await openWorkflow(app, target, await workflowData(app, target)); target.changeTracker?.prepareForSave(); await store.saveWorkflow(target); }
             catch (error) {
               if (activeWorkflowOf(app) !== active) await openWorkflow(app, active, await workflowData(app, active));
@@ -1422,7 +1428,7 @@
         // parameters after the load (AICG3D measured at ~300 ms) can move the canvas behind this save, so
         // `{saved:true}` alone is not an answer to 「保存的是哪一刻」 (round 5, R5-H).
         let savedStateHash = null, canvasHash = null;
-        try { savedStateHash = hashText(fingerprint(active.changeTracker?.activeState ?? null)); } catch {}
+        try { savedStateHash = hashText(fingerprint(savedWorkflow.changeTracker?.activeState ?? null)); } catch {}
         try { canvasHash = hashText(fingerprint(readGraph(app))); } catch {}
         return { saved: true, workflow: describeWorkflow(store, store.activeWorkflow),
           savedStateHash, canvasHash, canvasMatchesSaved: savedStateHash !== null && savedStateHash === canvasHash,

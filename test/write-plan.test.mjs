@@ -226,6 +226,27 @@ test('the panel state and the tab modified flag reach the caller too', () => {
   assert.equal(quiet.dirtyMarked, undefined);
 });
 
+test('force and the definitions fork travel as machine-readable fields, not only as prose', () => {
+  // Round 8, found by running the live panel: the page answered `forceUsed:true` and named the stale
+  // `definitions` slots, and the envelope kept the sentence but dropped the fields — so `structuredContent`
+  // said nothing about force having been used, which is exactly what the caller has to decide next.
+  const forced = writeEnvelope({
+    changed: [{ nodeId: '78', widget: 'fps', before: 24, after: 1000024, via: 'native-setter', verified: true, outOfRange: true },
+      { nodeId: '77', widget: 'noise_seed', before: 1, after: 777777777, via: 'native-setter', verified: true }],
+    forceUsed: true, forcedCount: 1,
+    definitionsStale: [{ nodeId: '77', widget: 'noise_seed', subgraphId: 'a67caa28', innerNodeId: '86', definitionValue: 432262096973490, canvasValue: 777777777 }],
+    warning: '1 项是 force 写进非法域的…'
+  }, [{ nodeId: 78, widget: 'fps', value: 1000024 }, { nodeId: 77, widget: 'noise_seed', value: 777777777 }]);
+  assert.equal(forced.forceUsed, true);
+  assert.equal(forced.forcedCount, 1);
+  assert.equal(forced.definitionsStale[0].innerNodeId, '86');
+  assert.equal(forced.changed[1].verified, true, 'and the write itself is still reported as written');
+
+  const plain = writeEnvelope({ changed: [{ nodeId: '1', widget: 'steps', after: 20, via: 'value+callback', verified: true }] }, []);
+  assert.equal(plain.forceUsed, undefined, 'a write that needed no force does not claim it used some');
+  assert.equal(plain.definitionsStale, undefined);
+});
+
 test('the draft store is described honestly whether it was measurable or not', () => {
   const unreadable = draftEnvelope({ available: false, blocking: '当前页面没有可枚举的 localStorage' });
   assert.equal(unreadable.unavailable, '当前页面没有可枚举的 localStorage');
