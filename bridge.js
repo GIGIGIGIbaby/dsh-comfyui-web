@@ -110,13 +110,32 @@
       ? Object.fromEntries(Object.keys(value).sort().map(key => [key, stable(value[key])])) : value;
     return JSON.stringify(stable(clean));
   }
+  // `graph.serialize()` on a canvas that holds subgraph proxies without their definitions dies with a
+  // litegraph internals sentence ("Attempted to access LGraph reference that was null or undefined") that
+  // reads like a dead bridge. Say what broke and what fixes it (fourth-round R4-E aftermath).
+  function readGraph(app) {
+    try { return snapshot(app); }
+    catch (error) {
+      throw new Error('当前画布无法序列化（' + ((error && error.message) || error) + '）。常见原因是图里留有子图代理节点、但工作流数据里没有 definitions——这种状态下 get_workflow、audit(op=params)、run 都用不了，而体检看不出问题。修法：用 load_workflow 传入该工作流磁盘文件的完整 JSON（包含 definitions）整图替换。',
+        { cause: error });
+    }
+  }
+  // True when the canvas can still be serialized — the single check that separates a working tab from
+  // one whose subgraph definitions went missing. Never call `graphToPrompt` for it: packs that patch
+  // serialization would take a side effect from what is supposed to be a listing.
+  function canSerialize(app) { try { rootGraphOf(app).serialize(); return true; } catch { return false; } }
+  // The same question where a broken canvas is the expected input rather than an error to report.
+  function readGraphOrNull(app) { try { return snapshot(app); } catch { return null; } }
   async function replaceCurrentWorkflow(app, workflow) {
     if (!graphReady(app)) throw new Error('ComfyUI 当前工作流正在载入，请稍后再试');
     const active = activeWorkflowOf(app);
     // Never use loadGraphData's null/string fallback: it creates temporary tabs.
     if (!active) throw new Error('ComfyUI 当前工作流尚未就绪，请稍后再试');
     const data = clone(workflow);
-    const localId = snapshot(app).id;
+    // The id only keeps this tab's own identity, and a canvas we are about to repair may be exactly the
+    // one that cannot be read — so ask for it and do not let a broken graph block the fix.
+    let localId = null;
+    try { localId = snapshot(app).id; } catch {}
     if (localId != null) data.id = localId;
     else delete data.id;
     const ds = app.canvas.ds;
@@ -129,6 +148,22 @@
       if (view && app.canvas.ds) { app.canvas.ds.scale = view.scale; app.canvas.ds.offset[0] = view.offset[0]; app.canvas.ds.offset[1] = view.offset[1]; }
       app.graph.setDirtyCanvas(true, true);
     }
+  }
+  // A restored graph that cannot be serialized leaves the tab half-dead: `get_workflow`, `audit(op=params)`
+  // and `run` all fail on it while `doctor` still reports ok, because nothing checked the canvas after our
+  // own restore (fourth-round R4-E). Verify it immediately and put the previous graph back rather than
+  // answer `restored:true` for a tab the user can no longer use.
+  async function keepCanvasUsable(app, previous) {
+    let failure = null;
+    try { rootGraphOf(app).serialize(); } catch (error) { failure = error; }
+    if (!failure) return;
+    const detail = failure?.message || String(failure);
+    if (previous) {
+      try { await replaceCurrentWorkflow(app, previous); }
+      catch { throw new Error('恢复出来的画布无法序列化（' + detail + '），退回恢复前的图也失败了：请用 load_workflow 从磁盘整图替换。'); }
+      throw new Error('恢复出来的画布无法序列化（' + detail + '）——通常是这条快照缺少 definitions 一类的顶层字段。已退回恢复前的画布，本次恢复没有生效。');
+    }
+    throw new Error('恢复出来的画布无法序列化（' + detail + '），且恢复前的画布也无法序列化，无法自动退回：请用 load_workflow 从磁盘整图替换。');
   }
   function selectSyncWorkflow(app) {
     const owner = activeWorkflowOf(app);
@@ -450,9 +485,22 @@
   // cannot be proven lossless is a corruption waiting to happen.
   const nodeIdOf = node => String(node?.id);
   function sameJson(a, b) { try { return JSON.stringify(a ?? null) === JSON.stringify(b ?? null); } catch { return false; } }
+  // Key order is not meaning. A rebuilt graph that carries the same fields in another order loads the
+  // same canvas, so the lossless test compares canonicalised JSON; requiring byte order would just
+  // refuse to compress for no reason.
+  function canonicalJson(value) {
+    if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']';
+    if (value && typeof value === 'object') return '{' + Object.keys(value).sort()
+      .map(key => JSON.stringify(key) + ':' + canonicalJson(value[key])).join(',') + '}';
+    return JSON.stringify(value ?? null);
+  }
+  function jsonEqual(a, b) { try { return canonicalJson(a) === canonicalJson(b); } catch { return false; } }
+  // Reserved patch keys: everything else in a patch is a workflow field, whatever it is called.
+  const PATCH_RESERVED = new Set(['nodes', 'removed', 'dropped']);
   function diffWorkflow(previous, next) {
     const remaining = new Map((previous?.nodes || []).map(node => [nodeIdOf(node), node]));
     const patch = { nodes: {}, removed: [] };
+    const dropped = [];
     for (const node of next?.nodes || []) {
       const key = nodeIdOf(node);
       const old = remaining.get(key);
@@ -460,12 +508,21 @@
       remaining.delete(key);
     }
     for (const key of remaining.keys()) patch.removed.push(key);
-    // Links, groups and the rest go in whole when they differ: they are small next to a prompt, and a
-    // per-link diff would be a second encoder to trust.
-    if (!sameJson(previous?.links, next?.links)) patch.links = next?.links ?? [];
-    for (const field of ['groups', 'config', 'extra', 'version', 'dsh_workflow_uuid']) {
-      if (!sameJson(previous?.[field], next?.[field])) patch[field] = next?.[field] ?? null;
+    // Every remaining top-level key goes in whole when it differs — not a whitelist of the ones we
+    // happened to think of. The whitelist version dropped `definitions`: a canvas that still holds
+    // subgraph proxies but lost their definitions cannot be serialized at all, so one undo turned the
+    // tab into a half-dead state while `doctor` stayed green (fourth-round R4-E, P0). `last_node_id`
+    // and `last_link_id` were the same bug one size down (R4-D).
+    const previousKeys = new Set(Object.keys(previous || {}));
+    const nextKeys = new Set(Object.keys(next || {}));
+    for (const key of new Set([...previousKeys, ...nextKeys])) {
+      if (key === 'nodes' || PATCH_RESERVED.has(key)) continue;
+      if (previousKeys.has(key) && !nextKeys.has(key)) { dropped.push(key); continue; }
+      if (!sameJson(previous?.[key], next?.[key])) patch[key] = next?.[key] ?? null;
     }
+    // A key that disappears has to be said out loud: `patch[key] = undefined` does not survive JSON,
+    // and writing `null` would put back a key the real graph does not have.
+    if (dropped.length) patch.dropped = dropped;
     return patch;
   }
   function applyWorkflowPatch(previous, patch) {
@@ -479,9 +536,11 @@
       if (index >= 0) merged[index] = node; else merged.push(node);
     }
     const next = { ...previous, nodes: merged };
-    for (const field of ['links', 'groups', 'config', 'extra', 'version', 'dsh_workflow_uuid']) {
-      if (patch && field in patch) next[field] = patch[field];
+    for (const [field, value] of Object.entries(patch || {})) {
+      if (PATCH_RESERVED.has(field)) continue;
+      next[field] = value;
     }
+    for (const field of patch?.dropped || []) delete next[field];
     return next;
   }
   // The state of entry `index`, rebuilt forward from whichever entry still holds a full graph.
@@ -543,7 +602,7 @@
       const candidate = { ...entry, patch }; delete candidate.workflow;
       let rebuilt = null;
       try { rebuilt = workflowAt([...list.slice(0, i), candidate], i); } catch {}
-      if (rebuilt && sameJson(rebuilt, entry.workflow)) {
+      if (rebuilt && jsonEqual(rebuilt, entry.workflow)) {
         saved += charCount(JSON.stringify(entry)) - charCount(JSON.stringify(candidate));
         list[i] = candidate;
       }
@@ -563,6 +622,19 @@
       const history = known
         ? { version: 2, undo: saved.undo, redo: saved.redo, ...(saved.expectedHash ? { expectedHash: saved.expectedHash } : {}) }
         : { version: 2, undo: [], redo: [] };
+      // Chains written before the field-generic encoder carry deltas that were built from a whitelist
+      // of top-level keys, so every one of them is suspect in exactly the way R4-E is: restoring such a
+      // step hands the canvas a graph with subgraph proxies but no `definitions`. Their full snapshots
+      // are still sound, so keep those and retire the patches that predate `codec:'fields'` rather than
+      // leave a known-lossy step one `restore_edit` away.
+      if (known && saved.codec !== 'fields') {
+        for (const list of [history.undo, history.redo]) {
+          const before = list.length;
+          list.splice(0, list.length, ...list.filter(entry => entry?.workflow));
+          history.legacyPatchesDropped = (history.legacyPatchesDropped || 0) + (before - list.length);
+        }
+      }
+      history.codec = 'fields';
       for (const list of [history.undo, history.redo]) { anchorHistoryHead(list); compactHistoryList(list); }
       trimHistory(history);
       histories.set(key, history);
@@ -598,7 +670,7 @@
     return note;
   }
   function graphHash(app) {
-    const text = fingerprint(snapshot(app)); let hash = 2166136261;
+    const text = fingerprint(readGraph(app)); let hash = 2166136261;
     for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
     return String(hash >>> 0);
   }
@@ -608,7 +680,16 @@
   function checkpoint(app, label, parent) {
     const workflow = snapshot(app);
     const entry = { id: randomUUID(), time: Date.now(), label, nodes: (workflow.nodes || []).length };
-    if (parent) entry.patch = diffWorkflow(parent, workflow);
+    const patch = parent ? diffWorkflow(parent, workflow) : null;
+    // Prove the delta at the moment it is created, not only when the chain is compacted later. The
+    // write path used to trust `diffWorkflow` blind: a field the encoder did not know about was
+    // silently missing from the patch, and the loss only surfaced as an unserializable canvas after
+    // an undo. Anything that cannot be rebuilt exactly is stored whole instead — the chain costs a
+    // little space, the user keeps a truthful undo.
+    // With the field-generic encoder no fixture can reach the fallback: every difference a JSON graph
+    // can express is a key the patch carries. Treat it as a construction guard; if it ever fires, the
+    // entry shows up as `encoded:"full"` in `list_edits`, which is the observable trace.
+    if (patch && jsonEqual(applyWorkflowPatch(parent, patch), workflow)) entry.patch = patch;
     else entry.workflow = workflow;
     return entry;
   }
@@ -690,9 +771,19 @@
   // for an arbitrary new string, and rewriting it would silently drop the references the queue
   // needs — so those are reported, never rewritten. Note the pack's own sync writes both `text`
   // and the single text part, which is why `text` is the field to compare.
-  const plainTextDoc = doc => Array.isArray(doc?.parts) && doc.parts.length === 1
-    && doc.parts[0] && typeof doc.parts[0] === 'object' && (doc.parts[0].type ?? 'text') === 'text'
-    && typeof doc.text === 'string';
+  const plainTextDoc = doc => {
+    if (!Array.isArray(doc?.parts) || !doc.parts.length) return false;
+    // Every part has to be plain text. A single-part requirement was the round-5 complaint (R5-F):
+    // AICG3D keeps a multi-paragraph plain prompt as several text parts, and the strict shape said
+    // "this write will be reverted" about a document that in fact resyncs and persists.
+    const everyText = doc.parts.every(part => typeof part === 'string'
+      || (part && typeof part === 'object' && (part.type ?? 'text') === 'text' && typeof part.text === 'string'));
+    if (!everyText) return false;
+    const joined = doc.parts.map(part => (typeof part === 'string' ? part : part.text)).join('');
+    // `text` is the field the pack's own sync compares, so when the document carries one it must agree
+    // with its parts: a doc whose `text` says more than its parts is holding something else.
+    return typeof doc.text !== 'string' || doc.text === joined;
+  };
   function shadowDocFor(node, widget, currentText = '') {
     const declared = [widget.options?.shadowDoc, widget.options?.serializedWidget,
       widget.options?.widgetName, widget.name].filter(key => typeof key === 'string' && key !== '');
@@ -922,6 +1013,44 @@
     paths.push('或改磁盘上的工作流 JSON，再用 load_workflow（workflowJson 传字符串）+ save_workflow 整图替换');
     return base + ' 可行路径：' + paths.map((p, i) => '(' + (i + 1) + ') ' + p).join('；') + '。不要重试同一调用。';
   };
+  // The quantization a Float widget applies to its own input: LiteGraph's `onFloatValueChange` rounds
+  // to `options.round` (which `useFloatWidget` derives from `step` unless the pack set a round), so
+  // writing 0.999 to a step-0.01 control lands on 1 and the read-back differs from the request by half
+  // a step. That is the panel accepting the value in its own granularity, not refusing it — rounds 5
+  // (R5-A) and 6 (R6-5) both saw it reported as `verified:false / needs_input`, and Float noise like
+  // 1.5000000000000002 is the same story one decimal further out.
+  const stepOf = widget => [widget?.options?.round, widget?.options?.step2, widget?.options?.step]
+    .find(size => typeof size === 'number' && size > 0);
+  // One rule for both read-backs — straight after the write and after the settle wait — otherwise a
+  // quantized value verifies once and then comes back as 「被改回去了」.
+  function readsBack(widget, after, value) {
+    if (String(after ?? '') === String(value)) return { verified: true };
+    if (typeof after !== 'number' || typeof value !== 'number' || !Number.isFinite(after) || !Number.isFinite(value)) return { verified: false };
+    const step = stepOf(widget);
+    const tolerance = step ? step / 2 : Number.EPSILON * Math.max(1, Math.abs(after)) * 4;
+    if (Math.abs(after - value) > tolerance) return { verified: false };
+    return { verified: true, quantized: step ? { requested: value, applied: after, step }
+      : { requested: value, applied: after, note: '浮点末位差异，画布存的是四舍五入后的值' } };
+  }
+  // The visible panel that renders a data-only control. Name matching (`ownsWidget`) is the first
+  // guess, and for AICG3D's素材库 it is not enough: the hidden `media_state` is rendered by a DOM
+  // widget called `h3_media_loader`, whose own `getValue` reads the hidden one — so the evidence that
+  // two controls show the same value is the value itself. An empty value is not evidence (that is how
+  // two unrelated editors used to be treated as interchangeable), and no candidate is reported as
+  // such rather than guessed at: a segment node's panel is only created when the user expands it.
+  function panelMirror(node, widget) {
+    const doms = (node?.widgets || []).filter(other => other !== widget && widgetKind(other) === 'dom'
+      && typeof other.options?.setValue === 'function');
+    if (!doms.length) return null;
+    const byName = doms.find(other => ownsWidget(other, widget.name));
+    if (byName) return byName;
+    let current;
+    try { current = String(widgetReadback(widget) ?? ''); } catch { return null; }
+    if (!current) return null;
+    return doms.find(other => {
+      try { return String(other.options?.getValue?.() ?? other.value ?? '') === current; } catch { return false; }
+    }) || null;
+  }
   function writeWidget(app, node, widget, value) {
     const setter = widgetSetter(widget), kind = widgetKind(widget);
     // An undeclared document is claimed by proving it mirrors this widget, and the text it mirrors
@@ -986,13 +1115,40 @@
     let after;
     try { after = widgetReadback(widget); } catch (error) { fail(error); }
     app.graph.setDirtyCanvas(true, true);
-    const verified = String(after ?? '') === String(value);
+    const read = readsBack(widget, after, value);
+    const verified = !!read.verified, quantized = read.quantized;
+    // A hidden control holds the value the queue carries; the panel the user sees is a separate DOM
+    // widget whose own `setValue` is what repaints it (comfyui-AICG3D h3easy: `h3_media_loader`
+    // `setValue: value => { media_state.value = value; mediaLoaderRender(node) }`). Data agreement is
+    // not visual agreement: round 5 wrote `media_state`, verified it, and the素材库 kept showing the
+    // old picture until the tab was reopened.
+    let panelRefreshed;
+    if (verified && (kind === 'hidden' || kind === 'shadowed')) {
+      const mirror = panelMirror(node, widget);
+      if (!mirror) panelRefreshed = 'no-dom-mirror';
+      else { try { mirror.options.setValue(value); panelRefreshed = true; } catch { panelRefreshed = false; } }
+    }
     // A document this widget cannot claim is left in place — deleting an unattributable one is
     // the irreversible mistake — but it is also the reason a verified read-back may still not be
     // what the queue carries. Naming the survivors turns a silent no-op into a visible question.
+    // A pack may keep its own private copy of the same value in `node.properties` (AICG3D writes
+    // `minimax_h3_inline_media_state` and `media_loader_state` alongside the widget). Those are not the
+    // queue's source of truth — measured: `mediaLoaderState` only falls back to the property when the
+    // widget is empty, and `media_loader_state` has no reader at all — so we do not touch them, but a
+    // caller who compares the node's properties against the canvas after a write deserves to know which
+    // copies are now stale (round 5, R5-E).
+    let propertiesStale;
+    if (verified && typeof valueBefore === 'string' && valueBefore && valueBefore !== String(value)) {
+      propertiesStale = Object.entries(node.properties || {})
+        .filter(([key, held]) => typeof held === 'string' && held === valueBefore && key !== widget.name)
+        .map(([key]) => key);
+      if (!propertiesStale.length) propertiesStale = undefined;
+    }
     const remaining = shadowAware && !cleared && !synced ? shadowDocs(node) : [];
     return { kind, via: setter ? (widget.options?.setValue ? 'dom-setter' : 'native-setter') : kind === 'plain' ? 'value+callback' : kind,
-      verified, after, cleared, synced, diverged, ...(remaining.length ? { shadowDocsRemaining: remaining } : {}),
+      verified, after, cleared, synced, diverged, panelRefreshed, ...(quantized ? { quantized } : {}),
+      ...(propertiesStale ? { propertiesStale } : {}),
+      ...(remaining.length ? { shadowDocsRemaining: remaining } : {}),
       ...(verified ? {} : { hint: writeHint(kind, node, widget) }) };
   }
   // Writing one widget can make the pack rewrite the nodes wired below it (AICG3D's prompt
@@ -1020,7 +1176,9 @@
       const edit = edits[index];
       let after; try { after = widgetReadback(edit.widget); } catch { after = edit.widget.value; }
       if (String(after ?? '') !== String(outcome.after ?? '')) {
-        outcome.after = after; outcome.verified = String(after ?? '') === String(edit.value);
+        const read = readsBack(edit.widget, after, edit.value);
+        outcome.after = after; outcome.verified = !!read.verified;
+        if (read.quantized) outcome.quantized = read.quantized;
         late.push({ nodeId: String(edit.node.id), widget: edit.widget.name, value: after, now: outcome.verified ? 'accepted' : 'overwritten' });
       }
     });
@@ -1068,9 +1226,46 @@
         ...(widgetKind(w) === 'plain' ? {} : { kind: widgetKind(w) }),
         writable: writability(w),
         ...(Array.isArray(w.options?.values) ? { choices: w.options.values } : {}),
-        ...(typeof w.options?.min === 'number' ? { min: w.options.min, max: w.options.max ?? null } : {}) })),
+        ...(typeof w.options?.min === 'number' ? { min: w.options.min, max: w.options.max ?? null } : {}),
+        // The granularity the panel applies to its own numbers. Without it a caller cannot tell a
+        // refused write from a quantized one, and 0.999 into a step-0.01 control reads as a failure
+        // (rounds 5/6: R5-A, R6-5). `round` is what LiteGraph actually rounds to; `step` is the hint
+        // the pack declared.
+        ...(stepOf(w) !== undefined ? { step: w.options?.step ?? null, round: stepOf(w) } : {}) })),
       inputs: (n.inputs || []).map((i, slot) => ({ name: i.name, type: i.type, slot, link: i.link ?? null })),
       outputs: (n.outputs || []).map((o, slot) => ({ name: o.name, type: o.type, slot, links: o.links || [] })) }));
+  }
+  // The content a save writes is `changeTracker.activeState`, not the canvas: the front-end's
+  // `ComfyWorkflowWithChangeTracker.save()`/`saveAs()` both do `this.content = JSON.stringify(this.activeState)`
+  // before hitting the disk, and `activeState` is only refreshed by `captureCanvasState()` — which
+  // early-returns on four conditions (graph not ready, a pending before-change, a state restore, a
+  // loading flag). A node that rebuilds its widget in a `requestAnimationFrame` after `onConfigure`
+  // (`ShowText|pysssss`, ~3.5s on this machine) can therefore stay missing from `activeState` for the
+  // whole session: round 6 measured `save_as_workflow` writing a file where that node's `widgets_values`
+  // had vanished entirely, while an in-place `save_workflow` of the same canvas kept it.
+  // So: give the page a frame to finish its deferred widgets, let the tracker do its own thing, and if
+  // the state that would be written still is not the canvas, put the canvas there. It is the same value
+  // `captureCanvasState` would have assigned (`clone(rootGraph.serialize())`).
+  async function refreshActiveState(app) {
+    // Only wait when the page actually has frames to wait for: a `setTimeout` fallback would delay every
+    // save for no reason, and a page without `requestAnimationFrame` has no deferred-widget mechanism
+    // either (the widgets are built synchronously there).
+    try {
+      if (typeof window.requestAnimationFrame === 'function') {
+        await new Promise(resolve => window.requestAnimationFrame(() => resolve()));
+      }
+    } catch {}
+    let canvas = null;
+    try { canvas = rootGraphOf(app).serialize(); } catch { return { ok: false, reason: '画布当前无法序列化，保存的是标签页自己持有的状态' }; }
+    const tracker = activeWorkflowOf(app)?.changeTracker;
+    if (!tracker) return { ok: false, reason: '该前端的工作流没有 changeTracker，保存走的是它自己缓存的内容' };
+    try { tracker.prepareForSave?.(); } catch {}
+    let matches = false;
+    try { matches = JSON.stringify(tracker.activeState ?? null) === JSON.stringify(canvas); } catch {}
+    if (matches) return { ok: true };
+    try { tracker.activeState = clone(canvas); }
+    catch { return { ok: false, reason: '标签页缓存的图状态无法更新，保存的内容可能比画布旧' }; }
+    return { ok: true, takenFromCanvas: true };
   }
   async function executeAction(command) {
     const app = appOf(); const args = command.args || {};
@@ -1083,7 +1278,9 @@
         if (!store.saveWorkflow || !store.saveAs) throw new Error('当前 ComfyUI 前端没有工作流保存接口');
         const name = args.name;
         if (name !== undefined && (typeof name !== 'string' || !name.trim() || name.length > 180 || /[\\/:*?"<>|\x00-\x1f]/.test(name) || /^\.+$/.test(name))) throw new Error('请提供有效的工作流文件名称');
-        active.changeTracker?.prepareForSave();
+        // Settle the deferred widgets and make sure the tab's cached state IS the canvas before anything
+        // is written to disk (R6-1: save_as lost ShowText's value; R6-2: switching tabs lost it too).
+        const stateRefresh = await refreshActiveState(app);
         const targetPath = name ? (active.directory || active.path.slice(0, active.path.lastIndexOf('/'))) + '/' + name.replace(/\.json$/i, '') + '.json' : active.path;
         if (targetPath === active.path) {
           if (command.action === 'save_as_workflow') throw new Error('另存时请使用一个新的文件名称');
@@ -1105,7 +1302,8 @@
             }
           }
         }
-        return { saved: true, workflow: describeWorkflow(store, store.activeWorkflow) };
+        return { saved: true, workflow: describeWorkflow(store, store.activeWorkflow),
+          ...(stateRefresh.ok ? {} : { saveStateWarning: '落盘的内容取自标签页缓存的图状态而非实时画布（' + stateRefresh.reason + '）：如果画布上有节点把自己的值存在延迟重建的组件里，这类值可能没进文件。' }) };
       }
       case 'edit_graph': {
         if (!Array.isArray(args.operations) || args.operations.length < 1 || args.operations.length > 100) throw new Error('operations 必须包含 1–100 项');
@@ -1158,6 +1356,8 @@
           if (added >= 0) options.values.splice(added, 1);
         }
         return { nodeId: String(node.id), widget: widget.name, value: outcome.after, via: outcome.via, verified: outcome.verified,
+          ...(outcome.quantized ? { quantized: outcome.quantized } : {}),
+          ...(outcome.panelRefreshed !== undefined ? { panelRefreshed: outcome.panelRefreshed } : {}),
           ...(reroutedFrom ? { requestedWidget: reroutedFrom, rerouted: true } : {}),
           ...(outcome.cleared ? { shadowDocsCleared: outcome.cleared } : {}),
           ...(outcome.synced ? { shadowDocsSynced: outcome.synced } : {}),
@@ -1171,6 +1371,12 @@
           // Which half of the chain this entry is: the anchor keeps the graph, the rest keep a patch.
           encoded: item.workflow ? 'full' : 'delta', chars: charCount(JSON.stringify(item))
         })), canRedo: history.redo.length > 0,
+          // Say out loud when the canvas cannot be serialized: `get_workflow`, `audit(op=params)` and
+          // `run` all need `graph.serialize()`, and a canvas whose subgraph definitions went missing
+          // cannot do it — a state `doctor` used to call fine (fourth-round R4-E). Read-only probe, and
+          // no clone: `graphToPrompt` is not called here because it can have page-side side effects
+          // (fourth-round observation R4-F).
+          serializable: canSerialize(app),
           // Undo depth is capped on purpose; say so instead of letting "only 3 checkpoints" look
           // like a bug, and show the chars this workflow currently occupies.
           // `workflowHistoryChars`, not `historyChars`: `draftStorage` reports the sum over every
@@ -1181,7 +1387,12 @@
           // The conflict notice tells the user the other page's version is backed up in the browser.
           // A promise nothing can read back is not a backup, so measure the slot here — its size,
           // age and node count, never the graph itself, which would flood the reply.
-          conflictBackup: conflictFacts()}
+          conflictBackup: conflictFacts(),
+          // Say which steps were retired and why: 「少了几步」 with no explanation reads as a new bug,
+          // while the truth is that a known-lossy delta from the old encoder is not restorable.
+          ...(history.legacyPatchesDropped ? {
+            legacyPatchesDropped: history.legacyPatchesDropped,
+            legacyNote: '这条链上有 ' + history.legacyPatchesDropped + ' 个撤销点由本插件旧版的增量编码写下，缺少 definitions 一类顶层字段，恢复它们会让画布无法序列化，因此已剔除；完整快照不受影响。想回到更早的状态请用 load_workflow 读磁盘文件。' } : {}) }
         ;
       }
       case 'restore_edit': {
@@ -1191,7 +1402,10 @@
         let workflow;
         try { workflow = workflowAt(history.undo, index); }
         catch (error) { throw new Error('该快照无法重建（' + error.message + '）：没有改动画布。可以用 list_edits 换一个快照，或 load_workflow 从磁盘整图替换。'); }
-        await replaceCurrentWorkflow(app, workflow); return { restored: true, checkpointId: history.undo[index].id, nodes: nodes(app) };
+        const previousGraph = readGraphOrNull(app);
+        await replaceCurrentWorkflow(app, workflow);
+        await keepCanvasUsable(app, previousGraph);
+        return { restored: true, checkpointId: history.undo[index].id, nodes: nodes(app) };
       }
       case 'list_workflows': {
         const store = workflowStore(app);
@@ -1233,7 +1447,11 @@
           filterHint: 'filter 同时匹配类型 / 标题 / 节点 id，' + JSON.stringify(args.filter) + ' 一个都没命中。当前画布 ' + list.length + ' 个节点，id 是 [' + list.slice(0, 20).map(n => n.id).join(', ') + (list.length > 20 ? ' …' : '') + ']。'
         } : {}) };
       }
-      case 'get_workflow': return { workflow: snapshot(app), prompt: (await app.graphToPrompt()).output };
+      // `includePrompt:false` skips `graphToPrompt()`: packs that patch serialization (AICG3D does) pay
+      // a serialization side effect on every read, and a read-only listing should not cause one
+      // (fourth-round observation R4-F). The default stays `true` so existing callers see no change.
+      case 'get_workflow': return { workflow: readGraph(app), ...(args.includePrompt === false
+        ? { prompt: null, promptSkipped: true } : { prompt: (await app.graphToPrompt()).output }) };
       case 'update_nodes': {
         const changes = args.changes;
         if (!Array.isArray(changes) || !changes.length || changes.length > 500) throw fail('changes 必须是包含 1–500 项的数组' + argNameHint(args, ['changes']),
@@ -1246,6 +1464,12 @@
           const found = (node.widgets || []).find(w => w.name === change.widget);
           if (!found || found.type === 'button') {
             const names = (node.widgets || []).filter(w => w.type !== 'button').map(w => w.name);
+            // "no such widget" is a lie about a node that has not finished building: `ShowText|pysssss`
+            // creates its display widget in a `requestAnimationFrame` after `onConfigure` (measured at
+            // ~3.5 s on this machine), so a write aimed at it right after a load came back
+            // `widget-not-found` and read like "this node cannot be changed" (round 6, R6-4).
+            if (!names.length) throw fail('可编辑参数不存在：' + change.nodeId + '.' + change.widget,
+              '节点 ' + change.nodeId + '（' + node.type + '）此刻一个控件都没有。两类原因：(1) 该包的显示控件是在 onConfigure 之后用 requestAnimationFrame 才建出来的（ShowText|pysssss 就是这样，本机实测约 3.5 秒），先 list_nodes 看它是否已出现控件、再等几秒重发同一条写入；(2) 这个节点本来就没有可写控件（注释/显示类，值由上游在运行时填）。等过一次仍为空就按 (2) 处理，换目标节点。');
             throw fail('可编辑参数不存在：' + change.nodeId + '.' + change.widget,
               '节点 ' + change.nodeId + '（' + node.type + '）的可写控件名是 [' + names.join(', ') + ']：用其中之一，或先 list_nodes detail=values 看清 name。');
           }
@@ -1311,12 +1535,28 @@
             + ' → 文档 ' + outcome.shadowDocsRemaining.join(', ')
             + (outcome.diverged ? ' 属于本控件但含结构，别用纯文本覆盖它' : ' 未归属，别改写控件名去猜它')));
         }
+        // 「写好了」and 「用户看得见」are different facts (round 5, R5-C/R5-D): the data layer can hold
+        // the new value while the panel the user is looking at still shows the old picture. Report the
+        // second dimension instead of letting a verified write answer a question it cannot ask.
+        const panelItems = state => results.filter(entry => entry.outcome.panelRefreshed === state)
+          .map(({ edit }) => ({ nodeId: String(edit.node.id), widget: edit.widget.name }));
+        const panels = { refreshed: panelItems(true), refreshFailed: panelItems(false), noVisiblePanel: panelItems('no-dom-mirror') };
+        if (panels.refreshed.length || panels.refreshFailed.length || panels.noVisiblePanel.length) {
+          panels.note = 'refreshed=同节点的可见面板已按新值重绘；noVisiblePanel=该节点此刻没有展开的面板（AICG3D 的素材库与段落面板要用户点开才创建），值已进队列，面板打开时会读新值；refreshFailed=找到了面板但它的 setValue 抛错——数据层仍是新值，面板要用户手动重开。';
+          if (panels.refreshFailed.length) {
+            warnings.push(panels.refreshFailed.length + ' 处面板刷新失败（panels.refreshFailed）：画布与队列已是新值，但用户眼前的面板还是旧内容，别把它当成没写进去而重发同一批。');
+            nextSteps.push(...panels.refreshFailed.map(item => 'node ' + item.nodeId + '.' + item.widget + ' → 让用户重开该面板即可，数据不必重写'));
+          }
+        }
         return {
           changed: results.map(({ edit, outcome }) => ({
             nodeId: String(edit.node.id), widget: edit.widget.name,
             ...(edit.reroutedFrom ? { requestedWidget: edit.reroutedFrom, rerouted: true } : {}),
             ...(edit.sameName > 1 ? { sameNameWidgets: edit.sameName } : {}),
             before: edit.before, after: outcome.after, via: outcome.via, verified: outcome.verified,
+            ...(outcome.quantized ? { quantized: outcome.quantized } : {}),
+            ...(outcome.panelRefreshed !== undefined ? { panelRefreshed: outcome.panelRefreshed } : {}),
+            ...(outcome.propertiesStale ? { propertiesStale: outcome.propertiesStale } : {}),
             ...(outcome.cleared ? { shadowDocsCleared: outcome.cleared } : {}),
             ...(outcome.synced ? { shadowDocsSynced: outcome.synced } : {}),
             ...(outcome.diverged ? { shadowDocsDiverged: outcome.diverged } : {}),
@@ -1326,6 +1566,7 @@
             ...(outcome.hint ? { hint: outcome.hint } : {})
           })),
           ...(wiredInputs.length ? { wiredInputs } : {}),
+          ...(panels.note ? { panels } : {}),
           ...(revertedWrites.length ? { revertedWrites } : {}),
           ...followUp,
           // One sentence per cause actually present, joined — never one clause describing a set with
@@ -1354,8 +1595,9 @@
         const history = clone(historyOf(app));
         const source = command.action === 'undo' ? history.undo : history.redo;
         if (!source.length) throw new Error('当前工作流已切换或没有可' + (command.action === 'undo' ? '撤销' : '重做') + '的 AI 修改');
-        if (history.expectedHash && history.expectedHash !== graphHash(app)) throw new Error('工作流又被手动或其他页面修改了，请先 list_edits，再明确使用 restore_edit 恢复所需快照');
-        const before = snapshot(app);
+        if (history.expectedHash && history.expectedHash !== graphHash(app)) throw new Error(
+          '画布在上一次工具写入之后又变了，所以「按顺序撤销」的基准已经不成立。变的人不一定是你：可能是网页上的手动修改，也可能是节点包在加载或序列化之后自己重填了参数（本机实测 AICG3D 的段落解析在加载后约 0.3 秒重写 prompt/秒数/种子，且无视 auto_fill=false）。撤销链本身没有坏——用 list_edits 看快照，再用 restore_edit 明确指定要回到哪一步。');
+        const before = readGraph(app);
         // The reverse step goes onto the opposite list; its parent is that list's current tail, so
         // both chains stay rebuildable forward from their own anchor.
         const target = command.action === 'undo' ? history.redo : history.undo;
@@ -1365,9 +1607,12 @@
           const restoredWorkflow = workflowAt(source, index);
           source.pop();
           await replaceCurrentWorkflow(app, restoredWorkflow);
+          // Same guard as `restore_edit`: an undo that hands back a canvas which cannot be serialized
+          // is worse than no undo, and the failure used to surface only as the next tool call dying.
+          await keepCanvasUsable(app, before);
           target.push(reverse); anchorHistoryHead(target);
           history.expectedHash = graphHash(app); saveHistory(app, history);
-        } catch (error) { await replaceCurrentWorkflow(app, before); throw error; }
+        } catch (error) { await replaceCurrentWorkflow(app, before).catch(() => {}); throw error; }
         return { restored: true, nodes: nodes(app) };
       }
       case 'audit_graph': {
@@ -1389,6 +1634,10 @@
           // The serialized prompt is the only evidence of what the queue would actually carry.
           ...serialized,
           linkCount: linkCount(app.graph),
+          // Whether the graph still serializes. A canvas holding subgraph proxies without their
+          // `definitions` fails here, and every downstream tool (`get_workflow`, `audit(op=params)`,
+          // `run`) with it — the structural audit alone cannot see that, so state it as a fact (R4-E).
+          serializable: canSerialize(app),
           workflowPath: activeWorkflowOf(app)?.path ?? null,
           // The canvas autosaves itself into localStorage; when that quota is full the front-end
           // throws a toast and stops persisting for the rest of the session. The tool side cannot
@@ -1464,6 +1713,33 @@
       + '带 stack 且指向前端或自定义节点包 setter 的才是页面异常，那种情况别重复同一调用，改用该包自带的写入入口或整图替换（load_workflow）。';
     return reply;
   }
+  // The front-end decides "this tab has unsaved changes" from mouse, keys and LiteGraph's canvas
+  // events — `ChangeTracker.init()` hooks `keydown/keyup/mouseup`, `processMouseUp`,
+  // `ContextMenu.close`, and the `litegraph:canvas` before/after-change pair. A bridge write touches
+  // none of them, so the canvas changed while the tab still said 「已保存」 and nothing warned before a
+  // tab switch or page close (round 5, R5-B). Three APIs, in the order the page itself uses:
+  //   graph.incrementVersion()  — LGraph's own counter (`_version`), what serialization compares;
+  //   canvas.emitAfterChange()  — the `litegraph:canvas` event ChangeTracker listens to; only `after`
+  //     is emitted on purpose, because `captureCanvasState()` returns while `changeCount > 0`, so a
+  //     `before` without its matching `after` would wedge the tracker for the session;
+  //   tracker.captureCanvasState() — the belt to that brace: it recomputes `activeState` and sets
+  //     `isModified` from `graphEqual(initialState, activeState)`.
+  // Each is optional and each is guarded: an older front-end without the API, or a tracker belonging to
+  // another tab (its inactive-call path only console.errors), must never fail a write that worked.
+  function markCanvasDirty(app) {
+    let versioned = false, tracked = false;
+    try {
+      const graph = rootGraphOf(app);
+      if (typeof graph?.incrementVersion === 'function') { graph.incrementVersion(); versioned = true; }
+      if (typeof app.canvas?.emitAfterChange === 'function') app.canvas.emitAfterChange();
+    } catch {}
+    try { app.graph?.change?.(); } catch {}
+    try {
+      const tracker = activeWorkflowOf(app)?.changeTracker;
+      if (typeof tracker?.captureCanvasState === 'function') { tracker.captureCanvasState(); tracked = true; }
+    } catch {}
+    return { versioned, tracked };
+  }
   async function handleCommands() {
     if (busy || handlingCommands) return;
     handlingCommands = true;
@@ -1481,7 +1757,21 @@
             }
             reply = { id: command.id, result: await execute(command) };
             // A write must always be published, whatever the counter says about it.
-            if (writesCanvas) { forceSync = true; await syncWorkflow(appOf()); }
+            if (writesCanvas) {
+              // Tell the page its own tab is now dirty before publishing, so the tab badge, the
+              // leave-page warning and the next `graphChanged` all see this write (R5-B). What gets
+              // reported is the front-end's own answer — `isModified` — not whether our calls ran.
+              const marks = markCanvasDirty(appOf());
+              const saved = command.action === 'save_workflow' || command.action === 'save_as_workflow';
+              const modified = activeWorkflowOf(appOf())?.isModified === true;
+              if (reply.result && typeof reply.result === 'object' && !Array.isArray(reply.result)) {
+                reply.result.dirtyMarked = saved ? false : modified;
+                if (!saved && !modified) reply.result.dirtyNote = marks.tracked
+                  ? '标签页没有标为「未保存」，通常是这次写入与已保存的内容本来就相同；要落盘仍需 save_workflow。'
+                  : '这个前端没有变更追踪接口，标签页不会显示「未保存」：画布内容已改，切标签或关页面前请先 save_workflow。';
+              }
+              forceSync = true; await syncWorkflow(appOf());
+            }
           }
           catch (e) {
             if (commandEditSequence !== undefined && commandEditSequence === editSequence) localAuthority = previousAuthority;

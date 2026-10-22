@@ -112,6 +112,23 @@ test('a widget-backed input slot with no link is not an unwired required input',
   assert.equal(result.checks.find(check => check.id === 'param-values'), undefined);
 });
 
+test('a canvas that cannot serialize is a hard failure, and an old bridge is not judged for it', () => {
+  const healthy = { nodes: [node(1, 'CheckpointLoaderSimple'), node(2, 'SaveImage', { inputs: [{ name: 'images', type: 'IMAGE', link: 9 }] })], linkCount: 1 };
+  const blocked = auditGraph({ page: { ...healthy, serializable: false }, defs });
+  assert.equal(blocked.verdict, 'refuted', 'the queue is built from graph.serialize(), so nothing can run');
+  const serializable = blocked.checks.find(c => c.id === 'graph-serializable');
+  assert.equal(serializable.verdict, 'refuted');
+  assert.match(serializable.hint, /definitions/);
+  assert.match(serializable.hint, /load_workflow/, 'and the hint gives the one action that fixes it');
+
+  // A page predating the fact reports nothing: "unknown" must not become "broken".
+  const silent = auditGraph({ page: healthy, defs });
+  assert.equal(silent.checks.find(c => c.id === 'graph-serializable'), undefined);
+  assert.equal(silent.verdict, 'supported');
+  assert.equal(auditGraph({ page: { ...healthy, serializable: true }, defs })
+    .checks.find(c => c.id === 'graph-serializable').verdict, 'supported');
+});
+
 test('graph audit separates intentional bypass, shadowed widgets and a missing saver', () => {
   const healthy = { nodes: [node(1, 'CheckpointLoaderSimple'), node(2, 'SaveImage', { inputs: [{ name: 'images', type: 'IMAGE', link: 9 }] })], linkCount: 1 };
   assert.equal(auditGraph({ page: healthy, defs }).verdict, 'supported');

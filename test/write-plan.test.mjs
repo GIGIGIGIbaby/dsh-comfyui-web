@@ -203,6 +203,25 @@ test('the settle evidence reaches the caller, not only the page result', () => {
   assert.deepEqual(envelope.ambiguousTargets.map(item => item.sameName), [2]);
 });
 
+test('the panel state and the tab modified flag reach the caller too', () => {
+  // Round 5 (R5-D): the page answers 「用户看得见吗」 and 「标签页标未保存了吗」, and the MCP envelope
+  // dropped both — a caller reading only the reply could not tell a repainted panel from a stale one.
+  const envelope = writeEnvelope({
+    changed: [{ nodeId: '189', widget: 'media_state', before: 'v1', after: 'v2', via: 'native-setter',
+      verified: true, panelRefreshed: true, quantized: { requested: 0.999, applied: 1, step: 0.01 } }],
+    panels: { refreshed: [{ nodeId: '189', widget: 'media_state' }], refreshFailed: [], noVisiblePanel: [], note: '…' },
+    dirtyMarked: true, warning: 'x'
+  }, [{ nodeId: 189, widget: 'media_state', value: 'v2' }]);
+  assert.deepEqual(envelope.panels.refreshed, [{ nodeId: '189', widget: 'media_state' }]);
+  assert.equal(envelope.dirtyMarked, true);
+  assert.equal(envelope.changed[0].panelRefreshed, true, 'the per-item facts travel inside changed[]');
+  assert.equal(envelope.changed[0].quantized.step, 0.01);
+
+  const quiet = writeEnvelope({ changed: [{ nodeId: '1', widget: 'steps', after: 20, via: 'value+callback', verified: true }] }, []);
+  assert.equal(quiet.panels, undefined, 'a plain parameter write invents no panel story');
+  assert.equal(quiet.dirtyMarked, undefined);
+});
+
 test('the draft store is described honestly whether it was measurable or not', () => {
   const unreadable = draftEnvelope({ available: false, blocking: '当前页面没有可枚举的 localStorage' });
   assert.equal(unreadable.unavailable, '当前页面没有可枚举的 localStorage');

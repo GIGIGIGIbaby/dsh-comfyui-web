@@ -13,10 +13,21 @@ const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(r => 
 async function boot(nodes, options = {}) {
   const code = (await readFile(new URL('../bridge.js', import.meta.url), 'utf8')).replace('__DSH_BRIDGE_TOKEN__', '"test"');
   const timers = [], replies = [], commands = [];
+  // Top-level graph fields the bridge must carry through its undo chain. The real `serialize()` emits
+  // `definitions`, `last_node_id`, `last_link_id`, `floatingLinks`… and a delta encoder that only knows
+  // a whitelist of them loses whatever is not on the list — the fourth-round P0 (R4-E): a canvas left
+  // with subgraph proxies and no `definitions` cannot be serialized at all. The fake models that rule
+  // so the tests fail the way the page would, not merely differ in JSON.
   const graph = {
     _nodes: nodes, links: options.links || [],
-    serialize: () => ({ nodes: nodes.map(n => ({ id: n.id, type: n.type, widgets_values: (n.widgets || []).map(w => w.value),
-      mode: n.mode ?? 0, properties: n.properties ?? {} })), links: graph.links, groups: [] }),
+    fields: { last_node_id: Math.max(0, ...nodes.map(node => node.id)), last_link_id: 0, ...(options.fields || {}) },
+    serialize: () => {
+      if (!graph.fields.definitions && nodes.some(node => node.type === 'SubgraphProxyFixture')) {
+        throw new TypeError('Attempted to access LGraph reference that was null or undefined.');
+      }
+      return { nodes: nodes.map(n => ({ id: n.id, type: n.type, widgets_values: (n.widgets || []).map(w => w.value),
+        mode: n.mode ?? 0, properties: n.properties ?? {} })), links: graph.links, groups: [], ...graph.fields };
+    },
     // `onDirty` runs inside the settle window: the bridge marks the canvas dirty as the last step of
     // a write, and only then waits for the page's debounce, so this is the deterministic place to
     // reproduce a pack taking the value back after the write-time read-back already matched.
@@ -40,6 +51,10 @@ async function boot(nodes, options = {}) {
       });
       nodes.length = 0; nodes.push(...rebuilt);
       graph.links = data?.links || [];
+      // The page owns its top-level fields: loading a graph without `definitions` really does leave the
+      // canvas without them, which is the state the guard below has to catch.
+      graph.fields = Object.fromEntries(Object.entries(data || {})
+        .filter(([key, value]) => !['nodes', 'links', 'groups'].includes(key) && value !== undefined));
       return true;
     },
     async graphToPrompt() {
@@ -47,7 +62,10 @@ async function boot(nodes, options = {}) {
       return { output: options.promptOutput || {} };
     } };
   vm.runInContext(code, vm.createContext({
-    window: { parent: { postMessage() {} }, comfyAPI: { app: { app } }, addEventListener() {}, LiteGraph: { createNode: () => null } },
+    window: { parent: { postMessage() {} }, comfyAPI: { app: { app } }, addEventListener() {}, LiteGraph: { createNode: () => null },
+      // Nodes like `ShowText|pysssss` build their display widget a frame after `onConfigure`; a save
+      // has to give them that frame or it writes a state that predates the widget (round 6, R6-1).
+      ...(options.requestAnimationFrame ? { requestAnimationFrame: options.requestAnimationFrame } : {}) },
     crypto: { randomUUID: () => 'u' + Math.random() }, URL, URLSearchParams, console,
     location: { origin: 'http://comfy.test', search: '?dsh_client=p&dsh_session=own', href: 'http://comfy.test/' },
     document: { referrer: 'http://dsh.test/', visibilityState: 'visible', addEventListener() {} },
@@ -60,7 +78,7 @@ async function boot(nodes, options = {}) {
     }
   }));
   await flush();
-  return async (action, args = {}) => {
+  const run = async (action, args = {}) => {
     commands.push({ id: 'c' + (replies.length + 1), action, args });
     // A write can park on the 600ms settle window, so keep running whatever the bridge queued
     // until the reply lands instead of firing exactly one timer and assuming it is done.
@@ -76,6 +94,9 @@ async function boot(nodes, options = {}) {
     if (reply?.error) throw Object.assign(new Error(reply.error), { bridgeError: reply.error, hint: reply.hint, stackTrace: reply.stack });
     return reply.result;
   };
+  // Callable as before, plus the page handles a test needs to move the graph under the bridge's feet.
+  run.graph = graph; run.app = app; run.nodes = nodes;
+  return run;
 }
 
 const plainNode = () => ({ id: 1, type: 'KSampler', title: '', mode: 0, properties: {},
@@ -860,4 +881,371 @@ test('a chain with no anchor anywhere is dropped rather than restored from a gue
   const edits = await command('list_edits');
   assert.equal(edits.checkpoints.length, 0, 'an un-anchorable entry is not offered back as restorable');
   assert.equal(promptsOf(nodes), before, 'the canvas was not touched');
+});
+
+// R4-E / R4-D. The delta encoder used to compare a whitelist of seven top-level keys, so a workflow
+// with subgraphs lost `definitions` the moment its checkpoint chain went through a patch — and a canvas
+// holding subgraph proxies without their definitions cannot be serialized at all. One ordinary undo
+// turned the tab half-dead (`get_workflow`, `audit(op=params)` and `run` all failing) while `doctor`
+// still reported ok. These fixtures reproduce the front-end's own rule, so a lossy chain fails the way
+// the page would rather than merely differing in JSON.
+
+const subgraphGraph = () => ({ id: 'a67caa28-0000-0000-0000-000000000001', name: 'FLUX 子图',
+  nodes: [{ id: 86, type: 'PrimitiveInt', title: 'seed', widgets_values: [432262096973490] }], links: [], inputs: [], outputs: [] });
+const proxyNode = () => ({ id: 31, type: 'SubgraphProxyFixture', title: '子图', mode: 0, properties: {},
+  widgets: [{ name: 'seed', type: 'number', value: 5, options: {}, callback() {} }], inputs: [], outputs: [] });
+const savedWorkflow = (promptValue, fields) => ({
+  nodes: [{ id: 21, type: 'AICG3D_H3SequenceSegment', mode: 0, properties: {}, widgets_values: [promptValue, 20] },
+    { id: 31, type: 'SubgraphProxyFixture', mode: 0, properties: {}, widgets_values: [5] }],
+  links: [], groups: [], last_node_id: 31, last_link_id: 0, ...fields });
+const withDefinitions = { definitions: { subgraphs: [subgraphGraph()] } };
+
+test('an undo restores definitions, the id counters and a field the encoder never heard of', async () => {
+  const nodes = [...promptNodes(2), proxyNode()];
+  const command = await boot(nodes, { fields: { ...withDefinitions, floatingLinks: [], zzzFutureField: { kept: true } } });
+
+  await command('update_nodes', { changes: [{ nodeId: 21, widget: 'prompt', value: bigPrompt('W') }] });
+  // The page moves these between the two writes exactly like a real pack does on load: counters
+  // advance, the subgraph's own widget values get refilled.
+  command.graph.fields.last_node_id = 905;
+  command.graph.fields.last_link_id = 420;
+  command.graph.fields.definitions.subgraphs[0].nodes[0].widgets_values = [1];
+  command.graph.fields.zzzFutureField = { kept: false, added: 'now' };
+  await command('update_nodes', { changes: [{ nodeId: 22, widget: 'steps', value: 33 }] });
+
+  const edits = await command('list_edits');
+  assert.deepEqual(edits.checkpoints.map(item => item.encoded), ['delta', 'full'],
+    'carrying every field must not cost the compression: the newest step is still a patch');
+  assert.equal(edits.serializable, true);
+
+  await command('undo');
+  assert.equal(command.graph.fields.last_node_id, 905, 'R4-D: the node counter comes back');
+  assert.equal(command.graph.fields.last_link_id, 420, 'R4-D: and so does the link counter');
+  // Compared as JSON: the restored object was built inside the page's realm, and a cross-realm
+  // deepEqual fails on prototype identity while the value is identical.
+  assert.equal(JSON.stringify(command.graph.fields.definitions.subgraphs[0].nodes[0].widgets_values), '[1]',
+    'R4-E: the subgraph definition comes back as it was');
+  assert.equal(JSON.stringify(command.graph.fields.zzzFutureField), '{"kept":false,"added":"now"}',
+    'a key nobody enumerated is carried just the same');
+  assert.equal(nodes.find(node => node.id === 22).widgets[1].value, 20, 'the refused write is gone again');
+  assert.equal(nodes.find(node => node.id === 21).widgets[0].value, bigPrompt('W'));
+  assert.equal(command.graph.serialize().nodes.length, 3, 'and the canvas still serializes — no proxy left without definitions');
+
+  await command('undo');
+  assert.equal(command.graph.fields.last_node_id, 31, 'the anchor holds the state from before the first write');
+  assert.equal(JSON.stringify(command.graph.fields.definitions.subgraphs[0].nodes[0].widgets_values), '[432262096973490]');
+});
+
+test('a field the graph loses is recorded as lost, not left behind from the parent', async () => {
+  const nodes = promptNodes(1);
+  const command = await boot(nodes, { fields: withDefinitions });
+  await command('update_nodes', { changes: [{ nodeId: 21, widget: 'steps', value: 24 }] });
+  delete command.graph.fields.definitions;                    // the page drops the key entirely
+  await command('update_nodes', { changes: [{ nodeId: 21, widget: 'steps', value: 25 }] });
+
+  const edits = await command('list_edits');
+  await command('restore_edit', { checkpointId: edits.checkpoints[0].checkpointId });
+  assert.equal('definitions' in command.graph.fields, false, 'the newer snapshot really has no definitions');
+  await command('restore_edit', { checkpointId: edits.checkpoints.at(-1).checkpointId });
+  assert.ok(command.graph.fields.definitions, 'restoring the older step puts the key back instead of inheriting it');
+});
+
+test('steps written by the old whitelist encoder are retired, not offered back as restorable', async () => {
+  const nodes = [...promptNodes(1), proxyNode()];
+  // A chain as the buggy build left it: an anchor plus a patch that was built from the whitelist, so
+  // it carries nodes/links/groups and nothing else. Rebuilding it yields a canvas with proxies and no
+  // definitions — precisely the state that cannot be serialized.
+  const lossyPatch = { nodes: { 21: { id: 21, type: 'AICG3D_H3SequenceSegment', mode: 0, properties: {},
+      widgets_values: [bigPrompt('new'), 20] } }, removed: [], links: [], groups: [] };
+  const store = fakeStorage({ [HISTORY_KEY]: JSON.stringify({ version: 2, savedAt: Date.now(), expectedHash: null,
+    undo: [{ id: 'cp-1', time: Date.now() - 3000, label: 'load_workflow', nodes: 2, workflow: savedWorkflow(bigPrompt('old'), withDefinitions) },
+      { id: 'cp-2', time: Date.now() - 2000, label: 'update_nodes', nodes: 2, patch: lossyPatch }], redo: [] }) });
+  const command = await boot(nodes, { localStorage: store, fields: withDefinitions });
+  const before = promptsOf(nodes);
+
+  const edits = await command('list_edits');
+  assert.deepEqual(edits.checkpoints.map(item => item.checkpointId), ['cp-1'], 'only the provably sound step survives');
+  assert.equal(edits.legacyPatchesDropped, 1, 'and the caller is told a step was retired, not that it never existed');
+  assert.match(edits.legacyNote, /definitions/);
+  assert.equal(edits.serializable, true);
+  assert.equal(promptsOf(nodes), before, 'reading the chain did not touch the canvas');
+  await assert.rejects(() => command('restore_edit', { checkpointId: 'cp-2' }), /没有该快照/);
+  await command('restore_edit', { checkpointId: 'cp-1' });
+  assert.equal(nodes.find(node => node.id === 21).widgets[0].value, bigPrompt('old'), 'the surviving anchor still restores');
+  assert.equal(promptsOf(nodes).includes(bigPrompt('new')), false, 'the retired patch is not reachable by any path');
+  // A second page load pays the repair only once: the record now declares the codec that can be trusted.
+  const again = await boot(nodes, { localStorage: store, fields: withDefinitions });
+  const second = await again('list_edits');
+  assert.equal(second.checkpoints.length, 2, 'the anchor plus the step the restore itself recorded — nothing else retired');
+  assert.ok(second.checkpoints.some(item => item.checkpointId === 'cp-1'), 'the surviving anchor is still offered');
+  assert.equal(second.legacyPatchesDropped, undefined, 'the migration is one-time, not a permanent tax');
+});
+
+test('a restore that would leave the canvas unserializable is refused and rolled back', async () => {
+  const nodes = [...promptNodes(1), proxyNode()];
+  // Both entries are full snapshots under a trustworthy codec, so the migration leaves them alone;
+  // the newer one is simply a graph without definitions, as if it came from a file saved by something
+  // else. Compaction may still fold it — a patch that loses the key must lose it faithfully.
+  const store = fakeStorage({ [HISTORY_KEY]: JSON.stringify({ version: 2, codec: 'fields', savedAt: Date.now(), expectedHash: null,
+    undo: [{ id: 'cp-1', time: Date.now() - 3000, label: 'load_workflow', nodes: 2, workflow: savedWorkflow(bigPrompt('A'), withDefinitions) },
+      { id: 'cp-2', time: Date.now() - 2000, label: 'load_workflow', nodes: 2, workflow: savedWorkflow(bigPrompt('B'), {}) }], redo: [] }) });
+  const command = await boot(nodes, { localStorage: store, fields: withDefinitions });
+
+  const edits = await command('list_edits');
+  assert.deepEqual(edits.checkpoints.map(item => item.checkpointId), ['cp-2', 'cp-1'], 'no step is retired here');
+  assert.equal(edits.legacyPatchesDropped, undefined, 'a chain that declares the trustworthy codec is not touched');
+  await assert.rejects(() => command('restore_edit', { checkpointId: 'cp-2' }), /无法序列化/);
+  assert.ok(command.graph.fields.definitions, 'the canvas is back in the state that still works');
+  assert.equal(nodes.find(node => node.id === 21).widgets[0].value, bigPrompt('init0'), 'the refused restore left no half-applied graph');
+  assert.equal((await command('list_edits')).serializable, true, 'and the tab is usable again');
+});
+
+test('a canvas that cannot serialize is explained as a missing definitions, not a dead bridge', async () => {
+  const nodes = [...promptNodes(1), proxyNode()];
+  const command = await boot(nodes, { fields: withDefinitions });
+  delete command.graph.fields.definitions;                    // e.g. a file that was edited outside
+
+  await assert.rejects(() => command('get_workflow'), /definitions.*load_workflow/s);
+  const edits = await command('list_edits');
+  assert.equal(edits.serializable, false, 'the listing says what is wrong instead of letting the next call die');
+});
+
+test('get_workflow can skip graphToPrompt, which some packs patch for side effects', async () => {
+  const command = await boot(promptNodes(1, 'p'));
+  let calls = 0;
+  command.app.graphToPrompt = async () => { calls += 1; return { output: { 21: { class_type: 'AICG3D_H3SequenceSegment' } } }; };
+
+  const skipped = await command('get_workflow', { includePrompt: false });
+  assert.equal(calls, 0, 'asking for the graph alone must not pay for a serialization');
+  assert.equal(skipped.prompt, null); assert.equal(skipped.promptSkipped, true);
+  assert.equal(skipped.workflow.nodes.length, 1, 'the workflow itself still arrives');
+
+  const whole = await command('get_workflow', {});
+  assert.equal(calls, 1, 'the documented default is unchanged');
+  assert.deepEqual(whole.prompt, { 21: { class_type: 'AICG3D_H3SequenceSegment' } });
+});
+
+// ---------------------------------------------------------------- saving what the canvas actually holds.
+// `ComfyWorkflowWithChangeTracker.save()` writes `JSON.stringify(this.activeState)`, not the graph, and
+// `captureCanvasState()` — the only thing that refreshes `activeState` — early-returns while a change is
+// pending, a restore is running or the graph is not "ready". A node that builds its display widget in a
+// `requestAnimationFrame` after `onConfigure` (`ShowText|pysssss`, measured at ~3.5 s on this machine)
+// can therefore stay absent from `activeState` for the whole session: round 6 (R6-1) saved a copy and the
+// node's `widgets_values` disappeared from the file, while an in-place save of the same canvas kept it.
+
+test('a save hands the disk the canvas, even when a node only builds its widget a frame later', async () => {
+  const text = 'x'.repeat(533);
+  const shown = { id: 11, type: 'ShowText|pysssss', title: '', mode: 0, properties: {}, widgets: [], inputs: [], outputs: [] };
+  let frames = 0;
+  // The fake stands in for one frame boundary: the pack builds its display widget inside its own
+  // `requestAnimationFrame` (pysssss does exactly that), and the page resumes what it awaited after.
+  const command = await boot([shown], { requestAnimationFrame: fn => {
+    frames += 1;
+    shown.widgets = [{ name: 'text_0', type: 'string', value: text, options: {}, callback() {} }];
+    fn();
+  } });
+  const store = command.app.extensionManager.workflow, active = store.activeWorkflow;
+  store.getWorkflowByPath = path => store.openWorkflows.find(item => item.path === path);
+  store.createNewTemporary = () => { throw new Error('unused'); };
+  active.directory = 'workflows';
+  // The tracker holds the state the tab cached BEFORE the deferred widget existed, and its own capture
+  // does nothing — blocked by `changeCount > 0`, which is the shape round 6 measured. The workflow
+  // delegates the way the front-end does (`get activeState() { return this.changeTracker?.activeState }`).
+  const stale = JSON.parse(JSON.stringify(command.graph.serialize()));
+  active.changeTracker = { activeState: stale, prepareForSave() {} };
+  Object.defineProperty(active, 'activeState', { configurable: true, get() { return this.changeTracker?.activeState ?? null; } });
+  assert.deepEqual(active.activeState.nodes[0].widgets_values, [], 'the cached state has no widget yet');
+  let written = null;
+  store.saveWorkflow = async workflow => { written = JSON.parse(JSON.stringify(workflow.activeState)); };
+  store.saveAs = () => { throw new Error('unused in this test'); };
+
+  const reply = await command('save_workflow');
+  assert.equal(frames, 1, 'the save gave the page a frame for its deferred widgets');
+  assert.equal(shown.widgets.length, 1, 'and the node did build its widget in it');
+  assert.equal(written.nodes[0].widgets_values[0], text, 'so the file carries the 533 characters instead of losing them');
+  assert.equal(reply.saved, true);
+  assert.equal(reply.saveStateWarning, undefined, 'a state that had to be taken from the canvas is not a warning');
+});
+
+test('a save says so when the tab state cannot be reconciled with the canvas', async () => {
+  const shown = { id: 11, type: 'ShowText|pysssss', title: '', mode: 0, properties: {},
+    widgets: [{ name: 'text_0', type: 'string', value: 'already built', options: {}, callback() {} }], inputs: [], outputs: [] };
+  const command = await boot([shown]);
+  const store = command.app.extensionManager.workflow;
+  store.getWorkflowByPath = path => store.openWorkflows.find(item => item.path === path);
+  store.createNewTemporary = () => { throw new Error('unused'); };
+  store.saveWorkflow = async () => {};
+  store.saveAs = () => { throw new Error('unused in this test'); };
+  // No changeTracker at all: nothing can be corrected here, and pretending otherwise is how the value
+  // used to go missing silently.
+  const reply = await command('save_workflow');
+  assert.equal(reply.saved, true, 'the save still happens — refusing it would be worse than warning');
+  assert.match(reply.saveStateWarning, /changeTracker/);
+});
+
+// ---------------------------------------------------------------- what a write looks like to the user.
+// Round 5's three write-path findings, each with the page behaviour it was written against:
+// R5-A a Float widget quantizes its own input, so 0.999 becomes 1 and the read-back "disagrees";
+// R5-B a bridge write touches none of the events the tab's change tracker listens to, so the tab goes
+//      on saying 「已保存」 while the canvas holds values nobody persisted;
+// R5-C the queue reads a hidden control while the user reads a DOM panel that repaints only through
+//      that panel's own `setValue`, so a verified write can still look like nothing happened.
+
+const floatNode = (options = {}) => ({ id: 78, type: 'KSampler', title: '', mode: 0, properties: {},
+  widgets: [{ name: 'denoise', type: 'number', value: 0.9, options: { min: 0, max: 1, step: 0.01, ...options },
+    // LiteGraph's own `onFloatValueChange`: round to the step, then `Number(x.toFixed(p))`.
+    callback(value) { const step = this.options.step;
+      this.value = Number((Math.round(value / step) * step).toFixed(2)); } }],
+  inputs: [], outputs: [] });
+
+test('a value the panel quantizes is an accepted write, and says what was applied', async () => {
+  const command = await boot([floatNode()]);
+  const reply = await command('update_nodes', { changes: [{ nodeId: 78, widget: 'denoise', value: 0.999 }] });
+  assert.equal(reply.changed[0].verified, true, 'half a step away is the panel accepting the value, not refusing it');
+  assert.equal(reply.changed[0].after, 1);
+  assert.equal(JSON.stringify(reply.changed[0].quantized), JSON.stringify({ requested: 0.999, applied: 1, step: 0.01 }));
+  assert.equal(reply.warning, undefined, 'and the batch must not be marked needs_input over it');
+  const listed = await command('list_nodes', { detail: 'values' });
+  assert.equal(listed.nodes[0].widgets[0].step, 0.01, 'the granularity is visible before the write, not only after');
+  assert.equal(listed.nodes[0].widgets[0].round, 0.01);
+
+  // A genuinely refused write still reports false: the difference there is bigger than the step.
+  const stubbornWidget = { name: 'denoise', type: 'number', options: { min: 0, max: 1, step: 0.01 }, callback() {} };
+  let held = 0.9;
+  Object.defineProperty(stubbornWidget, 'value', { get: () => held, set: () => {} });
+  const stubborn = await boot([{ id: 78, type: 'KSampler', title: '', mode: 0, properties: {},
+    widgets: [stubbornWidget], inputs: [], outputs: [] }]);
+  const kept = await stubborn('update_nodes', { changes: [{ nodeId: 78, widget: 'denoise', value: 0.5 }] });
+  assert.equal(kept.changed[0].verified, false, 'a value that stays where it was is still a failure');
+  assert.equal(kept.changed[0].quantized, undefined);
+});
+
+test('a write to the data layer also repaints the panel the user is looking at', async () => {
+  const state = { id: 189, type: 'AICG3D_H3Loader', title: '', mode: 0,
+    // The pack's own private copies of the same value. They are not what the queue carries
+    // (`mediaLoaderState` reads the hidden widget and falls back to the property only when it is empty,
+    // and `media_loader_state` has no reader at all), so the bridge leaves them alone — but names them,
+    // because a caller comparing properties against the canvas would otherwise read the write as failed
+    // (round 5, R5-E).
+    properties: { media_loader_state: '{"images":["old.png"]}', minimax_h3_inline_media_state: '{"images":["old.png"]}' },
+    widgets: [], inputs: [], outputs: [] };
+  const media = { name: 'media_state', type: 'string', value: '{"images":["old.png"]}', options: { serialize: false }, callback() {} };
+  const repaints = [];
+  const panel = { name: 'h3_media_loader', type: 'h3_media_loader', value: media.value, options: {
+    // The pair AICG3D registers: `getValue` reads the hidden widget, `setValue` writes it and renders.
+    getValue: () => media.value,
+    setValue: value => { media.value = String(value); repaints.push(value); } }, callback() {} };
+  state.widgets = [media, panel];
+  const command = await boot([state]);
+
+  const reply = await command('update_nodes', { changes: [{ nodeId: 189, widget: 'media_state', value: '{"images":["new.png"]}' }] });
+  assert.equal(reply.changed[0].verified, true);
+  assert.equal(reply.changed[0].panelRefreshed, true, 'the visible panel was driven through its own setValue');
+  assert.equal(JSON.stringify(repaints), JSON.stringify(['{"images":["new.png"]}']));
+  assert.equal(JSON.stringify(reply.panels.refreshed), JSON.stringify([{ nodeId: '189', widget: 'media_state' }]));
+  assert.match(reply.panels.note, /noVisiblePanel/, 'the reply explains the three answers, not just the good one');
+  assert.deepEqual([...reply.changed[0].propertiesStale].sort(), ['media_loader_state', 'minimax_h3_inline_media_state'],
+    'the stale private copies are reported, not silently rewritten');
+  assert.equal(state.properties.media_loader_state, '{"images":["old.png"]}', 'and they are left exactly as the pack wrote them');
+
+  // A node whose panel is not built yet (the segment editors exist only once the user expands them) is
+  // reported as such instead of claiming a repaint that did not happen.
+  const hidden = { id: 107, type: 'AICG3D_H3SequenceSegment', title: '', mode: 0, properties: {},
+    widgets: [{ name: 'inline_media_state', type: 'string', value: '{"a":1}', options: { serialize: false }, callback() {} }],
+    inputs: [], outputs: [] };
+  const second = await (await boot([hidden]))('update_nodes', { changes: [{ nodeId: 107, widget: 'inline_media_state', value: '{"a":2}' }] });
+  assert.equal(second.changed[0].verified, true, 'the queue value still moved');
+  assert.equal(second.changed[0].panelRefreshed, 'no-dom-mirror');
+  assert.equal(JSON.stringify(second.panels.noVisiblePanel), JSON.stringify([{ nodeId: '107', widget: 'inline_media_state' }]));
+
+  // A panel that throws is the data write plus a visible complaint — never a failed write.
+  const broken = { id: 207, type: 'AICG3D_H3MediaLoader', title: '', mode: 0, properties: {}, widgets: [], inputs: [], outputs: [] };
+  const brokenState = { name: 'media_state', type: 'string', value: 'v1', options: { serialize: false }, callback() {} };
+  broken.widgets = [brokenState, { name: 'h3_media_loader', type: 'h3_media_loader', value: 'v1',
+    options: { getValue: () => brokenState.value, setValue() { throw new Error('面板未挂载'); } }, callback() {} }];
+  const third = await (await boot([broken]))('update_nodes', { changes: [{ nodeId: 207, widget: 'media_state', value: 'v2' }] });
+  assert.equal(third.changed[0].verified, true);
+  assert.equal(third.changed[0].panelRefreshed, false);
+  assert.match(third.warning, /面板刷新失败/);
+});
+
+test('a bridge write marks the tab as unsaved, the way moving a node by hand does', async () => {
+  const command = await boot([floatNode()]);
+  const graph = command.graph, app = command.app, active = app.extensionManager.workflow.activeWorkflow;
+  let versions = 0, emitted = 0, captured = 0, changes = 0;
+  graph.incrementVersion = () => { versions += 1; };
+  graph.change = () => { changes += 1; };
+  app.canvas.emitAfterChange = () => { emitted += 1; };
+  // Only `after-change` is emitted: `captureCanvasState` returns while `changeCount > 0`, so a lone
+  // `before-change` would wedge the tracker for the rest of the session.
+  assert.equal(app.canvas.emitBeforeChange, undefined);
+  active.changeTracker = { captureCanvasState() { captured += 1; active.isModified = true; } };
+
+  const reply = await command('update_nodes', { changes: [{ nodeId: 78, widget: 'denoise', value: 0.9 }] });
+  assert.equal(versions, 1, 'the graph counter moved, so serialization and change detection see the write');
+  assert.equal(emitted, 1, 'the canvas event the change tracker listens for was published');
+  assert.equal(captured, 1, 'and the tracker itself was asked directly, because a headless write emits nothing else');
+  assert.equal(changes, 1, 'and the canvas was told to redraw');
+  assert.equal(reply.dirtyMarked, true, 'the answer reported is the tab own isModified');
+  assert.equal(reply.dirtyNote, undefined);
+
+  // A front-end without the tracker API still gets an honest note instead of a silent 「已保存」.
+  const bare = await boot([floatNode()]);
+  bare.app.extensionManager.workflow.activeWorkflow.changeTracker = undefined;
+  const second = await bare('update_nodes', { changes: [{ nodeId: 78, widget: 'denoise', value: 0.8 }] });
+  assert.match(second.dirtyNote, /没有变更追踪接口|未保存/);
+  assert.equal(second.dirtyMarked, false);
+});
+
+// ---------------------------------------------------------------- two wording bugs that cost real writes.
+// R5-F: the "this write will be reverted" warning fired on any document that was not exactly one text
+// part. AICG3D keeps a plain multi-paragraph prompt as several text parts and resyncs it fine, so the
+// warning sent callers down the expensive path (整图回灌) for a write that would have persisted.
+// R6-4: `ShowText|pysssss` builds its widget inside a requestAnimationFrame after `onConfigure`
+// (~3.5 s measured), and a write aimed at it during that window answered 「可编辑参数不存在」 — which
+// reads as "this node cannot be changed" rather than "not yet".
+
+test('a multi-paragraph text document is mirrored, not announced as a write that will be reverted', async () => {
+  const long = '第一段' + '第二段' + '第三段';
+  const node = { id: 190, type: 'AICG3D_H3ContextSegments', title: '', mode: 0,
+    properties: { minimax_h3_prompt_reference_doc: { text: long,
+      parts: [{ type: 'text', text: '第一段' }, { type: 'text', text: '第二段' }, { type: 'text', text: '第三段' }] } },
+    widgets: [{ name: 'prompt', type: 'h3_prompt', value: long,
+      options: { serialize: false, getValue: () => node.widgets[0].value, setValue: value => { node.widgets[0].value = String(value); } } }],
+    inputs: [], outputs: [] };
+  const command = await boot([node]);
+  const reply = await command('update_nodes', { changes: [{ nodeId: 190, widget: 'prompt', value: '换成中文的新提示词' }] });
+
+  assert.equal(reply.changed[0].verified, true);
+  assert.deepEqual(reply.changed[0].shadowDocsSynced, ['minimax_h3_prompt_reference_doc'],
+    'the document is a text mirror of the widget, so it is kept in step');
+  assert.equal(reply.revertedWrites, undefined, 'and the caller is not told to take the expensive path for nothing');
+  const doc = node.properties.minimax_h3_prompt_reference_doc;
+  assert.equal(doc.text, '换成中文的新提示词');
+  assert.equal(doc.parts.length, 1, 'collapsing the paragraphs is what the pack itself does when it resyncs');
+
+  // A document whose `text` says more than its parts is not a mirror, and a document with a mention is
+  // still the diverged case: both must keep the warning.
+  // Attributable (its `text` mirrors the widget), but the parts do not add up to that text — the
+  // document is holding structure the plain string cannot represent, so it must not be rewritten.
+  const hiddenExtra = { id: 191, type: 'AICG3D_H3ContextSegments', title: '', mode: 0,
+    properties: { minimax_h3_prompt_reference_doc: { text: long,
+      parts: [{ type: 'text', text: '第一段' }, { type: 'mention', label: '图片1' }, { type: 'text', text: '第二段第三段' }] } },
+    widgets: [{ name: 'prompt', type: 'h3_prompt', value: long,
+      options: { serialize: false, getValue: () => hiddenExtra.widgets[0].value, setValue: value => { hiddenExtra.widgets[0].value = String(value); } } }],
+    inputs: [], outputs: [] };
+  const second = await (await boot([hiddenExtra]))('update_nodes', { changes: [{ nodeId: 191, widget: 'prompt', value: '新内容' }] });
+  assert.deepEqual(second.changed[0].shadowDocsDiverged, ['minimax_h3_prompt_reference_doc'],
+    'a doc that carries something its parts do not show is not overwritten from a plain string');
+  assert.match(second.revertedWrites[0].note, /下一次序列化前有效/);
+});
+
+test('a node whose controls are not built yet says so instead of denying it can be written', async () => {
+  const shown = { id: 111, type: 'ShowText|pysssss', title: '', mode: 0, properties: {}, widgets: [], inputs: [], outputs: [] };
+  const command = await boot([shown]);
+  const error = await command('update_nodes', { changes: [{ nodeId: 111, widget: 'text_0', value: '探针' }] }).catch(caught => caught);
+  assert.match(error.bridgeError, /可编辑参数不存在：111.text_0/);
+  assert.match(error.hint, /requestAnimationFrame/, 'the hint names the deferred build, not just the missing name');
+  assert.match(error.hint, /等 4 秒|3\.5 秒/, 'and gives the caller the one action that works: wait and resend');
+  assert.match(error.hint, /本来就没有可写控件/, 'the other cause stays listed, so the hint cannot be a guess');
 });
