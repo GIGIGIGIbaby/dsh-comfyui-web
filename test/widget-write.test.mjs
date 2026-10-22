@@ -101,7 +101,10 @@ async function boot(nodes, options = {}) {
     const reply = replies.at(-1);
     // The bridge reports the message and the next step separately (the MCP layer joins them
     // with "下一步："). Keep both reachable so a test can assert on the actionable half.
-    if (reply?.error) throw Object.assign(new Error(reply.error), { bridgeError: reply.error, hint: reply.hint, stackTrace: reply.stack });
+    // Failures carry the same tab-state field successes do (round 7, observation 2), so the harness has
+    // to expose it on the thrown error or the test can only see the message.
+    if (reply?.error) throw Object.assign(new Error(reply.error), { bridgeError: reply.error, hint: reply.hint, stackTrace: reply.stack,
+      dirtyMarked: reply.dirtyMarked, stage: reply.stage, widgetKind: reply.widgetKind });
     return reply.result;
   };
   // Callable as before, plus the page handles a test needs to move the graph under the bridge's feet.
@@ -1424,4 +1427,99 @@ test('writing a subgraph proxy names the definitions copy that still holds the o
   const bare = await boot([proxyNodeReal()]);
   const bareReply = await bare('update_nodes', { changes: [{ nodeId: 77, widget: 'noise_seed', value: 1 }] });
   assert.equal(bareReply.definitionsStale, undefined, 'no definitions means no claim about them');
+});
+
+// ---------------------------------------------------------------- the pre-flight census, force, and
+// honest save semantics (round 7 requests). The census answers 「哪些能写、哪些写不了」 before a caller
+// tries anything; `force` is the escape hatch for a value the canvas no longer offers; and a save now
+// says which moment reached the disk.
+
+test('the write census reports the facts the classifier needs, per control', async () => {
+  const wired = { id: 198, type: 'AICG3D_H3SelectedVideoContext', title: '选中视频上下文', mode: 0, properties: {},
+    widgets: [{ name: 'prompt', type: 'string', value: '来自连线', options: {}, callback() {} }],
+    inputs: [{ name: 'prompt', type: 'STRING', link: 377 }], outputs: [] };
+  const guhai = { id: 309, type: '忽略多组孤海', title: '', mode: 0,
+    properties: { guhai_ig_filter: ['a'], guhai_ig_active_set: ['b'], unrelated: 'x' },
+    widgets: [{ name: 'guhai_ig', type: 'ig_custom', value: undefined, options: { serialize: false }, callback() {} }],
+    inputs: [], outputs: [] };
+  const domOnlyGetter = { id: 5, type: 'SomeVueNode', title: '', mode: 0, properties: {},
+    widgets: [{ name: 'mode', type: 'custom', value: 'a', options: { getValue: () => 'a' } }], inputs: [], outputs: [] };
+  const loader = { id: 189, type: 'AICG3D_H3Loader', title: '', mode: 0, properties: {}, widgets: [], inputs: [], outputs: [] };
+  const media = { name: 'media_state', type: 'string', value: 'v1', options: { serialize: false }, callback() {} };
+  loader.widgets = [media, { name: 'h3_media_loader', type: 'h3_media_loader', value: 'v1',
+    options: { getValue: () => media.value, setValue: value => { media.value = String(value); } } }];
+  const pending = { id: 111, type: 'ShowText|pysssss', title: '', mode: 0, properties: {}, widgets: [], inputs: [], outputs: [] };
+  const command = await boot([wired, guhai, domOnlyGetter, loader, pending, proxyNodeReal()],
+    { fields: { definitions: subgraphDefinitions() } });
+
+  const page = await command('audit_writes');
+  const byId = id => page.nodes.find(node => node.id === String(id));
+  assert.equal(page.subgraphCount, 1, 'the census knows which node types are live subgraphs');
+  assert.equal(byId(198).widgets[0].wired, 377, 'a slot driven by a link is reported as wired');
+  assert.deepEqual(byId(309).widgets[0].props.sort(), ['guhai_ig_active_set', 'guhai_ig_filter'],
+    'the properties that hold this control real state are named (and the unrelated key is not)');
+  assert.equal(byId(309).widgets[0].kind, 'shadowed');
+  assert.equal(byId(309).widgets[0].hasSetter, false, 'no setter means no channel for the plugin');
+  assert.equal(byId(5).widgets[0].kind, 'dom');
+  assert.equal(byId(5).widgets[0].hasSetter, false, 'a read-only display component is told apart from a writable one');
+  assert.equal(byId(189).widgets[0].mirror, true, 'the素材库 hidden control has a visible mirror to repaint');
+  assert.equal(byId(189).widgets[0].hasSetter, false);
+  assert.equal(byId(111).widgetCount, 0, 'a node that has not built its controls is reported as such');
+  assert.equal(byId(77).subgraph, SUBGRAPH_ID, 'a proxy node is identified by its type being the subgraph id');
+  assert.equal(JSON.stringify(Object.keys(page.nodes[0].widgets[0]).sort()),
+    JSON.stringify(['hasGetter', 'hasSetter', 'inOptions', 'kind', 'mirror', 'name', 'optionCount', 'props', 'serializes', 'step', 'wired'].sort()),
+    'flags only — the census never ships values it does not need');
+});
+
+test('force writes a value the canvas no longer offers, and says that it did', async () => {
+  const command = await boot([plainNode()]);
+  const refused = await command('update_nodes', { changes: [{ nodeId: 1, widget: 'mode', value: 'default' }] }).catch(error => error);
+  assert.match(refused.bridgeError, /值不在可选项中/);
+  assert.match(refused.hint, /force:true/, 'the rejection names the escape hatch instead of only the enum');
+
+  const forced = await command('update_nodes', { changes: [{ nodeId: 1, widget: 'mode', value: 'default' }], force: true });
+  assert.equal(forced.changed[0].verified, true, 'the canvas took the value');
+  assert.equal(forced.changed[0].outsideOptions, true, 'and the reply marks it as outside the legal domain');
+  assert.equal(forced.forceUsed, true);
+  assert.match(forced.warning, /提交时的服务端校验|不等于队列接受/);
+  assert.match(forced.nextSteps.join(' '), /整图替换/);
+
+  // Range is relaxable the same way, and equally loud about it.
+  const range = await command('update_nodes', { changes: [{ nodeId: 1, widget: 'steps', value: 500 }], force: true });
+  assert.equal(range.changed[0].outOfRange, true);
+  const strict = await command('update_nodes', { changes: [{ nodeId: 1, widget: 'steps', value: 500 }] }).catch(error => error);
+  assert.match(strict.bridgeError, /超出节点允许的范围/);
+  // A malformed request is not an unfriendly enum: force does not paper over type errors.
+  const wrongType = await command('update_nodes', { changes: [{ nodeId: 1, widget: 'steps', value: { a: 1 } }], force: true }).catch(error => error);
+  assert.match(wrongType.bridgeError, /必须是数字/);
+});
+
+test('a save reports which moment reached the disk, and the page can be asked again later', async () => {
+  const node = showTextNode('当前值');
+  const command = await boot([node]);
+  const remembered = JSON.parse(JSON.stringify(command.graph.serialize()));
+  const { written } = attachStore(command, { activeState: remembered, initialState: remembered, prepareForSave() {} });
+  const active = command.app.extensionManager.workflow.activeWorkflow;
+
+  const reply = await command('save_workflow');
+  assert.equal(written.length, 1);
+  assert.ok(reply.savedStateHash, 'the hash of what was serialized out');
+  assert.ok(reply.canvasHash, 'and the hash of the canvas at that same moment');
+  assert.equal(reply.canvasMatchesSaved, true, 'they agree when nothing moved behind the save');
+
+  node.widgets[0].value = '包自己又改了一次';
+  const after = await command('graph_fingerprint');
+  assert.equal(after.ok, true);
+  assert.equal(after.canvasMatchesSaved, false, 'a refill after the save is visible without shipping the graph');
+  assert.notEqual(after.canvasHash, reply.savedStateHash);
+  assert.equal(after.visible, true);
+
+  // An error reply says the same thing about the tab, because 「动了但回执死了」 and 「没动」 need telling apart.
+  const failed = await command('update_nodes', { changes: [{ nodeId: 999, widget: 'x', value: 1 }] }).catch(error => error);
+  assert.ok('dirtyMarked' in failed, 'a refused write still reports the tab state instead of leaving it unknown');
+  assert.equal(failed.dirtyMarked, false);
+  // The flag is read from the tab, not inferred from this call: set it the way the front-end would.
+  active.isModified = true;
+  const failed2 = await command('update_nodes', { changes: [{ nodeId: 999, widget: 'x', value: 1 }] }).catch(error => error);
+  assert.equal(failed2.dirtyMarked, true, 'and it is the front-end answer, not a guess from this call');
 });

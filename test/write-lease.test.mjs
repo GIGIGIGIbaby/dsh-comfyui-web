@@ -23,7 +23,14 @@ test('the first canvas write takes the lease and a second conversation is refuse
 
   await callComfyTool(rt, 'update_nodes', { changes: [{ nodeId: 1, widget: 'seed', value: 3 }] }, { dshSessionId: 'A' });
   assert.equal(rt.leaseState().holder, 'A', 'a write renews the lease for its own session');
-  assert.equal(rt.leaseState().heldForMs >= 0, true);
+  // Both clocks, not one tautology: a lease that reports `undefined >= 0` as a pass tells nobody
+  // whether the lock is about to lift. The two numbers answer different questions — how long A has
+  // held it, and how long it has been idle — and the two timeouts say what B has to wait.
+  const held = rt.leaseState();
+  assert.ok(Number.isFinite(held.heldForMs) && Number.isFinite(held.idleMs), JSON.stringify(held));
+  assert.ok(held.heldForMs >= 0 && held.heldForMs < 5000, 'heldForMs measures this command, not a stale clock');
+  assert.equal(held.ttlMs, 5 * 60 * 1000);
+  assert.equal(held.abandonedAfterMs, 15000, 'a dead holder releases in 15 s, not after the full TTL');
 
   // B has a live page too, so its refusal is the lease conflict and not the identity guard — and
   // the lease is now taken at the dispatch, which means the two-phase plan's read already happened.
@@ -31,6 +38,10 @@ test('the first canvas write takes the lease and a second conversation is refuse
   const before = dispatched.length;
   await assert.rejects(callComfyTool(rt, 'update_nodes', { changes: [{ nodeId: 1, widget: 'seed', value: 4 }] }, { dshSessionId: 'B' }),
     /写租约被另一条对话持有（A，空闲 \d+ 秒）/);
+  // A refused write must not disturb the holder's clocks: a rejection that renewed them would hand a
+  // blocked session a lease it never got, and the wait the message quotes would be a lie.
+  assert.equal(rt.leaseState().holder, 'A');
+  assert.ok(rt.leaseState().heldForMs >= held.heldForMs, JSON.stringify(rt.leaseState()));
   // A's successful write costs three dispatches: the read the two-phase plan makes before it
   // commits, the write itself, then the audit_graph that measures the front-end draft store for
   // the reply. B may read the canvas but its write must never be dispatched.

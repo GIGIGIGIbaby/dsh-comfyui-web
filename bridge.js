@@ -691,10 +691,14 @@
       : '浏览器存储吃紧：已回收 ' + (note.pruned?.chars ?? 0) + ' 字符的旧快照' + (note.pruned ? '（' + note.pruned.keys + ' 个键）' : '') + '，并丢弃本工作流最早的 ' + (note.dropped ?? 0) + ' 个撤销点；画布写入正常，list_edits 里能回退的步数变少。';
     return note;
   }
-  function graphHash(app) {
-    const text = fingerprint(readGraph(app)); let hash = 2166136261;
+  // FNV-1a over the canonical fingerprint: enough to answer 「did the canvas move」 without shipping it.
+  function hashText(text) {
+    let hash = 2166136261;
     for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
     return String(hash >>> 0);
+  }
+  function graphHash(app) {
+    return hashText(fingerprint(readGraph(app)));
   }
   // `parent` is the state the previous entry of the same list describes; with none, this entry is the
   // anchor. The node count is recorded on the entry because a patch does not carry a node list, and
@@ -1058,6 +1062,18 @@
     return { verified: true, quantized: step ? { requested: value, applied: after, step }
       : { requested: value, applied: after, note: '浮点末位差异，画布存的是四舍五入后的值' } };
   }
+  // Which `node.properties` keys plausibly hold this control's real state: every token of the widget
+  // name appears in the key. `guhai_ig` → `guhai_ig_filter` / `guhai_ig_active_set` match; an unrelated
+  // `active_set` on another control does not. Used only to tell the caller WHERE the value lives — the
+  // bridge never writes these keys (R6-6: no properties channel, by the maintainer's decision).
+  function propertyKeysFor(node, name) {
+    const needle = tokens(name);
+    if (!needle.length) return [];
+    return Object.keys(node.properties || {}).filter(key => {
+      const hay = tokens(key);
+      return needle.every(token => hay.includes(token));
+    });
+  }
   // The visible panel that renders a data-only control. Name matching (`ownsWidget`) is the first
   // guess, and for AICG3D's素材库 it is not enough: the hidden `media_state` is rendered by a DOM
   // widget called `h3_media_loader`, whose own `getValue` reads the hidden one — so the evidence that
@@ -1409,7 +1425,14 @@
             }
           }
         }
+        // Two hashes, never the graph: which moment actually hit the disk. A pack that refills its own
+        // parameters after the load (AICG3D measured at ~300 ms) can move the canvas behind this save, so
+        // `{saved:true}` alone is not an answer to 「保存的是哪一刻」 (round 5, R5-H).
+        let savedStateHash = null, canvasHash = null;
+        try { savedStateHash = hashText(fingerprint(active.changeTracker?.activeState ?? null)); } catch {}
+        try { canvasHash = hashText(fingerprint(readGraph(app))); } catch {}
         return { saved: true, workflow: describeWorkflow(store, store.activeWorkflow),
+          savedStateHash, canvasHash, canvasMatchesSaved: savedStateHash !== null && savedStateHash === canvasHash,
           // Three separate facts, each with its own wording: the value the tab could not see on screen
           // was kept (R7-6), the page was in the background so deferred widgets never built (R7-4/R7-7),
           // and the state could not be reconciled at all (R6-1).
@@ -1581,6 +1604,7 @@
     }
       case 'update_nodes': {
         const changes = args.changes;
+        const force = args.force === true;
         if (!Array.isArray(changes) || !changes.length || changes.length > 500) throw fail('changes 必须是包含 1–500 项的数组' + argNameHint(args, ['changes']),
           '参数名是 changes，每项结构 {nodeId, widget, value}（nodeId 用 list_nodes 取到的 id）：改好参数名后整批重发，画布尚未改动。');
         const ids = (app.graph._nodes || []).map(n => n.id);
@@ -1607,10 +1631,21 @@
           if (typeof current === 'number' && (typeof change.value !== 'number' || !Number.isFinite(change.value))) throw fail(widget.name + ' 必须是数字', widget.name + ' 当前是数字 ' + current + '，提交的是 ' + kindOf(change.value) + ' ' + JSON.stringify(change.value) + '：传裸数字，别传字符串或对象。');
           if (typeof current === 'string' && typeof change.value !== 'string') throw fail(widget.name + ' 必须是文本', widget.name + ' 当前是文本，提交的是 ' + kindOf(change.value) + '：传字符串（枚举值也要传原文）。');
           if (typeof current === 'boolean' && typeof change.value !== 'boolean') throw fail(widget.name + ' 必须是布尔值', widget.name + ' 当前是布尔 ' + current + '，提交的是 ' + kindOf(change.value) + '：传 true/false，别传 0/1 或字符串。');
-          if (Array.isArray(widget.options?.values) && !widget.options.values.includes(change.value)) throw fail(widget.name + ' 的值不在可选项中；' + optionHint(widget.options.values), '当前值是 ' + JSON.stringify(current) + '，可选值见错误正文；若可选项看起来像本地化显示名，说明该 pack 在提交时做转换，改用 load_workflow 整图替换更稳。');
-          if (typeof change.value === 'number' && ((widget.options?.min != null && change.value < widget.options.min) || (widget.options?.max != null && change.value > widget.options.max))) throw fail(widget.name + ' 超出节点允许的范围', widget.name + ' 允许范围是 [' + (widget.options?.min ?? '-∞') + ', ' + (widget.options?.max ?? '+∞') + ']，当前值 ' + current + '，提交值 ' + change.value + '。');
+          // `force` (R6-7) relaxes the two domain guards only — the canvas option list and the declared
+          // range — because a workflow can legitimately hold a value the canvas no longer offers
+          // (measured: `control_after_generate = "default"` is disk-legal and canvas-illegal, and without
+          // a force there was no way to put it back except a whole-graph reload). The type check stays:
+          // that is a malformed request, not an unfriendly enum. A forced value is still the queue's
+          // problem to accept, so the reply says `forced` and `audit(op=params)` will keep flagging it.
+          if (!force && Array.isArray(widget.options?.values) && !widget.options.values.includes(change.value)) throw fail(widget.name + ' 的值不在可选项中；' + optionHint(widget.options.values), '当前值是 ' + JSON.stringify(current) + '，可选值见错误正文；若可选项看起来像本地化显示名，说明该 pack 在提交时做转换，改用服务端值即可，确需写列表外的值才传 force:true（会照写，但队列校验不一定接受）。');
+          if (!force && typeof change.value === 'number' && ((widget.options?.min != null && change.value < widget.options.min) || (widget.options?.max != null && change.value > widget.options.max))) throw fail(widget.name + ' 超出节点允许的范围', widget.name + ' 允许范围是 [' + (widget.options?.min ?? '-∞') + ', ' + (widget.options?.max ?? '+∞') + ']，当前值 ' + current + '，提交值 ' + change.value + '。要越界写就得传 force:true，但前端会自己夹回或拒绝，先看这个范围是不是节点包写错了。');
           const sameName = (node.widgets || []).filter(w => w.name === change.widget).length;
-          return { node, widget, reroutedFrom, sameName, value: change.value, before: clone(current) };
+          // Recorded whether or not `force` was used, so a receipt can say what was written outside the
+          // legal domain instead of leaving the caller to remember which values were unusual.
+          const outsideOptions = Array.isArray(widget.options?.values) && !widget.options.values.includes(change.value);
+          const outOfRange = typeof change.value === 'number'
+            && ((widget.options?.min != null && change.value < widget.options.min) || (widget.options?.max != null && change.value > widget.options.max));
+          return { node, widget, reroutedFrom, sameName, value: change.value, before: clone(current), outsideOptions, outOfRange };
         });
         // Snapshot the wired-down nodes before the first write, then read the canvas again once
         // the pack's autofill debounce has landed. A batch of pure parameters touches nothing
@@ -1684,6 +1719,16 @@
             + ' → definitions[' + (item.subgraphName || item.subgraphId) + '].nodes[' + item.innerNodeId + '].' + item.widget
             + ' 仍是 ' + JSON.stringify(item.definitionValue) + '；要消除分叉就整图替换（load_workflow 传两份值都改好的 JSON），只改代理控件不会同步它'));
         }
+        // `force` was asked for and at least one value really sits outside the canvas options or the
+        // declared range: say so once, plainly, because the canvas accepting it is not the same as the
+        // queue accepting it (R6-7).
+        const forcedItems = results.filter(entry => entry.edit.outsideOptions || entry.edit.outOfRange);
+        if (force && forcedItems.length) {
+          warnings.push(forcedItems.length + ' 项是 force 写进非法域的（changed[].outsideOptions / outOfRange）：画布照写了，'
+            + '但提交时的服务端校验或前端自己的夹取可能不认这个值。run 前用 audit(op=params) 复核，别把它当长期状态。');
+          nextSteps.push(...forcedItems.map(({ edit }) => 'node ' + edit.node.id + '.' + edit.widget.name
+            + ' → 要长期保留就改磁盘工作流 JSON 后 load_workflow 整图替换，或让该节点包把选项/范围补全'));
+        }
         return {
           changed: results.map(({ edit, outcome }) => ({
             nodeId: String(edit.node.id), widget: edit.widget.name,
@@ -1697,6 +1742,8 @@
             ...(outcome.synced ? { shadowDocsSynced: outcome.synced } : {}),
             ...(outcome.diverged ? { shadowDocsDiverged: outcome.diverged } : {}),
             ...(outcome.shadowDocsRemaining ? { shadowDocsRemaining: outcome.shadowDocsRemaining } : {}),
+            ...(edit.outsideOptions ? { outsideOptions: true } : {}),
+            ...(edit.outOfRange ? { outOfRange: true } : {}),
             ...(wiredInputs.some(item => item.nodeId === String(edit.node.id)
               && item.widget === (edit.reroutedFrom || edit.widget.name)) ? { inputIsWired: true } : {}),
             ...(outcome.hint ? { hint: outcome.hint } : {})
@@ -1704,6 +1751,7 @@
           ...(wiredInputs.length ? { wiredInputs } : {}),
           ...(panels.note ? { panels } : {}),
           ...(definitionsStale.length ? { definitionsStale } : {}),
+          ...(force && forcedItems.length ? { forceUsed: true, forcedCount: forcedItems.length } : {}),
           ...(revertedWrites.length ? { revertedWrites } : {}),
           ...followUp,
           // One sentence per cause actually present, joined — never one clause describing a set with
@@ -1782,6 +1830,49 @@
           draftStorage: draftStorage()
         };
       }
+      // The capability census (round 7 request): what this plugin can and cannot write on THIS canvas,
+      // said before a caller tries. Only flags travel — no values, no graphs — so a 177-control workflow
+      // costs a few KB. Judgment lives in `lib/audit.js` where it can be tested; the page just reports.
+      case 'audit_writes': {
+        let subgraphIds = [];
+        try { subgraphIds = (rootGraphOf(app).serialize()?.definitions?.subgraphs || [])
+          .map(item => String(item?.id)).filter(id => id !== 'undefined'); } catch {}
+        return {
+          nodes: (app.graph._nodes || []).map(node => ({
+            id: String(node.id), type: node.type, title: node.title || '', mode: node.mode ?? 0,
+            subgraph: subgraphIds.includes(String(node.type)) ? String(node.type) : null,
+            widgetCount: (node.widgets || []).length,
+            widgets: (node.widgets || []).map(widget => {
+              const options = widget.options || {};
+              const list = Array.isArray(options.values) ? options.values : null;
+              const kind = widgetKind(widget);
+              const slot = (node.inputs || []).find(input => input.name === widget.name);
+              return { name: widget.name, kind,
+                hasSetter: typeof options.setValue === 'function', hasGetter: typeof options.getValue === 'function',
+                serializes: options.serialize !== false,
+                inOptions: list ? list.includes(widget.value) : null, optionCount: list ? list.length : null,
+                step: stepOf(widget) ?? null,
+                wired: slot && slot.link != null ? slot.link : null,
+                mirror: (kind === 'hidden' || kind === 'shadowed') ? !!panelMirror(node, widget) : false,
+                props: propertyKeysFor(node, widget.name) };
+            }),
+            shadowDocs: shadowDocs(node)
+          })),
+          workflowPath: activeWorkflowOf(app)?.path ?? null,
+          serializable: canSerialize(app), subgraphCount: subgraphIds.length
+        };
+      }
+      case 'graph_fingerprint': {
+        // The cheap answer to 「存的是哪一刻的图」: two hashes, never the graph. A save writes the tab's
+        // cached state, and a pack that refills parameters after the save moves the canvas again — the
+        // caller has to be able to tell the two moments apart (round 5, R5-H).
+        const tracker = activeWorkflowOf(app)?.changeTracker;
+        let saved = null, canvas = null;
+        try { saved = fingerprint(tracker?.activeState ?? null); } catch {}
+        try { canvas = fingerprint(readGraph(app)); } catch { return { ok: false, error: 'unserializable' }; }
+        return { ok: true, savedHash: saved ? hashText(saved) : null, canvasHash: hashText(canvas),
+          canvasMatchesSaved: saved !== null && saved === canvas, visible: document.visibilityState !== 'hidden' };
+      }
       case 'run': {
         const api = apiOf();
         if (!api?.queuePrompt) throw new Error('当前 ComfyUI 前端没有 queuePrompt 接口');
@@ -1848,6 +1939,13 @@
     // the fallback states what it actually knows and puts the two branches in check order.
     else reply.hint = '这条失败没有分类提示。先按错误正文判断是哪一类：说「不存在/不可选/超出范围/需要 X」的是校验拒绝，改正参数再发一次；'
       + '带 stack 且指向前端或自定义节点包 setter 的才是页面异常，那种情况别重复同一调用，改用该包自带的写入入口或整图替换（load_workflow）。';
+    // Round 7, observation 2: a failed write used to answer with nothing about the tab's state, so the
+    // caller could not tell 「画布根本没动」 from 「动了，只是回执死了」 — which matters most for the save
+    // path, where the file may already be written. The tab's own flag is the honest answer either way.
+    if (['update_nodes', 'bind_image', 'load_workflow', 'undo', 'redo', 'restore_edit', 'edit_graph',
+      'save_workflow', 'save_as_workflow'].includes(command.action)) {
+      try { reply.dirtyMarked = activeWorkflowOf(appOf())?.isModified === true; } catch {}
+    }
     return reply;
   }
   // The front-end decides "this tab has unsaved changes" from mouse, keys and LiteGraph's canvas

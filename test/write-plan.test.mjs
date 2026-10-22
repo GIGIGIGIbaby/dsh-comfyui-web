@@ -288,3 +288,102 @@ test('a node whose controls are not built yet is answered as a wait, not as an e
   assert.equal(named.blocked[0].code, 'widget-not-found');
   assert.match(named.blocked[0].nextSteps, /steps/);
 });
+
+test('force relaxes the domain judgments at the tool surface too', async t => {
+  // The page has its own force; the two-phase plan must not block first and make it meaningless (R6-7).
+  const rt = await runtime(); t.after(() => rt.stop());
+  rt.clients.set('pA', { id: 'pA', sessionId: 'A', ready: true, allowAI: true, visible: true, seen: Date.now(), queue: [] });
+  const seen = [];
+  rt.command = async (sessionId, action, payload) => {
+    seen.push({ action, payload });
+    if (action === 'list_nodes') return { nodes };
+    return { changed: payload.changes.map(change => ({ nodeId: String(change.nodeId), widget: change.widget,
+      before: 25, after: change.value, via: 'native-setter', verified: true, outOfRange: true })) };
+  };
+  rt.request = async path => {
+    const type = decodeURIComponent(String(path).replace('/object_info/', ''));
+    return { [type]: defs[type] };
+  };
+
+  const strict = await callComfyTool(rt, 'update_nodes', { changes: [{ nodeId: 78, widget: 'steps', value: 500 }] }, { dshSessionId: 'A' });
+  assert.equal(strict.structuredContent.status, 'needs_input', 'without force the batch is still refused before the canvas');
+  assert.equal(strict.structuredContent.blocked[0].code, 'out-of-range');
+
+  const forced = await callComfyTool(rt, 'update_nodes', { changes: [{ nodeId: 78, widget: 'steps', value: 500 }], force: true }, { dshSessionId: 'A' });
+  assert.equal(forced.structuredContent.status, 'written', 'with force the write goes through');
+  assert.equal(forced.structuredContent.written, true);
+  assert.equal(forced.structuredContent.planned[0].forced, 'out-of-range', 'and the plan says which judgment was relaxed');
+  const writer = seen.find(call => call.action === 'update_nodes');
+  assert.equal(writer.payload.force, true, 'the page is told force was used, so its own guards relax the same way');
+  assert.equal(forced.structuredContent.changed[0].outOfRange, true, 'the per-item flag travels back through the envelope');
+});
+
+test('saveAfterWrite answers which moment reached the disk', async t => {
+  // R5-H: the honest version of 「写完顺带保存」 — a pack can move the canvas after the save (AICG3D does,
+  // measured at ~300 ms), so `{saved:true}` alone would be a promise the plugin cannot keep.
+  const rt = await runtime(); t.after(() => rt.stop());
+  rt.clients.set('pA', { id: 'pA', sessionId: 'A', ready: true, allowAI: true, visible: true, seen: Date.now(), queue: [] });
+  const calls = [];
+  rt.command = async (sessionId, action, payload) => {
+    calls.push(action);
+    if (action === 'list_nodes') return { nodes };
+    if (action === 'update_nodes') return { changed: payload.changes.map(change => ({ nodeId: String(change.nodeId),
+      widget: change.widget, before: 25, after: change.value, via: 'native-setter', verified: true })), canvasHash: 'hash-1' };
+    if (action === 'save_workflow') return { saved: true, workflow: { path: 'workflows/H3.json' },
+      savedStateHash: 'hash-1', canvasHash: 'hash-1', canvasMatchesSaved: true };
+    if (action === 'graph_fingerprint') return { ok: true, savedHash: 'hash-1', canvasHash: 'hash-2', canvasMatchesSaved: false };
+    return { usedChars: 100, available: true, keys: [] };
+  };
+  rt.request = async path => {
+    const type = decodeURIComponent(String(path).replace('/object_info/', ''));
+    return { [type]: defs[type] };
+  };
+
+  const reply = await callComfyTool(rt, 'update_nodes',
+    { changes: [{ nodeId: 78, widget: 'steps', value: 26 }], saveAfterWrite: true }, { dshSessionId: 'A' });
+  assert.deepEqual(calls.filter(action => action === 'save_workflow'), ['save_workflow'], 'the save ran once, after the write');
+  assert.equal(reply.structuredContent.saved.path, 'workflows/H3.json');
+  assert.equal(reply.structuredContent.saved.savedStateHash, 'hash-1');
+  assert.equal(reply.structuredContent.saved.canvasHashAtSave, 'hash-1');
+  assert.equal(reply.structuredContent.saved.canvasHashNow, 'hash-2');
+  assert.equal(reply.structuredContent.saved.driftedAfterSave, true, 'the canvas moved after the save, and the reply says so');
+  assert.match(reply.structuredContent.saved.driftNote, /再调一次 save_workflow/);
+
+  // A save that fails must not be reported as a failed write — the canvas change already happened.
+  rt.command = async (sessionId, action, payload) => {
+    if (action === 'list_nodes') return { nodes };
+    if (action === 'save_workflow') throw new Error('没有保存路径');
+    return { changed: payload.changes.map(change => ({ nodeId: String(change.nodeId), widget: change.widget,
+      before: 25, after: change.value, via: 'native-setter', verified: true })) };
+  };
+  const failed = await callComfyTool(rt, 'update_nodes',
+    { changes: [{ nodeId: 78, widget: 'steps', value: 27 }], saveAfterWrite: true }, { dshSessionId: 'A' });
+  assert.equal(failed.structuredContent.written, true, 'the write result survives a failed save');
+  assert.match(failed.structuredContent.saveError, /画布写入已成功，但顺带保存失败/);
+});
+
+test('audit(op=writes) asks the page for the flags-only census and returns the classification', async t => {
+  const rt = await runtime(); t.after(() => rt.stop());
+  rt.clients.set('pA', { id: 'pA', sessionId: 'A', ready: true, allowAI: true, visible: true, seen: Date.now(), queue: [] });
+  const actions = [];
+  rt.command = async (sessionId, action) => {
+    actions.push(action);
+    if (action !== 'audit_writes') throw new Error('unexpected action ' + action);
+    return { workflowPath: 'workflows/H3.json', serializable: true, subgraphCount: 0,
+      nodes: [{ id: '198', type: 'AICG3D_H3SelectedVideoContext', title: '', mode: 0, subgraph: null, widgetCount: 1,
+        widgets: [{ name: 'prompt', kind: 'hidden', hasSetter: false, hasGetter: false, serializes: false,
+          inOptions: null, optionCount: null, step: null, wired: 377, mirror: false, props: [] }], shadowDocs: [] }] };
+  };
+  rt.request = async path => {
+    const type = decodeURIComponent(String(path).replace('/object_info/', ''));
+    return { [type]: defs[type] || { input: { required: {} } } };
+  };
+  const reply = await callComfyTool(rt, 'audit', { op: 'writes' }, { dshSessionId: 'A' });
+  assert.deepEqual(actions, ['audit_writes'], 'the census takes its own page action, not the structural one');
+  assert.equal(reply.structuredContent.op, 'writes');
+  assert.equal(reply.structuredContent.blocked, 1);
+  assert.match(reply.structuredContent.blockedItems[0].note, /连线/);
+  assert.equal(reply.structuredContent.verdict, 'refuted');
+
+  await assert.rejects(callComfyTool(rt, 'audit', { op: 'nonsense' }, { dshSessionId: 'A' }), /graph \/ params \/ writes/);
+});

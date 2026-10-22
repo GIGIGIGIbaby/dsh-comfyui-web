@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { ComfyRuntime } from '../lib/runtime.js';
 import { callComfyTool } from '../lib/mcp.js';
 import { MCP_TOOLS } from '../lib/tool-definitions.js';
-import { auditGraph, auditParams, defInputs, paramViolations } from '../lib/audit.js';
+import { auditGraph, auditParams, auditWrites, defInputs, paramViolations } from '../lib/audit.js';
 
 // ---------------------------------------------------------------- definitions
 
@@ -389,11 +389,15 @@ test('audit pulls page facts and one object_info per distinct node type', async 
   await assert.rejects(callComfyTool(rt, 'audit', {}, {}), /需要当前对话身份/);
 });
 
-test('audit is registered as a read-only tool', () => {
+test('audit stays read-only and the census declares itself as such', () => {
   const audit = MCP_TOOLS.find(tool => tool.name === 'audit');
   assert.ok(audit);
   assert.equal(audit.annotations.readOnlyHint, true, 'audit must stay exempt from the write lease');
-  assert.deepEqual(audit.inputSchema.properties.op.enum, ['graph', 'params']);
+  assert.deepEqual(audit.inputSchema.properties.op.enum, ['graph', 'params', 'writes']);
+  // The census verdict means writability, not runnability; reading it the other way would tell a
+  // caller a workflow is broken when it only has controls the plugin cannot touch.
+  assert.match(audit.description, /可写性普查/);
+  assert.match(audit.inputSchema.properties.op.description, /能写、哪些不能/);
 });
 
 test('a serialized field that missed the truncated-name list is still not refuted', () => {
@@ -431,4 +435,65 @@ test('the param audit refuses a canvas that cannot produce a prompt', () => {
   const silent = auditParams({ page: { nodes }, defs: {} });
   assert.equal(silent.checks.find(item => item.id === 'prompt-serializable'), undefined,
     'a page that never reported the fact gets no verdict about it');
+});
+
+test('the write census classifies every control as writable, conditional, or impossible', () => {
+  // Facts arrive exactly as `audit_writes` reports them: flags, no values, no graph (round 7 request —
+  // a caller should learn what the plugin cannot write BEFORE it tries, which is the honest answer to
+  // the R6-6 request for a properties write channel).
+  const flag = (name, extra = {}) => ({ name, kind: 'plain', hasSetter: false, hasGetter: false,
+    serializes: true, inOptions: null, optionCount: null, step: null, wired: null, mirror: false, props: [], ...extra });
+  const node = (id, type, widgets, extra = {}) => ({ id: String(id), type, title: '', mode: 0,
+    subgraph: null, widgetCount: widgets.length, widgets, shadowDocs: [], ...extra });
+  const SUB = 'a67caa28-5f85-4917-8396-36004960dd30';
+  const page = { workflowPath: 'workflows/H3.json', serializable: true, subgraphCount: 1, nodes: [
+    node(1, 'KSampler', [flag('seed'), flag('mode', { inOptions: false, optionCount: 2 }), flag('denoise', { step: 0.01 })]),
+    node(198, 'AICG3D_H3SelectedVideoContext', [flag('prompt', { wired: 377 })]),
+    node(309, '忽略多组孤海', [flag('guhai_ig', { kind: 'shadowed', serializes: false, props: ['guhai_ig_filter', 'guhai_ig_active_set'] })]),
+    node(5, 'SomeVueNode', [flag('mode', { kind: 'dom' })]),
+    node(189, 'AICG3D_H3Loader', [flag('media_state', { kind: 'hidden', serializes: false, mirror: true })]),
+    node(107, 'AICG3D_H3SequenceSegment', [flag('inline_media_state', { kind: 'hidden', serializes: false })]),
+    node(111, 'ShowText|pysssss', []),
+    node(77, SUB, [flag('noise_seed')], { subgraph: SUB })
+  ] };
+  const result = auditWrites({ page, defs: {} });
+
+  assert.equal(result.controls, 9, 'a node without controls is not counted as a control');
+  assert.equal(result.blocked, 3, 'wired input, properties-backed, and a display component with no setter');
+  assert.equal(result.conditional, 4, 'enum-domain, quantized, no mirror, subgraph proxy');
+  assert.equal(result.pendingNodes, 1, 'the not-built-yet node is reported separately');
+  assert.equal(result.writable, 2, 'seed and the mirrored hidden state go through untouched');
+  assert.equal(result.verdict, 'refuted', 'the three-state contract keeps its meaning: something must be routed elsewhere');
+
+  const blockedIds = result.blockedItems.map(item => item.note && [item.nodeId, item.widget].join('.'));
+  assert.deepEqual([result.blockedItems[0].nodeId, result.blockedItems[1].nodeId, result.blockedItems[2].nodeId], ['198', '309', '5']);
+  assert.match(result.blockedItems[0].note, /连线/);
+  assert.deepEqual(result.blockedItems[1].properties, ['guhai_ig_filter', 'guhai_ig_active_set'],
+    'a control whose state lives in properties is named with the keys that hold it — no write channel is pretended');
+  assert.match(result.blockedItems[2].note, /setValue/);
+  assert.equal(blockedIds.length, 3);
+
+  assert.equal(result.byReason['wired-input'], 1);
+  assert.equal(result.byReason['properties-backed'], 1);
+  assert.equal(result.byReason['dom-no-setter'], 1);
+  assert.equal(result.byReason['pending-build'], 1);
+  const conditionalKeys = result.conditionalItems.map(item => [item.nodeId, item.widget].join('.'));
+  // The pending node rides in the same list (with no `widget`), which is why `conditional` and
+  // `pendingNodes` are counted apart above.
+  assert.deepEqual(conditionalKeys, ['1.mode', '1.denoise', '107.inline_media_state', '111.', '77.noise_seed']);
+  assert.match(result.conditionalItems[0].note, /force:true/);
+  assert.match(result.conditionalItems[1].note, /step=0\.01/);
+  assert.match(result.conditionalItems[2].note, /面板/);
+  assert.match(result.conditionalItems[3].note, /延迟重建|等几秒/, 'a node with no controls yet is called out as maybe-too-early');
+  assert.match(result.conditionalItems[4].note, /definitions/, 'the proxy caveat is stated before the write, not only after');
+  assert.ok(result.checks.some(check => check.id === 'writes-blocked' && check.verdict === 'refuted'));
+  assert.ok(result.checks.some(check => check.id === 'writes-conditional' && check.verdict === 'unresolved'));
+
+  // A canvas the plugin can fully write says so without padding, and a filtered census stays small.
+  const clean = auditWrites({ page: { nodes: [node(1, 'KSampler', [flag('seed')])], workflowPath: 'p' }, defs: {} });
+  assert.equal(clean.verdict, 'supported');
+  assert.equal(clean.writable, 1);
+  assert.equal(clean.blockedItems.length, 0);
+  const scoped = auditWrites({ page, defs: {}, filter: 'ShowText' });
+  assert.equal(scoped.nodeCount, 1, 'filter narrows the census to the node asked about');
 });
