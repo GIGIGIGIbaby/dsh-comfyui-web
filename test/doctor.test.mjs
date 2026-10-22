@@ -36,7 +36,7 @@ test('a healthy environment is one verdict with the measured value behind every 
   assert.equal(report.kind, 'ok');
   assert.equal(report.failedChecks, undefined);
   assert.deepEqual(report.checks.map(item => item.id), [
-    'mcp-enabled', 'comfyui-reachable', 'bridge-page', 'bridge-heartbeat', 'bridge-version',
+    'mcp-enabled', 'comfyui-reachable', 'bridge-page', 'bridge-heartbeat', 'bridge-stalled', 'bridge-version',
     'ai-permission', 'write-lease', 'graph-executable', 'disk-output', 'active-workflow',
     'draft-storage', 'queue-idle'
   ]);
@@ -113,4 +113,21 @@ test('a page that never connected says so once and skips what it cannot see', ()
   assert.match(checks['bridge-page'].note, /打开面板/);
   assert.match(checks['write-lease'].note, /不要自行 force 接管/);
   assert.equal(checks['graph-executable'].value, 'skipped');
+});
+
+test('a page whose commands never came back is a failure, not a green report over a dead tab', () => {
+  // Round 7 (R7-7): the SSE stream stayed open, so `connected` and the heartbeat both said fine while
+  // no tool could answer for 11.6 minutes. The two counters are the only thing that separates
+  // 「页面在忙」 from 「页面里有等不到的回调」.
+  const pageSide = doctorReport(facts({ clients: [client({ stalledCommands: 1 })] }));
+  assert.equal(pageSide.kind, 'fail');
+  assert.ok(pageSide.failedChecks.includes('bridge-stalled'), JSON.stringify(pageSide.failedChecks));
+  assert.match(byId(pageSide)['bridge-stalled'].note, /刷新 ComfyUI 页面/);
+  assert.match(byId(pageSide)['bridge-stalled'].note, /别重复提交/, 'and the note stops a resubmit of a save that may already be on disk');
+  const transport = doctorReport(facts({ clients: [client({ timeouts: 2 })] }));
+  assert.ok(transport.failedChecks.includes('bridge-stalled'), 'a command the page never answers is the same failure from the other side');
+  const clean = doctorReport(facts());
+  assert.equal(byId(clean)['bridge-stalled'].ok, true, 'zero unanswered commands is a measured pass, not a silent one');
+  assert.equal(byId(clean)['bridge-stalled'].value, '0');
+  assert.equal(byId(doctorReport(facts({ clients: [] })))['bridge-stalled'].ok, null, 'no page is no verdict, not a failure');
 });

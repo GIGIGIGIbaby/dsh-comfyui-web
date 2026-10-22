@@ -268,3 +268,23 @@ test('list_nodes only speaks about notes when it has one to speak about', async 
   assert.deepEqual(noted.structuredContent.usageNotes.map(group => group.target), ['node:KSampler'],
     'and a note for a type that is not on the canvas stays out of the reply');
 });
+
+test('a node whose controls are not built yet is answered as a wait, not as an empty widget list', () => {
+  // R7-1: the page-side hint never reached the MCP path, because the two-phase plan blocked the change
+  // first and only knew to print the widget names it was given — which for `ShowText|pysssss` mid-build
+  // is an empty list, i.e. "pick one of nothing".
+  const building = [{ id: '111', type: 'ShowText|pysssss', title: '', widgets: [] }];
+  const plan = planWrites({ defs: {}, nodes: building, changes: [{ nodeId: 111, widget: 'text_0', value: '探针' }] });
+  assert.equal(plan.status, 'needs_input');
+  const blocked = plan.blocked[0];
+  assert.equal(blocked.code, 'widgets-not-built');
+  assert.match(blocked.reason, /一个控件都没有/);
+  assert.match(blocked.nextSteps, /requestAnimationFrame/);
+  assert.match(blocked.nextSteps, /等几秒|3\.5 秒/);
+  assert.match(blocked.nextSteps, /本来就没有可写控件/, 'both causes stay listed, so the hint is not a guess');
+
+  // A node that does have controls but the wrong name keeps the old, more specific answer.
+  const named = planWrites({ defs, nodes, changes: [{ nodeId: 78, widget: 'seed', value: 1 }] });
+  assert.equal(named.blocked[0].code, 'widget-not-found');
+  assert.match(named.blocked[0].nextSteps, /steps/);
+});

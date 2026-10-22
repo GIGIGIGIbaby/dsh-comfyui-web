@@ -62,6 +62,9 @@
   const CONFLICT_KEY = 'dsh.comfyui.sync-conflict';
   const CONFLICT_BUDGET = 2_000_000;
   const commandQueue = []; let handlingCommands = false, commandStream, reconnectTimer;
+  // How many commands this page has had to write off as unreturnable. Reported with the heartbeat so a
+  // stuck pack setter is visible from the server side instead of only felt as a timeout (R7-7).
+  let stalledCommands = 0;
   const appOf = () => window.comfyAPI?.app?.app;
   const apiOf = () => window.comfyAPI?.api?.api;
   const activeWorkflowOf = app => {
@@ -80,7 +83,7 @@
     return { bridgeProtocol, bridgeVersion, ready: graphReady(app), allowAI,
       visible: visible && document.visibilityState !== 'hidden',
       hasActiveWorkflow: !!activeWorkflowOf(app), workflowTabs: Array.isArray(tabs) ? tabs.length : null,
-      synchronization: { ...synchronization } };
+      stalledCommands, synchronization: { ...synchronization } };
   }
   const notify = data => { if (embedded) window.parent.postMessage({ source: 'dsh-comfyui', clientId, ...data }, parentOrigin); };
   window.addEventListener('message', event => {
@@ -124,6 +127,19 @@
   // one whose subgraph definitions went missing. Never call `graphToPrompt` for it: packs that patch
   // serialization would take a side effect from what is supposed to be a listing.
   function canSerialize(app) { try { rootGraphOf(app).serialize(); return true; } catch { return false; } }
+  // `graphToPrompt()` is a different call from `serialize()`, and a canvas can survive one and not the
+  // other (round 7, R7-5). Explain it in the same words as the serialization failure, because the cure
+  // is the same and a bare litegraph sentence reads like a dead bridge.
+  async function buildPrompt(app) {
+    try { return (await app.graphToPrompt()).output; }
+    catch (error) {
+      const detail = (error && error.message) || error;
+      if (/无法序列化/.test(String(detail))) throw error;
+      throw new Error('页面没能把当前图转成执行用的 prompt（' + detail + '）。画布能序列化不代表它能提交：'
+        + '常见原因仍是图里留有子图代理节点、而工作流数据缺少 definitions。修法：用 load_workflow 传入该工作流磁盘文件的完整 JSON（包含 definitions）整图替换，或 F5 刷新该页面。',
+        { cause: error });
+    }
+  }
   // The same question where a broken canvas is the expected input rather than an error to report.
   function readGraphOrNull(app) { try { return snapshot(app); } catch { return null; } }
   async function replaceCurrentWorkflow(app, workflow) {
@@ -292,6 +308,12 @@
     return activeWorkflowOf(app)?.isModified !== false;
   }
   async function poll() {
+    // A command in flight must not silence the heartbeat. Round 7 lost 11.6 minutes to exactly this
+    // coupling: the loop was stuck on one await, the early return stopped every later `poll`, the
+    // server-side `seen` stopped moving only because SSE stayed open — so the transport said
+    // `connected:true` while the page answered nothing. "Is this page alive?" and "is this page busy?"
+    // have to be separate facts, which is what the cheap state POST below reports.
+    if (handlingCommands && !busy) send('state', {}).catch(() => {});
     if (busy || handlingCommands) { setTimeout(poll, FAST_POLL_MS); return; } busy = true;
     try {
       const ready = graphReady(appOf());
@@ -979,9 +1001,13 @@
       }
       // The names are short and the list is what keeps a cut value from being judged: a
       // smaller bound here would let field 41 onward be refuted on its prefix.
-      return { serializedInputs: map, ...(truncated.length ? { serializedTruncated: truncated.slice(0, 500) } : {}) };
+      return { serializedInputs: map, promptFailed: false,
+        ...(truncated.length ? { serializedTruncated: truncated.slice(0, 500) } : {}) };
     } catch (error) {
-      return { serializedInputs: null, serializedError: String(error?.message || error) };
+      // A page that cannot produce a prompt cannot run either, and that fact must not be reported only
+      // when some value happens to be out of the authoritative domain (round 7, R7-5: `param-values`
+      // came back `supported / count 0` next to this same error).
+      return { serializedInputs: null, promptFailed: true, serializedError: String(error?.message || error) };
     }
   };
   const diffSnapshot = (before, after) => {
@@ -1246,26 +1272,107 @@
   // So: give the page a frame to finish its deferred widgets, let the tracker do its own thing, and if
   // the state that would be written still is not the canvas, put the canvas there. It is the same value
   // `captureCanvasState` would have assigned (`clone(rootGraph.serialize())`).
+  // Round 7's P0 (R7-7): this await had no way to lose. `requestAnimationFrame` does not fire in a
+  // hidden tab, so a `save_*` while the page was in the background never resolved, `handlingCommands`
+  // stayed true, and every later command — plus the heartbeat, which is gated on the same flag —
+  // queued forever (11.6 minutes measured, `server_info` still saying `connected:true`). Anything that
+  // waits on a browser callback has to lose that wait on purpose, and the reply has to say which branch
+  // it took.
+  const FRAME_WAIT_MS = 150;
+  // A save that cannot settle its own state is worse than a slow one, so the wait is bounded twice over:
+  // the race above for the normal case, and a watchdog here that answers `'watchdog'` if even the
+  // 150 ms timer somehow never ran.
+  async function waitOneFrame() {
+    if (typeof window.requestAnimationFrame !== 'function') return 'no-frames';
+    // Ask the page first: a background tab does not run animation frames at all, so waiting for one is
+    // waiting for nothing. Bounded by the race below for the rarer visible-but-throttled case.
+    if (document.visibilityState === 'hidden') return 'stalled';
+    // A save is never worth freezing a tab for, so the frame wait is bounded by the command watchdog as
+    // well: `clearTimeout` can be missing on an exotic page, and an un-cleared 150 ms timer must not be
+    // the reason `handlingCommands` never releases.
+    let timer;
+    const outcome = await Promise.race([
+      new Promise(resolve => window.requestAnimationFrame(() => resolve('frame'))),
+      new Promise(resolve => { timer = setTimeout(() => resolve('stalled'), FRAME_WAIT_MS); }),
+      new Promise(resolve => setTimeout(() => resolve('watchdog'), FRAME_WAIT_MS * 10))
+    ]);
+    if (timer != null && typeof clearTimeout === 'function') clearTimeout(timer);
+    return outcome;
+  }
+  // Round 7, R7-6/R7-4: `ShowText|pysssss` rebuilds its display widget inside `onConfigure` +
+  // `requestAnimationFrame`, and that only runs on a full `loadGraphData` — switching tabs back does not
+  // re-run it. So the live canvas can be holding a node with NO `widgets_values` key at all, and the next
+  // ordinary save writes a file where that node's value has vanished (`save_as_workflow` answered
+  // `{saved:true}` while doing exactly that). The signature is unambiguous when compared against the
+  // same tab's own history: the node had non-empty `widgets_values` and now has none, and with no widget
+  // on screen there is nothing the user could have edited. Keep the last value the tab itself knew
+  // instead of writing a hole, and say which nodes were kept.
+  function preserveDroppedWidgets(canvas, tracker) {
+    const sources = [tracker?.activeState, tracker?.initialState, ...(((tracker?.undoQueue || []).slice()).reverse())]
+      .filter(state => Array.isArray(state?.nodes));
+    if (!sources.length || !Array.isArray(canvas?.nodes)) return [];
+    const kept = [];
+    for (const node of canvas.nodes) {
+      const live = node?.widgets_values;
+      if (Array.isArray(live) && live.length) continue;
+      const source = sources.find(state => (state.nodes || []).some(held =>
+        String(held?.id) === String(node?.id) && Array.isArray(held?.widgets_values) && held.widgets_values.length));
+      if (!source) continue;
+      const held = (source.nodes || []).find(item => String(item?.id) === String(node?.id));
+      node.widgets_values = clone(held.widgets_values);
+      kept.push({ nodeId: String(node.id), type: node.type, chars: charCount(JSON.stringify(held.widgets_values)) });
+    }
+    return kept;
+  }
+  // Settle the deferred widgets and make sure the state a save is about to serialize IS the canvas
+  // before anything hits the disk (R6-1: `save_as_workflow` wrote a file where ShowText's
+  // `widgets_values` had vanished; R6-2: switching tabs lost it the same way).
   async function refreshActiveState(app) {
-    // Only wait when the page actually has frames to wait for: a `setTimeout` fallback would delay every
-    // save for no reason, and a page without `requestAnimationFrame` has no deferred-widget mechanism
-    // either (the widgets are built synchronously there).
-    try {
-      if (typeof window.requestAnimationFrame === 'function') {
-        await new Promise(resolve => window.requestAnimationFrame(() => resolve()));
-      }
-    } catch {}
+    const frame = await waitOneFrame();
     let canvas = null;
-    try { canvas = rootGraphOf(app).serialize(); } catch { return { ok: false, reason: '画布当前无法序列化，保存的是标签页自己持有的状态' }; }
+    try { canvas = rootGraphOf(app).serialize(); } catch { return { ok: false, frame, reason: '画布当前无法序列化，保存的是标签页自己持有的状态' }; }
     const tracker = activeWorkflowOf(app)?.changeTracker;
-    if (!tracker) return { ok: false, reason: '该前端的工作流没有 changeTracker，保存走的是它自己缓存的内容' };
+    if (!tracker) return { ok: false, frame, reason: '该前端的工作流没有 changeTracker，保存走的是它自己缓存的内容' };
     try { tracker.prepareForSave?.(); } catch {}
+    const preserved = preserveDroppedWidgets(canvas, tracker);
     let matches = false;
     try { matches = JSON.stringify(tracker.activeState ?? null) === JSON.stringify(canvas); } catch {}
-    if (matches) return { ok: true };
+    if (matches) return { ok: true, frame, ...(preserved.length ? { preserved } : {}) };
     try { tracker.activeState = clone(canvas); }
-    catch { return { ok: false, reason: '标签页缓存的图状态无法更新，保存的内容可能比画布旧' }; }
-    return { ok: true, takenFromCanvas: true };
+    catch { return { ok: false, frame, reason: '标签页缓存的图状态无法更新，保存的内容可能比画布旧', ...(preserved.length ? { preserved } : {}) }; }
+    return { ok: true, frame, takenFromCanvas: true, ...(preserved.length ? { preserved } : {}) };
+  }
+  // Round 7 (R7-8) and round 6 (R6-3): a subgraph proxy node and the copy of that subgraph in
+  // `definitions.subgraphs[].nodes[]` are two stores of the same widget values. Writing the proxy updates
+  // the proxy and the queue; neither ComfyUI's save nor anything we do reconciles the definition copy, so
+  // the file ends up holding two conflicting values for the same slot (measured on this machine: proxy
+  // `77.noise_seed = 777777777` while `definitions[a67caa28…].nodes[86].noise_seed` stayed
+  // `432262096973490`). The mapping is readable from the data — a proxy node's `type` IS the subgraph id,
+  // and the inner node keeps the exposed widget under the same name — and the claim is only made when the
+  // definition copy held exactly the value this write replaced. Nothing is rewritten here: this is the
+  // "record it honestly" half of the answer the sixth round asked for.
+  function staleDefinitionCopies(app, results) {
+    let graphData = null;
+    try { graphData = rootGraphOf(app).serialize(); } catch { return []; }
+    const subgraphs = (graphData?.definitions?.subgraphs || []).filter(item => Array.isArray(item?.nodes));
+    if (!subgraphs.length) return [];
+    const found = [];
+    for (const { edit, outcome } of results) {
+      if (!outcome?.verified) continue;
+      const sub = subgraphs.find(item => item.id === edit.node.type);
+      if (!sub) continue;
+      const name = edit.reroutedFrom || edit.widget.name;
+      for (const inner of sub.nodes) {
+        const held = inner?.widgets_values_named?.[name];
+        if (held === undefined) continue;
+        if (String(held) !== String(edit.before ?? '')) continue;   // not the slot this write replaced
+        if (String(held) === String(outcome.after ?? '')) continue; // already in step
+        found.push({ nodeId: String(edit.node.id), widget: name, subgraphId: sub.id,
+          subgraphName: sub.name || null, innerNodeId: String(inner.id), innerType: inner.type || null,
+          definitionValue: held ?? null, canvasValue: outcome.after ?? null });
+      }
+    }
+    return found;
   }
   async function executeAction(command) {
     const app = appOf(); const args = command.args || {};
@@ -1303,6 +1410,17 @@
           }
         }
         return { saved: true, workflow: describeWorkflow(store, store.activeWorkflow),
+          // Three separate facts, each with its own wording: the value the tab could not see on screen
+          // was kept (R7-6), the page was in the background so deferred widgets never built (R7-4/R7-7),
+          // and the state could not be reconciled at all (R6-1).
+          ...(stateRefresh.preserved ? {
+            saveStatePreserved: stateRefresh.preserved,
+            saveStatePreservedNote: '这些节点在画布上一个控件都没有（前端延迟重建的控件在切标签路径上不会重跑），但本标签页自己记得它们的值——已按记得的值写进文件，没有留成空洞（R7-6）。要让画布真的显示出来，把这个标签切到前台或刷新页面。'
+          } : {}),
+          ...(stateRefresh.frame === 'stalled' ? {
+            deferredFrame: 'stalled',
+            deferredNote: '页面此刻在后台：requestAnimationFrame 在 ' + FRAME_WAIT_MS + 'ms 内没跑，延迟重建的控件本次没有机会建出来。把该标签切到前台再保存更稳。'
+          } : {}),
           ...(stateRefresh.ok ? {} : { saveStateWarning: '落盘的内容取自标签页缓存的图状态而非实时画布（' + stateRefresh.reason + '）：如果画布上有节点把自己的值存在延迟重建的组件里，这类值可能没进文件。' }) };
       }
       case 'edit_graph': {
@@ -1450,8 +1568,17 @@
       // `includePrompt:false` skips `graphToPrompt()`: packs that patch serialization (AICG3D does) pay
       // a serialization side effect on every read, and a read-only listing should not cause one
       // (fourth-round observation R4-F). The default stays `true` so existing callers see no change.
-      case 'get_workflow': return { workflow: readGraph(app), ...(args.includePrompt === false
-        ? { prompt: null, promptSkipped: true } : { prompt: (await app.graphToPrompt()).output }) };
+      case 'get_workflow': {
+      // Round 7, R7-5: three tools serialize the graph (`get_workflow` after `readGraph`, the structural
+      // audit, and every guard that uses `canSerialize`) while `run`, `audit(op=params)` and the default
+      // path here build a prompt with `graphToPrompt()`. A canvas with subgraph proxies but no
+      // `definitions` passes the first group and dies in the second, and the caller got a bare litegraph
+      // sentence. Same advice as `readGraph`, so the two faces of "half-dead" cannot be mistaken for a
+      // dead bridge. The default stays `true` (fourth-round observation R4-F).
+      const workflow = readGraph(app);
+      if (args.includePrompt === false) return { workflow, prompt: null, promptSkipped: true };
+      return { workflow, prompt: await buildPrompt(app) };
+    }
       case 'update_nodes': {
         const changes = args.changes;
         if (!Array.isArray(changes) || !changes.length || changes.length > 500) throw fail('changes 必须是包含 1–500 项的数组' + argNameHint(args, ['changes']),
@@ -1548,6 +1675,15 @@
             nextSteps.push(...panels.refreshFailed.map(item => 'node ' + item.nodeId + '.' + item.widget + ' → 让用户重开该面板即可，数据不必重写'));
           }
         }
+        // The second store of the same value (R7-8): reported, never rewritten.
+        const definitionsStale = staleDefinitionCopies(app, results);
+        if (definitionsStale.length) {
+          warnings.push(definitionsStale.length + ' 处写的是子图代理控件：画布与队列已用新值，但 definitions 里同一槽位还是这次写掉的旧值（definitionsStale）。'
+            + '保存到磁盘的文件会同时存在两份矛盾的值——重新加载时以代理 widget 为准（实测会自愈），但直接读这个 JSON 的外部工具读到的是旧值。');
+          nextSteps.push(...definitionsStale.map(item => 'node ' + item.nodeId + '.' + item.widget
+            + ' → definitions[' + (item.subgraphName || item.subgraphId) + '].nodes[' + item.innerNodeId + '].' + item.widget
+            + ' 仍是 ' + JSON.stringify(item.definitionValue) + '；要消除分叉就整图替换（load_workflow 传两份值都改好的 JSON），只改代理控件不会同步它'));
+        }
         return {
           changed: results.map(({ edit, outcome }) => ({
             nodeId: String(edit.node.id), widget: edit.widget.name,
@@ -1567,6 +1703,7 @@
           })),
           ...(wiredInputs.length ? { wiredInputs } : {}),
           ...(panels.note ? { panels } : {}),
+          ...(definitionsStale.length ? { definitionsStale } : {}),
           ...(revertedWrites.length ? { revertedWrites } : {}),
           ...followUp,
           // One sentence per cause actually present, joined — never one clause describing a set with
@@ -1740,6 +1877,67 @@
     } catch {}
     return { versioned, tracked };
   }
+  // One command must never own the queue. Round 7 froze the whole bridge for 11.6 minutes on a single
+  // await that could not be woken (R7-7), and the loop's only defence had been "this code never hangs".
+  // It does not need to be a hang to hurt: a pack setter that spins, or a `loadGraphData` that never
+  // resolves, produces the same dead tab. So: race the body against a watchdog, answer the caller with
+  // what is actually known ("it may still have completed — re-read before repeating it"), and keep the
+  // queue moving. A body that finishes after its deadline is discarded rather than published, because
+  // the caller already moved on and a surprise sync is how a late save would overwrite the user's graph.
+  const COMMAND_TIMEOUT_MS = 25000;
+  const STALLED = Symbol('stalled');
+  async function runCommandBody(command) {
+    let previousAuthority, commandEditSequence;
+    try {
+      if (graphReady(appOf())) await syncWorkflow(appOf());
+      const writesCanvas = ['update_nodes', 'bind_image', 'load_workflow', 'undo', 'redo', 'restore_edit', 'edit_graph', 'save_workflow', 'save_as_workflow', 'switch_workflow', 'new_workflow', 'run'].includes(command.action);
+      if (writesCanvas && allowAI && graphReady(appOf())) {
+        previousAuthority = localAuthority; localEdit(true); commandEditSequence = editSequence;
+      }
+      const result = await execute(command);
+      if (command.abandoned) return { id: command.id, result, abandoned: true };
+      // A write must always be published, whatever the counter says about it.
+      if (writesCanvas) {
+        // Tell the page its own tab is now dirty before publishing, so the tab badge, the
+        // leave-page warning and the next `graphChanged` all see this write (R5-B). What gets
+        // reported is the front-end's own answer — `isModified` — not whether our calls ran.
+        const marks = markCanvasDirty(appOf());
+        const saved = command.action === 'save_workflow' || command.action === 'save_as_workflow';
+        const modified = activeWorkflowOf(appOf())?.isModified === true;
+        if (result && typeof result === 'object' && !Array.isArray(result)) {
+          result.dirtyMarked = saved ? false : modified;
+          if (!saved && !modified) result.dirtyNote = marks.tracked
+            ? '标签页没有标为「未保存」，通常是这次写入与已保存的内容本来就相同；要落盘仍需 save_workflow。'
+            : '这个前端没有变更追踪接口，标签页不会显示「未保存」：画布内容已改，切标签或关页面前请先 save_workflow。';
+        }
+        forceSync = true; await syncWorkflow(appOf());
+      }
+      return { id: command.id, result };
+    }
+    catch (e) {
+      if (commandEditSequence !== undefined && commandEditSequence === editSequence) localAuthority = previousAuthority;
+      return commandError(command, e);
+    }
+  }
+  async function settleCommand(command) {
+    let timer = null;
+    const work = runCommandBody(command);
+    const outcome = await Promise.race([work, new Promise(resolve => {
+      timer = setTimeout(() => resolve(STALLED), COMMAND_TIMEOUT_MS);
+      // A watchdog timer must not be the reason a page cannot go idle: it is cleared on the normal path.
+      if (timer && typeof timer.unref === 'function') timer.unref();
+    })]);
+    // `typeof` first: a page (or a fake) without `clearTimeout` must not turn a finished command into a
+    // ReferenceError inside the loop.
+    if (timer != null && typeof clearTimeout === 'function') clearTimeout(timer);
+    if (outcome !== STALLED) return outcome;
+    command.abandoned = true;
+    stalledCommands += 1;
+    work.then(late => { if (late?.result !== undefined) completed.set(command.id, late); }).catch(() => {});
+    return commandError(command, new Error('这条 ' + command.action + ' 在 ' + Math.round(COMMAND_TIMEOUT_MS / 1000)
+      + ' 秒内没有返回，已按超时收尾。注意它可能仍在页面里执行完（保存类动作尤其可能已经落盘），所以不要立刻重发同一个动作：'
+      + '先 list_workflows / get_workflow / list_edits 复核当前状态。反复卡在同一条通常是页面里有等不到的浏览器回调（后台标签页的 requestAnimationFrame 不触发），F5 刷新该页面即可恢复；本桥接的其余命令不会被它堵住。'));
+  }
   async function handleCommands() {
     if (busy || handlingCommands) return;
     handlingCommands = true;
@@ -1748,36 +1946,8 @@
         const command = commandQueue.shift();
         let reply = completed.get(command.id);
         if (!reply) {
-          let previousAuthority, commandEditSequence;
-          try {
-            if (graphReady(appOf())) await syncWorkflow(appOf());
-            const writesCanvas = ['update_nodes', 'bind_image', 'load_workflow', 'undo', 'redo', 'restore_edit', 'edit_graph', 'save_workflow', 'save_as_workflow', 'switch_workflow', 'new_workflow', 'run'].includes(command.action);
-            if (writesCanvas && allowAI && graphReady(appOf())) {
-              previousAuthority = localAuthority; localEdit(true); commandEditSequence = editSequence;
-            }
-            reply = { id: command.id, result: await execute(command) };
-            // A write must always be published, whatever the counter says about it.
-            if (writesCanvas) {
-              // Tell the page its own tab is now dirty before publishing, so the tab badge, the
-              // leave-page warning and the next `graphChanged` all see this write (R5-B). What gets
-              // reported is the front-end's own answer — `isModified` — not whether our calls ran.
-              const marks = markCanvasDirty(appOf());
-              const saved = command.action === 'save_workflow' || command.action === 'save_as_workflow';
-              const modified = activeWorkflowOf(appOf())?.isModified === true;
-              if (reply.result && typeof reply.result === 'object' && !Array.isArray(reply.result)) {
-                reply.result.dirtyMarked = saved ? false : modified;
-                if (!saved && !modified) reply.result.dirtyNote = marks.tracked
-                  ? '标签页没有标为「未保存」，通常是这次写入与已保存的内容本来就相同；要落盘仍需 save_workflow。'
-                  : '这个前端没有变更追踪接口，标签页不会显示「未保存」：画布内容已改，切标签或关页面前请先 save_workflow。';
-              }
-              forceSync = true; await syncWorkflow(appOf());
-            }
-          }
-          catch (e) {
-            if (commandEditSequence !== undefined && commandEditSequence === editSequence) localAuthority = previousAuthority;
-            reply = commandError(command, e);
-          }
-          completed.set(command.id, reply);
+          reply = await settleCommand(command);
+          if (reply) completed.set(command.id, reply);
           if (completed.size > 200) completed.delete(completed.keys().next().value);
         }
         await send('result', reply);

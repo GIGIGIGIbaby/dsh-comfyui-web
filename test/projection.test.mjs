@@ -177,3 +177,18 @@ test('tool surface keeps its size and gains only optional projection modes', () 
   assert.equal((listed.inputSchema.required || []).includes('detail'), false);
   assert.ok(listed.annotations.readOnlyHint);
 });
+
+test('a plugin-side fallback says which budget fired, not that the page is old', async () => {
+  // R7-3: the note used to read 「本页桥接代码较旧…刷新 ComfyUI 页面可在源头省掉这次传输」 on every
+  // fallback, so following it meant refreshing a page that was never the problem. The trigger is the
+  // size budget, and the projection already carries that number.
+  const fat = { workflow: { nodes: Array.from({ length: 400 }, (_, i) => ({ id: i, type: 'Note', widgets_values: ['x'.repeat(60)] })), links: [] }, prompt: {} };
+  const result = await callComfyTool({ mcpEnabled: true, command: async () => fat }, 'get_workflow', {}, { dshSessionId: 'own' });
+  const text = JSON.stringify(result.structuredContent ?? result);
+  assert.match(text, /projection/, 'the reply is projected');
+  assert.doesNotMatch(text, /本页桥接代码较旧/, 'and it no longer blames the page build');
+  assert.match(text, /原因：返回体/, 'the measured reason travels with the note');
+  const note = result.structuredContent?.fallbackNote || '';
+  assert.match(note, /mode="full"/, 'plus the one argument that gets the full payload back');
+  assert.match(note, /不是页面故障/);
+});

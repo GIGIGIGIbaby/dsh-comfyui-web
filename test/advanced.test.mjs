@@ -10,6 +10,7 @@ import { GenerationMonitor } from '../lib/generation.js';
 import { referenceImages, uploadImage } from '../lib/reference.js';
 import { callComfyTool } from '../lib/mcp.js';
 import { resumeCompletionJob } from '../lib/completion-job.js';
+import { createPageTimers } from './helpers/page-timers.mjs';
 
 const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(r => setImmediate(r)); };
 class Socket extends EventTarget {
@@ -117,16 +118,19 @@ test('precise graph edits roll back failures, snapshots survive browser reload, 
       graph._nodes = nodes; graph.links = [...data.links]; store.activeWorkflow = workflow; return true;
     } };
   async function browser() {
-    const timers = [], replies = [], commands = [], parent = { postMessage() {} };
+    const timers = createPageTimers(), replies = [], commands = [], parent = { postMessage() {} };
     vm.runInNewContext(code, { window: { parent, LiteGraph: { createNode: create }, comfyAPI: { app: { app } }, addEventListener() {} },
       crypto: { randomUUID: () => 'checkpoint-' + checkpoints++ }, URL, URLSearchParams,
       location: { origin: 'http://localhost:8188', search: '?dsh_client=p&dsh_session=own' }, document: { referrer: 'http://localhost:3080/' },
       localStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value) },
-      setTimeout: fn => timers.push(fn), fetch: async (path, options) => {
+      setTimeout: timers.schedule, clearTimeout: timers.unschedule, fetch: async (path, options) => {
         const data = JSON.parse(options.body); if (path.endsWith('/result')) replies.push(data);
         return { ok: true, json: async () => path.endsWith('/poll') ? { commands: commands.splice(0) } : { revision: 0 } };
       } }); await flush();
-    return async (action, args = {}) => { commands.push({ id: 'call-' + replies.length, action, args }); timers.shift()(); await flush(); return replies.at(-1); };
+    return async (action, args = {}) => { const before = replies.length;
+      commands.push({ id: 'call-' + before, action, args });
+      await timers.runUntil(() => replies.length > before);
+      return replies.at(-1); };
   }
   let command = await browser();
   const edited = await command('edit_graph', { operations: [ { op: 'create_node', nodeType: 'Target', ref: 'new', position: [200, 100] },

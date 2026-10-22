@@ -411,3 +411,24 @@ test('a serialized field that missed the truncated-name list is still not refute
   assert.equal(violations.bad.length, 0, 'no field, including the 41st outside the list, may be refuted');
   assert.equal(violations.unverified.length, 41, 'all of them are open questions about what the queue received');
 });
+
+test('the param audit refuses a canvas that cannot produce a prompt', () => {
+  // R7-5: the page now answers `promptFailed` whether or not it worked, and an older page that says
+  // nothing is not judged for a fact it never reported.
+  const nodes = [{ id: '195', type: 'AICG3DPromptSegmentSplit', title: '', mode: 0,
+    widgets: [{ name: 'text', kind: 'plain', type: 'string', value: '镜1' }], inputs: [], outputs: [] }];
+  const failed = auditParams({ page: { nodes, promptFailed: true, serializedError: 'Attempted to access LGraph reference…', serializedInputs: null }, defs: {} });
+  assert.equal(failed.verdict, 'refuted', 'no prompt means nothing can be submitted');
+  const refused = failed.checks.find(item => item.id === 'prompt-serializable');
+  assert.equal(refused.verdict, 'refuted');
+  assert.match(refused.hint, /definitions/);
+  assert.match(refused.hint, /load_workflow/);
+  assert.match(refused.evidence[0].note, /LGraph/, 'the page error travels as evidence');
+
+  const worked = auditParams({ page: { nodes, promptFailed: false, serializedInputs: { 195: { text: '镜1' } } }, defs: {} });
+  assert.equal(worked.checks.find(item => item.id === 'prompt-serializable').verdict, 'supported');
+
+  const silent = auditParams({ page: { nodes }, defs: {} });
+  assert.equal(silent.checks.find(item => item.id === 'prompt-serializable'), undefined,
+    'a page that never reported the fact gets no verdict about it');
+});

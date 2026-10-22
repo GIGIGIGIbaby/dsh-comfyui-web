@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ComfyRuntime, normalizeUrl, BRIDGE_PROTOCOL } from '../lib/runtime.js';
 import { WorkflowSync } from '../lib/sync.js';
+import { createPageTimers } from './helpers/page-timers.mjs';
 
 test('validates server URLs', () => {
   assert.equal(normalizeUrl('http://127.0.0.1:8188/'), 'http://127.0.0.1:8188');
@@ -18,7 +19,7 @@ test('browser tab resume synchronizes into the existing workflow without duplica
   const sync = new WorkflowSync();
   const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(r => setImmediate(r)); };
   function page(clientId, external = false) {
-    const scheduled = []; const commands = []; const replies = []; const calls = []; const events = new Map();
+    const scheduled = createPageTimers(); const commands = []; const replies = []; const calls = []; const events = new Map();
     let syncGate;
     const active = { path: 'shared.json' }; const tabs = [active];
     const tracker = { isLoadingGraph: false };
@@ -37,7 +38,7 @@ test('browser tab resume synchronizes into the existing workflow without duplica
     if (external) window.parent = window;
     const context = vm.createContext({ window, crypto: { randomUUID: () => clientId }, location: { search: external ? '' : '?dsh_client=' + clientId + '&dsh_session=s' },
       document: { referrer: 'http://127.0.0.1:3080/', addEventListener(name, callback) { events.set(name, callback); } }, URL, URLSearchParams,
-      localStorage: { setItem() {} }, setTimeout: fn => scheduled.push(fn), fetch: async (path, options) => {
+      localStorage: { setItem() {} }, setTimeout: scheduled.schedule, clearTimeout: scheduled.unschedule, fetch: async (path, options) => {
         const data = JSON.parse(options.body);
         if (path.endsWith('/result')) replies.push(data);
         const reply = path.endsWith('/sync') ? sync.exchange(data) : path.endsWith('/poll') ? { commands: commands.splice(0) } : { ok: true };
@@ -48,8 +49,9 @@ test('browser tab resume synchronizes into the existing workflow without duplica
       edit(value) { events.get('pointerdown')?.({ isTrusted: true }); graph.nodes[0].widgets_values[0] = value; events.get('input')?.({ isTrusted: true }); events.get('pointerup')?.({ isTrusted: true }); }, value() { return graph.nodes[0].widgets_values[0]; },
       localRevision() { graph.revision++; },
       holdSync() { let release; syncGate = new Promise(resolve => { release = resolve; }); return release; },
-      async tick() { scheduled.shift()(); await flush(); },
-      async command(action, args = {}) { commands.push({ id: String(replies.length), action, args }); await this.tick(); return replies.at(-1); } };
+      async tick() { scheduled.runNext(); await flush(); },
+      async command(action, args = {}) { const before = replies.length; commands.push({ id: String(before), action, args });
+        await scheduled.runUntil(() => replies.length > before); return replies.at(-1); } };
   }
   const original = page('original', true); const embedded = page('embedded');
   original.start(); await flush(); embedded.start(); await flush();
@@ -144,7 +146,7 @@ test('proxy injects bridge, forwards HTTP, rejects cross-origin writes, and isol
 
 test('browser bridge edits actual named widgets, validates whole batch and restores graph', async () => {
   const code = (await readFile(new URL('../bridge.js', import.meta.url), 'utf8')).replace('__DSH_BRIDGE_TOKEN__', '"test-token"');
-  const scheduled = []; const results = []; let commands = []; const messages = [];
+  const scheduled = createPageTimers(); const results = []; let commands = []; const messages = [];
   const widget = { name: 'text', type: 'text', value: 'original' };
   const node = { id: 6, type: 'CLIPTextEncode', title: 'Prompt', widgets: [widget], inputs: [], outputs: [] };
   let dirty = false; let submitted = 0;
@@ -156,7 +158,7 @@ test('browser bridge edits actual named widgets, validates whole batch and resto
   const window = { parent, comfyAPI: { app: { app }, api: { api: { queuePrompt: async () => { submitted++; return { prompt_id: 'test-prompt' }; } } } }, addEventListener: () => {} };
   const context = vm.createContext({ window, location: { search: '?dsh_client=c&dsh_session=s' }, document: { referrer: 'http://127.0.0.1:40000/' }, URL, URLSearchParams,
     crypto: { randomUUID: () => 'checkpoint-' + results.length },
-    setTimeout: fn => scheduled.push(fn), fetch: async (path, options) => {
+    setTimeout: scheduled.schedule, clearTimeout: scheduled.unschedule, fetch: async (path, options) => {
       const data = JSON.parse(options.body);
       if (path.endsWith('/result')) results.push(data);
       const reply = path.endsWith('/poll') ? { commands: commands.splice(0) } : { ok: true };
@@ -165,7 +167,9 @@ test('browser bridge edits actual named widgets, validates whole batch and resto
   vm.runInContext(code, context);
   const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(r => setImmediate(r)); };
   await flush();
-  async function command(action, args = {}, expiresAt) { commands.push({ id: String(results.length), action, args, expiresAt }); scheduled.shift()(); await flush(); return results.at(-1); }
+  async function command(action, args = {}, expiresAt) { const before = results.length;
+    commands.push({ id: String(before), action, args, expiresAt });
+    await scheduled.runUntil(() => results.length > before); return results.at(-1); }
   assert.equal(messages.at(-1).ready, true);
   assert.match((await command('update_nodes', { changes: [{ nodeId: '6', widget: 'text', value: 'expired change' }] }, 1)).error, /过期/);
   assert.equal(widget.value, 'original', 'a delayed expired command must not modify the graph');
@@ -206,4 +210,44 @@ test('the served bridge carries the plugin version, never a literal that can dri
   // in ~/.dsh/comfyui/connection.json), so the running surface has to say it rather than let a green
   // server_info imply the token is confidential.
   assert.match(runtime.status().localTrustBoundary, /本机任意进程可读/);
+});
+
+test('a command the page never answers is counted on both sides and the timeout names the cure', async t => {
+  // R7-7: the round-7 freeze was invisible because `connected` reads the SSE stream, which stays open while
+  // the page's command loop is wedged. Two counters close that gap — the page's own watchdog and this
+  // transport-side one — and the timeout text now says what a timeout cannot prove.
+  const runtime = new ComfyRuntime('/tmp/dsh-comfyui-timeout-test.json', { port: 0 });
+  const written = [];
+  const client = { id: 'c-timeout', sessionId: 's', queue: [], seen: Date.now(), ready: true, allowAI: true,
+    stream: { write: data => written.push(String(data)), destroyed: false } };
+  runtime.clients.set(client.id, client);
+  const commandId = () => JSON.parse(written.at(-1).replace(/^data: /, '').trim()).commands[0].id;
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const pending = runtime.dispatch(client, 'save_as_workflow', { name: 'x' });
+    assert.match(written.join(''), /save_as_workflow/, 'the command reached the page');
+    t.mock.timers.tick(25_000);
+    const message = await pending.then(() => null, error => error.message);
+    assert.match(message, /面板响应超时/);
+    assert.match(message, /保存类动作常已落盘/, 'a save that timed out may still have hit the disk, and the caller must be told');
+    assert.match(message, /再决定是否重发/, 'so the answer is to check, not to fire the same write again');
+    assert.match(message, /F5 刷新/, 'and the recovery for a wedged page is named');
+    assert.equal(client.timeouts, 1, 'the transport counted it, so doctor can fail on it');
+
+    // A command that IS answered must not leave its watchdog to fire later and be counted as a second stall.
+    const answered = runtime.dispatch(client, 'list_nodes', {});
+    runtime.pending.get(commandId()).resolve({ nodes: [] });
+    assert.deepEqual(await answered, { nodes: [] }, 'the reply reaches the caller');
+    t.mock.timers.tick(60_000);
+    assert.equal(client.timeouts, 1, 'answering clears the watchdog instead of letting it expire behind the reply');
+    assert.equal(runtime.pending.size, 0);
+
+    client.stalledCommands = 2;
+    const reported = runtime.status().clients.find(item => item.clientId === client.id);
+    assert.equal(reported.timeouts, 1);
+    assert.equal(reported.stalledCommands, 2, 'and the page-reported count travels with the client');
+    assert.equal(runtime.status().syncClients.find(item => item.clientId === client.id).stalledCommands, 2);
+  } finally {
+    t.mock.timers.reset();
+  }
 });

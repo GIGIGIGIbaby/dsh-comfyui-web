@@ -12,7 +12,13 @@ const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(r => 
 // refuses to apply.
 async function boot(nodes, options = {}) {
   const code = (await readFile(new URL('../bridge.js', import.meta.url), 'utf8')).replace('__DSH_BRIDGE_TOKEN__', '"test"');
-  const timers = [], replies = [], commands = [];
+  const timers = [], replies = [], commands = [], requests = [];
+  // A virtual clock, because the bridge now schedules a 25-second watchdog per command alongside 400ms
+  // poll ticks and a 600ms settle. Popping timers in arrival order would fire the watchdog "first" and
+  // every command would come back as stalled; firing them in due order reproduces what a page does.
+  let clock = 0;
+  const schedule = (fn, ms) => { const entry = { fn, at: clock + (Number(ms) || 0) }; timers.push(entry); return entry; };
+  const unschedule = entry => { const index = timers.indexOf(entry); if (index >= 0) timers.splice(index, 1); };
   // Top-level graph fields the bridge must carry through its undo chain. The real `serialize()` emits
   // `definitions`, `last_node_id`, `last_link_id`, `floatingLinks`… and a delta encoder that only knows
   // a whitelist of them loses whatever is not on the list — the fourth-round P0 (R4-E): a canvas left
@@ -25,7 +31,10 @@ async function boot(nodes, options = {}) {
       if (!graph.fields.definitions && nodes.some(node => node.type === 'SubgraphProxyFixture')) {
         throw new TypeError('Attempted to access LGraph reference that was null or undefined.');
       }
-      return { nodes: nodes.map(n => ({ id: n.id, type: n.type, widgets_values: (n.widgets || []).map(w => w.value),
+      // LiteGraph omits `widgets_values` entirely for a node with no widgets — which is exactly the
+      // signature of a display widget that was never rebuilt, so the fake has to reproduce it.
+      return { nodes: nodes.map(n => ({ id: n.id, type: n.type,
+        ...((n.widgets || []).length ? { widgets_values: n.widgets.map(w => w.value) } : {}),
         mode: n.mode ?? 0, properties: n.properties ?? {} })), links: graph.links, groups: [], ...graph.fields };
     },
     // `onDirty` runs inside the settle window: the bridge marks the canvas dirty as the last step of
@@ -68,11 +77,12 @@ async function boot(nodes, options = {}) {
       ...(options.requestAnimationFrame ? { requestAnimationFrame: options.requestAnimationFrame } : {}) },
     crypto: { randomUUID: () => 'u' + Math.random() }, URL, URLSearchParams, console,
     location: { origin: 'http://comfy.test', search: '?dsh_client=p&dsh_session=own', href: 'http://comfy.test/' },
-    document: { referrer: 'http://dsh.test/', visibilityState: 'visible', addEventListener() {} },
+    document: { referrer: 'http://dsh.test/', visibilityState: options.visibility || 'visible', addEventListener() {} },
     localStorage: options.localStorage || { getItem: () => null, setItem() {} },
-    setTimeout: fn => timers.push(fn), clearTimeout() {},
+    setTimeout: schedule, clearTimeout: unschedule,
     fetch: async (url, options) => {
       const body = options?.body ? JSON.parse(options.body) : {};
+      requests.push(String(url).replace(/^.*\/__dsh_comfyui\//, ''));
       if (String(url).includes('/result')) replies.push(body);
       return { ok: true, status: 200, json: async () => String(url).includes('/poll') ? { commands: commands.splice(0) } : { revision: 1 } };
     }
@@ -83,9 +93,9 @@ async function boot(nodes, options = {}) {
     // A write can park on the 600ms settle window, so keep running whatever the bridge queued
     // until the reply lands instead of firing exactly one timer and assuming it is done.
     const before = replies.length;
-    for (let turn = 0; turn < 60 && replies.length === before; turn += 1) {
-      const next = timers.shift();
-      if (next) next();
+    for (let turn = 0; turn < 400 && replies.length === before; turn += 1) {
+      const next = timers.length ? timers.reduce((earliest, entry) => (entry.at < earliest.at ? entry : earliest)) : null;
+      if (next) { unschedule(next); clock = Math.max(clock, next.at); next.fn(); }
       await flush();
     }
     const reply = replies.at(-1);
@@ -95,7 +105,7 @@ async function boot(nodes, options = {}) {
     return reply.result;
   };
   // Callable as before, plus the page handles a test needs to move the graph under the bridge's feet.
-  run.graph = graph; run.app = app; run.nodes = nodes;
+  run.graph = graph; run.app = app; run.nodes = nodes; run.requests = requests;
   return run;
 }
 
@@ -1054,7 +1064,7 @@ test('a save hands the disk the canvas, even when a node only builds its widget 
   const stale = JSON.parse(JSON.stringify(command.graph.serialize()));
   active.changeTracker = { activeState: stale, prepareForSave() {} };
   Object.defineProperty(active, 'activeState', { configurable: true, get() { return this.changeTracker?.activeState ?? null; } });
-  assert.deepEqual(active.activeState.nodes[0].widgets_values, [], 'the cached state has no widget yet');
+  assert.equal('widgets_values' in active.activeState.nodes[0], false, 'the cached state has no widget yet');
   let written = null;
   store.saveWorkflow = async workflow => { written = JSON.parse(JSON.stringify(workflow.activeState)); };
   store.saveAs = () => { throw new Error('unused in this test'); };
@@ -1248,4 +1258,170 @@ test('a node whose controls are not built yet says so instead of denying it can 
   assert.match(error.hint, /requestAnimationFrame/, 'the hint names the deferred build, not just the missing name');
   assert.match(error.hint, /等 4 秒|3\.5 秒/, 'and gives the caller the one action that works: wait and resend');
   assert.match(error.hint, /本来就没有可写控件/, 'the other cause stays listed, so the hint cannot be a guess');
+});
+
+// ---------------------------------------------------------------- one command may not own the queue.
+// Round 7's P0 (R7-7): a `save_*` awaited a `requestAnimationFrame` that a backgrounded page never runs.
+// The await never resolved, `handlingCommands` stayed true, and every later tool call — plus the
+// heartbeat, which was gated on the same flag — queued for 11.6 minutes while `server_info` kept
+// answering `connected:true`, because the SSE stream was still open. Three holes, three assertions:
+// an unbounded browser callback, a loop with no per-command deadline, and a heartbeat that shares the
+// loop's fate.
+
+const showTextNode = (value = 'x'.repeat(533)) => {
+  const node = { id: 111, type: 'ShowText|pysssss', title: '', mode: 0, properties: {},
+    widgets: [{ name: 'text_0', type: 'string', value, options: {}, callback() {} }], inputs: [], outputs: [] };
+  return node;
+};
+// The front-end's own save plumbing, faked the way `ComfyWorkflowWithChangeTracker` uses it: the file
+// content is `JSON.stringify(this.activeState)`, and `activeState` is a getter onto the change tracker.
+function attachStore(command, changeTracker) {
+  const store = command.app.extensionManager.workflow, active = store.activeWorkflow;
+  store.getWorkflowByPath = path => store.openWorkflows.find(item => item.path === path);
+  store.createNewTemporary = () => { throw new Error('unused'); };
+  active.directory = 'workflows';
+  active.changeTracker = changeTracker;
+  Object.defineProperty(active, 'activeState', { configurable: true, get() { return this.changeTracker?.activeState ?? null; } });
+  const written = [];
+  store.saveWorkflow = async workflow => { written.push(JSON.parse(JSON.stringify(workflow.activeState))); };
+  store.saveAs = () => { throw new Error('unused in this test'); };
+  return { written };
+}
+
+test('a page that never gets a frame still finishes its save, and says the frame did not run', async () => {
+  // A background tab: `requestAnimationFrame` is accepted and never called.
+  const command = await boot([showTextNode()], { requestAnimationFrame: () => {}, visibility: 'hidden' });
+  const canvasState = JSON.parse(JSON.stringify(command.graph.serialize()));
+  const { written } = attachStore(command, { activeState: canvasState, initialState: canvasState, prepareForSave() {} });
+
+  const reply = await command('save_workflow');
+  assert.equal(reply.saved, true, 'the save must return instead of wedging the page forever');
+  assert.equal(reply.deferredFrame, 'stalled', 'and it must say that no frame ever came');
+  assert.match(reply.deferredNote, /后台/, 'the reason names the background tab, because that is the cure');
+  assert.equal(written.length, 1, 'the save itself ran');
+
+  // The same page in the foreground, but the frame never lands (throttled, or a pack that blocks the
+  // queue): the wait is bounded by its own timer, not by the visibility flag.
+  const throttled = await boot([showTextNode()], { requestAnimationFrame: () => {} });
+  const state = JSON.parse(JSON.stringify(throttled.graph.serialize()));
+  const secondStore = attachStore(throttled, { activeState: state, initialState: state, prepareForSave() {} });
+  const second = await throttled('save_workflow');
+  assert.equal(second.saved, true, 'a visible page cannot hang the loop either');
+  assert.equal(second.deferredFrame, 'stalled');
+  assert.equal(secondStore.written.length, 1);
+});
+
+test('a save keeps the value of a node whose widget never came back, instead of writing a hole', async () => {
+  const node = showTextNode();
+  const command = await boot([node], { requestAnimationFrame: fn => fn() });
+  // What the tab remembered from when it was opened: the node with its 533 characters.
+  const remembered = JSON.parse(JSON.stringify(command.graph.serialize()));
+  // `switch_workflow` back to this tab does not re-run `onConfigure`, so the widget is gone and the live
+  // canvas serializes the node with no `widgets_values` key at all (round 7, R7-4/R7-6).
+  node.widgets = [];
+  const staleCache = JSON.parse(JSON.stringify(command.graph.serialize()));
+  assert.equal('widgets_values' in staleCache.nodes[0], false, 'fixture: the canvas really lost the key');
+  const { written } = attachStore(command, { activeState: staleCache, initialState: remembered, prepareForSave() {} });
+
+  const reply = await command('save_workflow');
+  assert.equal(written[0].nodes[0].widgets_values[0], 'x'.repeat(533),
+    'the file carries the value the tab knew instead of an absent key');
+  assert.equal(JSON.stringify(reply.saveStatePreserved.map(item => item.nodeId)), '["111"]', 'and says which node was kept');
+  assert.match(reply.saveStatePreservedNote, /延迟重建/);
+  assert.equal(node.widgets.length, 0, 'the canvas was not touched — only what gets written to disk');
+});
+
+test('a command that never returns is written off, the heartbeat keeps beating, and the next command runs', async () => {
+  const command = await boot([plainNode()]);
+  command.app.graphToPrompt = () => new Promise(() => {});     // a page-side call that never resolves
+
+  const stuck = await command('get_workflow').catch(error => error);
+  assert.match(stuck.bridgeError, /没有返回/, 'the caller gets a verdict, not a silent hang');
+  assert.match(stuck.bridgeError, /不要立刻重发/, 'because the action may still have completed on the page');
+  assert.match(stuck.bridgeError, /F5 刷新/, 'and the cure is named');
+  assert.ok(command.requests.filter(path => path === 'state').length > 0,
+    'the page kept sending its state while the command was stuck, so the server can tell busy from dead');
+
+  const alive = await command('list_nodes');
+  assert.ok((alive.nodes || []).length >= 1, 'the queue kept moving after the written-off command');
+
+  // A command that answers late is discarded rather than published behind the caller's back.
+  const late = await boot([plainNode()]);
+  let release;
+  late.app.graphToPrompt = () => new Promise(resolve => { release = () => resolve({ output: { 1: { class_type: 'KSampler' } } }); });
+  const lateStuck = await late('get_workflow').catch(error => error);
+  assert.match(lateStuck.bridgeError, /没有返回/);
+  const results = () => late.requests.filter(path => path === 'result').length;
+  const beforeLate = results();
+  release();
+  for (let turn = 0; turn < 4; turn += 1) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(results(), beforeLate, 'no second reply is posted for a command that was already written off');
+  assert.ok((await late('list_nodes')).nodes.length >= 1, 'and the page is still taking work');
+});
+
+test('a canvas that serializes but cannot produce a prompt reports it as a fact, not a silence', async () => {
+  // R7-5: `serialize()` and `graphToPrompt()` are different calls. A canvas carrying subgraph proxies
+  // without `definitions` passes the first and dies in the second; the page used to answer the param
+  // audit with `serializedError` alone, so `param-values` came back `supported, count 0`.
+  const nodes = [...promptNodes(1), proxyNode()];
+  const command = await boot(nodes, { fields: withDefinitions,
+    promptError: 'Attempted to access LGraph reference that was null or undefined.' });
+  const page = await command('audit_graph', { op: 'params' });
+  assert.equal(page.promptFailed, true, 'the page says plainly that no submission can be built');
+  assert.match(page.serializedError, /LGraph/, 'with the original error kept as evidence');
+
+  const stuck = await command('get_workflow').catch(error => error);
+  assert.match(stuck.bridgeError, /没能把当前图转成执行用的 prompt/, 'no bare litegraph sentence reaches the caller');
+  assert.match(stuck.bridgeError, /definitions.*load_workflow/s);
+  assert.equal((await command('list_edits')).serializable, true,
+    'and the two facts stay two facts: the graph does serialize, the prompt is what dies');
+
+  // The other half of the fork: a page whose serialize is fine and whose prompt works must not claim
+  // anything.
+  const healthy = await boot([...promptNodes(1), proxyNode()], { fields: withDefinitions });
+  const okPage = await healthy('audit_graph', { op: 'params' });
+  assert.equal(okPage.promptFailed, false);
+  assert.equal(okPage.serializedError, undefined);
+});
+
+const SUBGRAPH_ID = 'a67caa28-5f85-4917-8396-36004960dd30';
+const subgraphDefinitions = (seed = 432262096973490) => ({ subgraphs: [{
+  id: SUBGRAPH_ID, name: 'Text to Image (Flux.2 Klein 4B)',
+  nodes: [{ id: 86, type: 'RandomNoise', widgets_values: [seed, 'randomize'],
+    widgets_values_named: { noise_seed: seed, control_after_generate: 'randomize' } }], links: [] }] });
+const proxyNodeReal = () => ({ id: 77, type: SUBGRAPH_ID, title: 'Text to Image', mode: 0, properties: {},
+  widgets: [{ name: 'value', type: 'number', value: 1024, options: {}, callback() {} },
+    { name: 'noise_seed', type: 'number', value: 432262096973490, options: {}, callback() {} }],
+  inputs: [], outputs: [] });
+
+test('writing a subgraph proxy names the definitions copy that still holds the old value', async () => {
+  // R7-8: the proxy and `definitions.subgraphs[].nodes[]` are two stores. Writing the proxy is enough for
+  // the queue, and not enough for the file — and the sixth round's promise was to record that, not to
+  // guess at a fix. A proxy node's `type` is the subgraph id, and the inner copy keeps the exposed widget
+  // under the same name, so the claim is checked against the value this write actually replaced.
+  const command = await boot([proxyNodeReal()], { fields: { definitions: subgraphDefinitions() } });
+  const reply = await command('update_nodes', { changes: [{ nodeId: 77, widget: 'noise_seed', value: 777777777 }] });
+  assert.equal(reply.changed[0].verified, true, 'the write itself did land');
+  assert.equal(reply.definitionsStale.length, 1, JSON.stringify(reply.definitionsStale));
+  const stale = reply.definitionsStale[0];
+  assert.equal(stale.nodeId, '77');
+  assert.equal(stale.widget, 'noise_seed');
+  assert.equal(stale.subgraphId, SUBGRAPH_ID);
+  assert.equal(stale.innerNodeId, '86');
+  assert.equal(stale.innerType, 'RandomNoise');
+  assert.equal(stale.definitionValue, 432262096973490, 'the copy keeps exactly the value this write replaced');
+  assert.equal(stale.canvasValue, 777777777);
+  assert.match(reply.warning, /definitions/);
+  assert.match(reply.nextSteps.join(' '), /整图替换/);
+  assert.equal(JSON.stringify(command.graph.fields.definitions), JSON.stringify(subgraphDefinitions()),
+    'and nothing was rewritten behind the caller');
+
+  // A widget with no matching copy in the definitions reports nothing, rather than a plausible guess.
+  const other = await command('update_nodes', { changes: [{ nodeId: 77, widget: 'value', value: 512 }] });
+  assert.equal(other.definitionsStale, undefined);
+  assert.equal(other.warning, undefined);
+  // …and neither does a canvas that has no subgraph definitions at all.
+  const bare = await boot([proxyNodeReal()]);
+  const bareReply = await bare('update_nodes', { changes: [{ nodeId: 77, widget: 'noise_seed', value: 1 }] });
+  assert.equal(bareReply.definitionsStale, undefined, 'no definitions means no claim about them');
 });
