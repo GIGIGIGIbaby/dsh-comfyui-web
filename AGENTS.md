@@ -12,15 +12,12 @@
 
 | 伴随 PR | 内容 |
 | --- | --- |
-| `fix/dom-widget-write-verification` | `update_nodes` 通过控件自己的 setter 写入，并回 `via` / `verified` 证明写进去了 |
-| `feat/write-lease` | 画布写租约：同一时刻只让一个对话写共享画布 |
-| `feat/audit-family` | `audit(op=graph\|params)`：这张图能不能跑、我的值服务器会不会拒 |
-| `feat/tool-face-hardening` | `doctor` 一次判定环境可用、错误信息带下一步 |
+| #10 `feat/tool-face-hardening` | 运行时改动的归并总入口（#6/#7/#8 各自开过的分支已作为「被取代」关闭，并入此处）：`update_nodes` 通过控件自己的 setter 写入并回 `via` / `verified` 证明写进去了；画布写租约——同一时刻只让一个对话写共享画布；`doctor` 一次判定环境可用、错误信息带下一步；`audit(op=graph\|params\|writes)`——这张图能不能跑、我的值服务器会不会拒、以及这台画布上到底有哪些控件是本插件写得动的 |
 
 **合并建议**：
 
-- 如果上面这些 PR 被合并了，**本 PR 推荐一起合并**——此时 §2 的判据应改用 `doctor`（见文末附录），比本文描述的 `server_info` 判据更强。
-- 如果那些 PR 没有合并，**本 PR 只作为参考**：正文按当前 `main` 的实际工具面写，不会引用 `main` 上还不存在的工具。
+- 如果 #10 被合并了，**本 PR 推荐一起合并**——此时 §2 的判据应改用 `doctor`（见文末附录），比本文描述的 `server_info` 判据更强。
+- 如果它没有被合并，**本 PR 只作为参考**：正文按当前 `main` 的实际工具面写，不会引用 `main` 上还不存在的工具。
 
 ---
 
@@ -105,10 +102,12 @@ list_nodes { filter: "<节点类型>", detail: "values" }   → 回读，值确�
 
 ## 附录：合并伴随 PR 之后的差异
 
-合并上表那几个 PR 后，工具面会多出以下能力，届时本文的判据应相应升级：
+合并上表的 #10 之后，工具面会多出以下能力，届时本文的判据应相应升级：
 
 - **`doctor`**：一次调用判定「现在能不能用」，返回 `kind: "ok" | "fail"`，并逐项列出判据（MCP 开关、ComfyUI 是否可达、桥接页面是否活着、心跳、版本、AI 权限、写租约、画布能否执行、有无落盘节点、当前工作流、队列）。**§2 的判据 1～2 应改用 `doctor` 的 `kind === "ok"` 且 `failedChecks` 为空**，比逐字段读 `server_info` 便宜。
 - **`update_nodes` 回 `via` / `verified`**：`verified: true` 表示写入后回读确认过；`verified: false` 表示该控件由前端组件自己持有状态、写控件没生效，回执里的 `hint` 会给出替代路径（写 shadow 源 / 用该包自带的写入入口 / 改磁盘 JSON 再 `load_workflow`）。**此时 §2 的判据 3 应改用 `verified`，并明确：`verified` 为 false 或缺失时不得报告「已改好」。**
 - **`lease`**：画布写权在一段对话手里，其他对话的写操作会被拒。看到租约被占用时不要强行接管，先问用户。
-- **`audit(op="graph"|"params")`**：改完参数或连线，先 `audit` 再 `run`；`verdict` 为 `refuted` 时先修再提交。
-- **`list_nodes` 的 `kind` / `writable`**：能预判某个控件能不能被 `update_nodes` 写成功（`ok` / `risky` / `no`），`risky` 的多为前端自持状态的 DOM 控件。
+- **`audit(op="graph"|"params"|"writes")`**：改完参数或连线，先 `audit` 再 `run`；`verdict` 为 `refuted` 时先修再提交。`graph` 判结构（画布能否序列化、必填连线是否缺失——只算产物节点的依赖链上缺失的那些、有没有落盘节点），`params` 按 `object_info` 判值，`writes` 是下面那份可写性普查。
+- **`audit(op="writes")` 是普查，而 `list_nodes` 已经不再预判**：页面按控件报事实（有没有 setter、会不会序列化、这个输入槽是否被连线占用、是不是子图代理节点、控件还没建出来、写回去会被量化到多少），工具把每个控件判成写得动 / 有条件 / 写不了，并给出原因。`list_nodes` 以前那个 `writable: ok|risky|no` 字段已经删掉了：服务器会不会接受某个值，本来就无法从画布推出来，一个看起来很确定的标签只会让代理跳过普查。
+- **`update_nodes(force: true)`** 只放宽两项确实「不友好」的判定——画布没提供的枚举值、以及超出声明范围的数字；JSON 类型错误照旧拒绝。被 force 写进去的项会标上 `changed[].outsideOptions` / `outOfRange`，回执给出 `forceUsed` / `forcedCount`。画布接受这个值不等于队列会接受，run 之前要用 `audit(op="params")` 复核。
+- **`update_nodes(saveAfterWrite: true)`** 走前端自己的保存路径，并回答「落盘的是哪一刻」：`saved.savedStateHash`（真正被序列化出去的那份状态）、`canvasHashAtSave`，以及保存之后另取指纹算出的 `driftedAfterSave`。节点包在加载后重填自己的参数是常态，所以单一个 `{saved: true}` 说明不了任何事。

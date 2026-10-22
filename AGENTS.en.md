@@ -12,15 +12,12 @@ This file documents the following changes, and ships as a **separate PR so it ca
 
 | Companion PR | What it adds |
 | --- | --- |
-| `fix/dom-widget-write-verification` | `update_nodes` writes through the widget's own setter and reports `via` / `verified` to prove the write stuck |
-| `feat/write-lease` | a canvas write lease, so two conversations cannot stomp the live canvas |
-| `feat/audit-family` | `audit(op=graph\|params)`: can this graph run, and will the server reject my values |
-| `feat/tool-face-hardening` | `doctor` decides in one call whether the environment is usable; errors carry the next step |
+| #10 `feat/tool-face-hardening` | the consolidated runtime PR -- the review path for what #6/#7/#8 each opened separately (those were closed as superseded, not merged): `update_nodes` writes through the widget's own setter and reports `via` / `verified` to prove the write stuck; a canvas write lease, so two conversations cannot stomp the live canvas; `doctor` decides in one call whether the environment is usable and errors carry the next step; `audit(op=graph\|params\|writes)` -- can this graph run, will the server reject my values, and which controls can this plugin write at all |
 
 **Merge advice:**
 
-- If those PRs get merged, **this PR is worth merging together with them** -- §2's criteria should then move to `doctor` (see the appendix), which is stronger than the `server_info` criteria described here.
-- If they do not get merged, **treat this PR as reference only**: the body is written against the tool face that actually exists on `main`, and never sends an agent after a tool `main` does not have.
+- If #10 gets merged, **this PR is worth merging together with it** -- §2's criteria should then move to `doctor` (see the appendix), which is stronger than the `server_info` criteria described here.
+- If it does not get merged, **treat this PR as reference only**: the body is written against the tool face that actually exists on `main`, and never sends an agent after a tool `main` does not have.
 
 ---
 
@@ -108,10 +105,12 @@ page reload.
 
 ## Appendix: what changes once the companion PRs land
 
-After the PRs in the table are merged, the tool face gains the following. Update this file's criteria accordingly at that point:
+Once #10 is merged, the tool face gains the following. Update this file's criteria accordingly at that point:
 
 - **`doctor`**: decides "can I work right now" in one call, returning `kind: "ok" | "fail"` plus every criterion as a value (MCP switch, ComfyUI reachable, bridge page alive, heartbeat, version, AI permission, write lease, graph executable, disk output node, active workflow, queue). **§2 criteria 1-2 should then switch to `doctor`'s `kind === "ok"` with an empty `failedChecks`**, which is cheaper than reading `server_info` field by field.
 - **`update_nodes` returns `via` / `verified`**: `verified: true` means the value was read back after writing; `verified: false` means the widget holds its own state in a front-end component and the write did not land, and the receipt's `hint` gives the alternative (write its shadow source, use the pack's own write entry point, or edit the JSON on disk and `load_workflow`). **§2 criterion 3 should then use `verified`, and state plainly that `verified: false` or a missing `verified` may not be reported as "changed".**
-- **`lease`**: the canvas write right lives with one conversation; writes from others are refused. When the lease is taken, do not grab it by force -- ask the user first.
-- **`audit(op="graph"|"params")`**: after changing parameters or links, run `audit` before `run`; when `verdict` is `refuted`, fix first and submit later.
-- **`list_nodes`'s `kind` / `writable`**: predicts whether `update_nodes` can write a widget (`ok` / `risky` / `no`); `risky` ones are usually DOM widgets whose state a front-end component owns.
+- **`lease`**: the canvas write right lives with one conversation; writes from others are refused. When the lease is held by someone else, do not seize it -- ask the user first.
+- **`audit(op="graph"|"params"|"writes")`**: after changing parameters or links, run `audit` before `run`; when `verdict` is `refuted`, fix first and submit later. `graph` judges structure (does the canvas serialize, is a required wire missing **on a dependency of an output node**, is there a saver at all), `params` judges values against `object_info`, and `writes` is the capability census described below.
+- **`audit(op="writes")` is the census, and `list_nodes` deliberately stopped pre-judging**: the page reports per-control facts (does it have a setter, does it serialize, is the slot wired by a link, is it a subgraph proxy, are the node's controls not built yet, what step does it quantize to) and the tool classifies every control as writable, conditional or impossible -- with the reason. `list_nodes` used to carry a `writable: ok|risky|no` guess; it was removed because "the server would accept this" is not derivable from the canvas, and a confident label invited agents to skip the census.
+- **`update_nodes(force: true)`** relaxes only the two domain judgements that are genuinely soft -- a combo value the canvas does not offer, and a number outside the declared range. A wrong JSON type stays refused. Forced items are marked `changed[].outsideOptions` / `outOfRange` and the reply answers `forceUsed` / `forcedCount`; the canvas taking an illegal value is not the queue taking it, so re-check with `audit(op="params")` before running.
+- **`update_nodes(saveAfterWrite: true)`** saves through the front-end's own save path and reports which moment reached the disk: `saved.savedStateHash` (the state that was serialized), `canvasHashAtSave`, and `driftedAfterSave` from a fingerprint taken afterwards. A pack that refills its own parameters after a load is normal, so `{saved: true}` alone proves nothing.
