@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { doctorReport } from '../lib/doctor.js';
+import { callComfyTool } from '../lib/mcp.js';
 
 // The doctor is the one call that must answer "usable or not" — so its verdict is tested as a
 // verdict, not as a field dump: same facts in, same kind out, and a warning never flips it to fail.
@@ -26,6 +27,9 @@ const facts = overrides => ({
   },
   draftStorage: { available: true, usedChars: 120, ownChars: 400, totalChars: 520, keys: [{ key: 'a', chars: 120 }], ownKeys: [{ key: 'b', kind: 'history', chars: 400 }] },
   promptQueued: { running: 0, pending: 0 },
+  // R8-B: whether the canvas can build a submission prompt is an audit fact, handed to the doctor
+  // the same way the graph verdict is — it is not re-derived here.
+  prompt: { id: 'prompt-serializable', verdict: 'supported', count: 0 },
   ...overrides
 });
 
@@ -37,7 +41,7 @@ test('a healthy environment is one verdict with the measured value behind every 
   assert.equal(report.failedChecks, undefined);
   assert.deepEqual(report.checks.map(item => item.id), [
     'mcp-enabled', 'comfyui-reachable', 'bridge-page', 'bridge-heartbeat', 'bridge-stalled', 'bridge-version',
-    'ai-permission', 'write-lease', 'graph-executable', 'disk-output', 'active-workflow',
+    'ai-permission', 'write-lease', 'graph-executable', 'prompt-serializable', 'disk-output', 'active-workflow',
     'draft-storage', 'queue-idle'
   ]);
   const checks = byId(report);
@@ -130,4 +134,88 @@ test('a page whose commands never came back is a failure, not a green report ove
   assert.equal(byId(clean)['bridge-stalled'].ok, true, 'zero unanswered commands is a measured pass, not a silent one');
   assert.equal(byId(clean)['bridge-stalled'].value, '0');
   assert.equal(byId(doctorReport(facts({ clients: [] })))['bridge-stalled'].ok, null, 'no page is no verdict, not a failure');
+});
+test('a canvas that serializes but cannot build a prompt is a failed verdict, not a green one', () => {
+  // R8-B, measured on this machine: doctor returned kind:'ok' with 13 green checks while
+  // audit(op=params) gave `prompt-serializable: refuted` on the SAME canvas — serialize() worked and
+  // graphToPrompt() threw ("Attempted to access LGraph reference that was null or undefined.") because
+  // subgraph proxies lost their definitions. run / get_workflow / audit(op=params) were half-dead and
+  // the health check said the environment was fine. `graph-executable` cannot catch this: the
+  // structural audit walks the node table and never builds a submission.
+  const report = doctorReport(facts({ prompt: { id: 'prompt-serializable', verdict: 'refuted', count: 1,
+    evidence: [{ note: 'Attempted to access LGraph reference that was null or undefined.' }] } }));
+  assert.notEqual(report.kind, 'ok', 'a canvas that cannot produce a prompt is not a usable environment');
+  assert.equal(report.kind, 'fail');
+  assert.ok(report.failedChecks.includes('prompt-serializable'), JSON.stringify(report.failedChecks));
+  const check = byId(report)['prompt-serializable'];
+  assert.equal(check.ok, false);
+  assert.equal(check.value, 'graphToPrompt failed');
+  assert.match(check.note, /definitions/, 'the cure is the same one the audit gives: reload the full JSON');
+  assert.match(check.note, /load_workflow/);
+  assert.match(check.note, /LGraph/, 'the page error travels as the reason');
+});
+
+test('a page that never reported prompt serializability gets no verdict about it', () => {
+  // Same convention as graph-serializable: an older bridge that says nothing is not judged for a fact
+  // it never measured, and this must not become a silent pass either.
+  const report = doctorReport(facts({ prompt: null }));
+  assert.equal(report.kind, 'ok');
+  const check = byId(report)['prompt-serializable'];
+  assert.equal(check.ok, null);
+  assert.equal(check.value, 'not reported');
+  const pending = byId(doctorReport(facts({ prompt: { id: 'prompt-serializable', verdict: 'unresolved' } })));
+  assert.equal(pending['prompt-serializable'].ok, null, 'an open question must not read as a pass');
+  const skipped = byId(doctorReport(facts({ clients: [], graph: null })));
+  assert.equal(skipped['prompt-serializable'].ok, null, 'no page is no verdict');
+  assert.equal(skipped['prompt-serializable'].value, 'skipped');
+});
+test('the doctor asks the page for the prompt facts once and reuses the audit judgment', async () => {
+  // R8-B end to end: the doctor must not re-derive "can this canvas produce a prompt?" — it hands the
+  // same page reply to auditParams() the audit tool uses, so the two faces can never disagree. This
+  // pins both halves: one round trip (no second command), and the check that reaches the report.
+  const v = (overrides = {}) => ({ sessionId: 'session-me', connected: true, heartbeatAgeMs: 42,
+    refreshRequired: false, bridgeVersion: '0.5.12', bridgeProtocol: 6, allowAI: true, ready: true, ...overrides });
+  const defsByType = {
+    KSampler: { input: { required: { steps: ['INT', { min: 1, max: 100 }] } } },
+    SaveImage: { input: { required: { images: ['IMAGE'] } }, output_node: true }
+  };
+  const commands = [];
+  const runtime = {
+    mcpEnabled: true, bridgeVersion: '0.5.12', bridgeProtocol: 6, noteStore: null,
+    status: () => ({ clients: [v()], syncClients: [v()], writeLease: null }),
+    request: async path => path === '/system_stats' ? { system: { comfyui_version: '0.39.0' } }
+      : path === '/queue' ? { queue_running: [], queue_pending: [] }
+        : (() => { const type = decodeURIComponent(path.replace('/object_info/', '')); return { [type]: defsByType[type] }; })(),
+    command: async (sessionId, action, args) => {
+      commands.push([action, args]);
+      return { nodes: [{ id: '1', type: 'KSampler', title: '', mode: 0,
+        widgets: [{ name: 'steps', kind: 'int', type: 'number', value: 20 }], inputs: [], outputs: [] },
+        { id: '2', type: 'SaveImage', title: '', mode: 0, widgets: [], inputs: [{ name: 'images', type: 'IMAGE', link: 1 }],
+          outputs: [] }],
+        serializable: true, workflowPath: 'workflows/H3.json',
+        ...(action === 'audit_graph' && args.op === 'params' ? promptFacts : {}) };
+    }
+  };
+  // serialize() succeeded (that is what auditGraph reads) but graphToPrompt() threw: the exact shape the
+  // real page reports, from the machine where doctor said ok next to audit(op=params) refuted.
+  const promptFacts = { serializedInputs: null, promptFailed: true,
+    serializedError: 'Attempted to access LGraph reference that was null or undefined.' };
+
+  const report = (await callComfyTool(runtime, 'doctor', {}, { dshSessionId: 'session-me' })).structuredContent;
+  assert.equal(report.kind, 'fail', 'a tab that cannot build a prompt is not a usable environment');
+  assert.ok(report.failedChecks.includes('prompt-serializable'), JSON.stringify(report.failedChecks));
+  const check = report.checks.find(item => item.id === 'prompt-serializable');
+  assert.equal(check.ok, false);
+  assert.match(check.note, /definitions/);
+  assert.match(check.note, /LGraph/, 'the page error travels into the doctor note');
+  // One command, and it asked for the facts that carry the prompt — not a second round trip.
+  assert.equal(commands.length, 1, 'the prompt check reuses the same page reply: ' + JSON.stringify(commands));
+  assert.deepEqual(commands[0], ['audit_graph', { op: 'params' }]);
+
+  // A healthy page keeps kind=ok and reports the pass with a measured value.
+  promptFacts.serializedInputs = { 1: { steps: 20 } }; promptFacts.promptFailed = false;
+  delete promptFacts.serializedError;
+  const healthy = (await callComfyTool(runtime, 'doctor', {}, { dshSessionId: 'session-me' })).structuredContent;
+  assert.equal(healthy.kind, 'ok');
+  assert.equal(healthy.checks.find(item => item.id === 'prompt-serializable').ok, true);
 });
