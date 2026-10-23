@@ -251,3 +251,71 @@ test('a command the page never answers is counted on both sides and the timeout 
     t.mock.timers.reset();
   }
 });
+
+test('a page-side refusal does not renew the lease an idle holder already has', async () => {
+  // Eighth-round report R8-C. acquireLease() both claims and renews, and command() called it
+  // unconditionally before the dispatch — so for a conversation that ALREADY held the lease every
+  // page-side refusal (ok:false, e.g. a wrong widget type) pushed renewedAt to now. An idle holder
+  // could sit there retrying a write that never lands and never lose the canvas. The plan phase
+  // (needs_input in lib/mcp.js) returns before reaching command(), which is why only page-side
+  // refusals showed the symptom.
+  const runtime = new ComfyRuntime('/tmp/dsh-comfyui-renew-test.json', { port: 0 });
+  const panel = (id, sessionId) => ({ id, sessionId, ready: true, allowAI: true, visible: true, seen: Date.now(), queue: [] });
+  runtime.clients.set('pA', panel('pA', 'A'));
+  runtime.clients.set('pB', panel('pB', 'B'));
+  const dispatched = [];
+  let refuse = false;
+  runtime.dispatch = async (client, action) => {
+    dispatched.push({ sessionId: client.sessionId, action });
+    if (refuse) throw Object.assign(new Error('resolution 必须是文本'), { pageSide: true, stage: 'apply' });
+    return { changed: [] };
+  };
+
+  await runtime.command('A', 'update_nodes', { changes: [] });
+  assert.equal(runtime.leaseState().holder, 'A', 'the first landed write claims the canvas');
+
+  // Age the clock, then let the page refuse the retry: a write that wrote nothing is not activity.
+  runtime.lease.renewedAt = Date.now() - 60_000;
+  refuse = true;
+  await assert.rejects(runtime.command('A', 'update_nodes', { changes: [] }), /resolution 必须是文本/);
+  assert.equal(runtime.lease.holder, 'A', 'the established holder keeps the lease across its own failed write');
+  assert.ok(Date.now() - runtime.lease.renewedAt >= 60_000,
+    'and the refused write must not push the idle clock forward — failing in a loop cannot hold the canvas');
+
+  // The renewal has to be earned: the same call, actually landing, does move the clock.
+  refuse = false;
+  await runtime.command('A', 'update_nodes', { changes: [] });
+  assert.ok(Date.now() - runtime.lease.renewedAt < 5000, 'a write that landed renews the lease');
+
+  // Claiming still happens before the dispatch, so a second conversation is refused, not queued.
+  const before = dispatched.length;
+  assert.throws(() => runtime.command('B', 'update_nodes', { changes: [] }), /写租约被另一条对话持有（A/);
+  assert.equal(dispatched.length, before, 'B never reached its page');
+
+  // A lease that had already expired is a new claim, not a renewal, so a refusal gives it back.
+  runtime.lease.renewedAt = Date.now() - 6 * 60 * 1000;
+  refuse = true;
+  await assert.rejects(runtime.command('A', 'update_nodes', { changes: [] }), /resolution 必须是文本/);
+  assert.equal(runtime.leaseState().holder, null,
+    'a claim this call established is released when the write was refused');
+
+  // Two writes from the same conversation can be in flight. The restore is synchronous (before the
+  // dispatch), so a renewal another call earns later can never be rewound by this one's refusal —
+  // this pins that ordering instead of leaving it to luck.
+  let openGate; const gate = new Promise(resolve => { openGate = resolve; });
+  let refuseLate = false;
+  runtime.dispatch = async (client, action) => {
+    if (refuseLate) { refuseLate = false; await gate; throw new Error('resolution 必须是文本'); }
+    return { changed: [] };
+  };
+  await runtime.command('A', 'update_nodes', { changes: [] });
+  runtime.lease.renewedAt = Date.now() - 60_000;
+  refuseLate = true;
+  const inFlight = runtime.command('A', 'update_nodes', { changes: [] }).catch(error => error);
+  await runtime.command('A', 'update_nodes', { changes: [] });
+  assert.ok(Date.now() - runtime.lease.renewedAt < 5000, 'the write that landed renewed the lease');
+  openGate();
+  assert.match((await inFlight).message, /resolution 必须是文本/);
+  assert.ok(Date.now() - runtime.lease.renewedAt < 5000,
+    'a late refusal from the same conversation must not rewind the renewal the landed write earned');
+});
