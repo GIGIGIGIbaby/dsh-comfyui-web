@@ -489,7 +489,10 @@ test('the write census classifies every control as writable, conditional, or imp
     node(111, 'ShowText|pysssss', []),
     node(77, SUB, [flag('noise_seed')], { subgraph: SUB })
   ] };
-  const result = auditWrites({ page, defs: {} });
+  // R8-E: "waiting to be built" must be a claim about the server definition, so the fixture states one:
+  // ShowText|pysssss declares a STRING input, which is exactly what its deferred build creates.
+  const censusDefs = { 'ShowText|pysssss': { input: { required: { text: ['STRING', { multiline: true }] } } } };
+  const result = auditWrites({ page, defs: censusDefs });
 
   assert.equal(result.controls, 9, 'a node without controls is not counted as a control');
   assert.equal(result.blocked, 3, 'wired input, properties-backed, and a display component with no setter');
@@ -527,7 +530,7 @@ test('the write census classifies every control as writable, conditional, or imp
   assert.equal(clean.verdict, 'supported');
   assert.equal(clean.writable, 1);
   assert.equal(clean.blockedItems.length, 0);
-  const scoped = auditWrites({ page, defs: {}, filter: 'ShowText' });
+  const scoped = auditWrites({ page, defs: censusDefs, filter: 'ShowText' });
   assert.equal(scoped.nodeCount, 1, 'filter narrows the census to the node asked about');
 });
 
@@ -546,4 +549,65 @@ test('a capped census says which list was cut, and only that one', () => {
   const small = auditWrites({ page: { workflowPath: 'p', nodes: [{ id: '1', type: 'T', title: '', mode: 0, subgraph: null,
     widgetCount: 2, shadowDocs: [], widgets: many(2, 'plain') }] }, defs: {} });
   assert.equal(small.truncated, undefined, 'nothing was cut, nothing is claimed');
+});
+
+test('a button is not a control: the census counts what list_nodes counts', () => {
+  // R8-D: node 195 AICG3DPromptSegmentSplit adds two buttons (aicg3d_prompt_split.js:601/:609,
+  // `node.addWidget("button", …)`), and the census counted them while telling the reader it did not
+  // (`controls += 1; continue;   // not a parameter, never counted`). `list_nodes` drops them
+  // (bridge.js:1261 `filter(w => w.type !== 'button')`), so the two tool faces disagreed by exactly the
+  // number of buttons: 10 controls on the page, 12 in the census.
+  const widget = (name, extra = {}) => ({ name, kind: 'plain', hasSetter: false, hasGetter: false,
+    serializes: true, inOptions: null, optionCount: null, step: null, wired: null, mirror: false, props: [], ...extra });
+  const widgets = [widget('text'), widget('add_split', { kind: 'button' }), widget('remove_split', { kind: 'button' }),
+    widget('apply')];
+  const page = { workflowPath: 'workflows/H3.json', nodes: [{ id: '195', type: 'AICG3DPromptSegmentSplit', title: '',
+    mode: 0, subgraph: null, widgetCount: widgets.length, shadowDocs: [], widgets }] };
+  const result = auditWrites({ page, defs: {} });
+  assert.equal(result.controls, widgets.filter(item => item.kind !== 'button').length,
+    'the census and list_nodes must count the same widgets');
+  assert.equal(result.controls, 2, 'two parameters, two buttons');
+  assert.equal(result.buttons, 2, 'buttons are named as their own count, not folded into controls');
+  assert.equal(result.writable, 2, 'writable = controls - blocked - conditionalControls still adds up');
+  assert.equal(result.verdict, 'supported', 'a canvas whose only extra widgets are buttons is fully writable');
+});
+
+test('an empty node is classified by its server definition, not by hope', () => {
+  // R8-E: every node with no widgets used to become `pending-build` — advice to wait, which was wrong in
+  // both directions. Measured against this machine's /object_info: DMADSampler declares no inputs at all
+  // and AICG3D_H3SegmentDecode only a wire (segments), so waiting never changes anything; Reroute and the
+  // 孤海 comment have no server definition at all (front-end types). The only honest "wait" is a type
+  // that declares a widget input and has not built it yet (ShowText|pysssss).
+  const blank = (id, type) => ({ id: String(id), type, title: '', mode: 0, subgraph: null, widgetCount: 0,
+    widgets: [], shadowDocs: [] });
+  const defs = {
+    DMADSampler: { input: { required: {}, optional: {} } },
+    AICG3D_H3SegmentDecode: { input: { required: { segments: ['SEGMENTS'] } } },
+    HiddenOnly: { input: { required: { unique_id: ['STRING', { hidden: true }] } } },
+    'ShowText|pysssss': { input: { required: { text: ['STRING', { multiline: true }] } } }
+  };
+  const page = { workflowPath: 'p', nodes: [blank(191, 'DMADSampler'), blank(204, 'AICG3D_H3SegmentDecode'),
+    blank(9, 'HiddenOnly'), blank(4, 'Reroute'), blank(5, '孤海注释'), blank(111, 'ShowText|pysssss')] };
+  const result = auditWrites({ page, defs });
+  assert.deepEqual(result.conditionalItems.map(item => [item.nodeId, item.code]), [
+    ['191', 'no-controls-by-design'], ['204', 'no-controls-by-design'], ['9', 'no-controls-by-design'],
+    ['4', 'no-server-definition'], ['5', 'no-server-definition'], ['111', 'pending-build']]);
+  assert.match(result.conditionalItems[0].note, /没有 widget 型输入/, 'a definition with no inputs is a fact, not a wait');
+  assert.match(result.conditionalItems[3].note, /前端内置/);
+  assert.match(result.conditionalItems[5].note, /延迟重建|等几秒/, 'only the unbuilt widget input keeps the wait');
+  assert.equal(result.byReason['no-controls-by-design'], 3);
+  assert.equal(result.byReason['no-server-definition'], 2);
+  assert.equal(result.byReason['pending-build'], 1);
+  assert.equal(result.pendingNodes, 6, 'node-level findings still ride in pendingNodes; the reason code separates them');
+  assert.equal(result.controls, 0);
+  assert.equal(result.writable, 0, 'no controls means nothing writable, and nothing is claimed writable either');
+  // The verdict must not be read as "this canvas is broken": none of these nodes blocks anything.
+  assert.equal(result.verdict, 'unresolved', 'an unbuilt node is a question; the empty ones are not');
+
+  // The same judgement has to hold when a filter narrows the set — the classification is per surviving node.
+  const scoped = auditWrites({ page, defs, filter: 'Reroute' });
+  assert.equal(scoped.nodeCount, 1, 'filter still narrows to the node asked about');
+  assert.equal(scoped.conditionalItems[0].code, 'no-server-definition');
+  const built = auditWrites({ page, defs, filter: 'ShowText' });
+  assert.equal(built.conditionalItems[0].code, 'pending-build');
 });
