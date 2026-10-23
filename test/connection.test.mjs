@@ -43,6 +43,6 @@ test('persistent commands remain available while hidden and idle, reconnect with
   assert.notEqual(newCommand.id, command.id);
   await bridge('result', { id: newCommand.id, result: { workflow: { nodes: [], links: [] } } }); await next;
   await bridge('state', { allowAI: false });
-  assert.throws(() => runtime.command('owner', 'run'), /MCP 设置/);
+  assert.throws(() => runtime.command('owner', 'run'), /连接设置/);
   await nextReader.cancel();
 });

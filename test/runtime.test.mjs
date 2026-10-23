@@ -129,7 +129,7 @@ test('proxy injects bridge, forwards HTTP, rejects cross-origin writes, and isol
   await bridge('result', { id: commands[0].id, result: { nodes: [] } });
   assert.deepEqual(await result, { nodes: [] });
   await bridge('poll', { allowAI: false });
-  assert.throws(() => runtime.command('s', 'run'), /MCP 设置/);
+  assert.throws(() => runtime.command('s', 'run'), /连接设置/);
   runtime.sync.exchange({ clientId: 'new-page', workflow: { nodes: [], links: [] }, fingerprint: 'new' });
   const stale = await bridge('sync', { bridgeProtocol: undefined, revision: 0 });
   assert.equal(stale.status, 409);

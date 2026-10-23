@@ -52,11 +52,11 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
   "连接失败": "Connection failed",
   "复制失败，请选中下方配置手动复制。": "Could not copy. Select the configuration below and copy it manually.",
   "尚未收到 AI 桥接扩展连接。请确认 ComfyUI 可访问、已安装扩展；首次安装后重启 ComfyUI 并刷新面板。Docker 用户需确认扩展所在目录已持久化挂载。": "The AI bridge has not connected. Check that ComfyUI is reachable and the extension is installed. After first installation, restart ComfyUI and refresh the panel. For Docker, use a persistent mounted extension directory.",
-  "扩展安装说明": "Extension setup guide",
+  "安装说明": "Setup guide",
   "ComfyUI 工作台": "ComfyUI workspace",
-  "MCP 已关闭": "MCP off",
-  "MCP · 共享画布已连接": "MCP · Shared canvas connected",
-  "AI 桥接扩展未连接": "AI bridge disconnected",
+  "AI 操作已关闭": "AI control off",
+  "AI 已连接": "AI connected",
+  "AI 尚未连接": "AI not connected",
   "等待 ComfyUI": "Waiting for ComfyUI",
   "ComfyUI 界面缩放": "ComfyUI interface zoom",
   "缩小 ComfyUI 界面": "Zoom out ComfyUI",
@@ -69,14 +69,30 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
   "关": "Off",
   "刷新 ComfyUI 页面": "Refresh the ComfyUI page",
   "刷新": "Refresh",
-  "MCP 设置": "MCP settings",
+  "连接设置": "Connection settings",
   "启动设置": "Launch settings",
   "本机启动": "Local launch",
+  "启动": "Start",
+  "手动填写路径": "Enter a path manually",
+  "连接与 AI 操作": "Connection and AI control",
+  "诊断信息": "Diagnostics",
+  "未能读取结果，请重试。": "Could not load the result. Please try again.",
+  "生成未完成，请检查工作流后重试。": "Generation did not complete. Check the workflow and try again.",
+  "显存不足，请减小图片尺寸或批量后重试。": "Not enough GPU memory. Reduce the image size or batch size and try again.",
+  "操作未完成，请重试。": "Could not complete the action. Please try again.",
+  "无法使用此路径，请重新选择文件或文件夹。": "Cannot use this path. Choose a file or folder again.",
+  "连接失败，请确认 ComfyUI 已启动且地址正确。": "Could not connect. Check that ComfyUI is running and the address is correct.",
+  "AI 暂时无法操作，请刷新页面；仍未连接时查看连接设置。": "AI control is unavailable. Refresh the page; if it still cannot connect, check connection settings.",
+  "请按照安装说明完成连接设置。": "Follow the setup guide to finish connecting.",
+  "页面已更新，请刷新后继续。": "The page has been updated. Refresh it to continue.",
+  "正在重新连接，请稍候。": "Reconnecting. Please wait.",
+  "另一页面也修改了工作流，已保留本页修改。请确认同步结果。": "Another page changed this workflow. Your edits were kept. Please check the synchronized result.",
+  "此地址不支持本机启动，请在对应设备上打开 ComfyUI。": "Open ComfyUI on the device at this address; it cannot be started here.",
   "ComfyUI 未运行": "ComfyUI is offline",
   "ComfyUI 已就绪": "ComfyUI is ready",
-  "正在启动 ComfyUI，服务就绪后会自动连接。": "Starting ComfyUI. The panel will connect when it is ready.",
-  "已运行所选入口；如启动器需要操作，请在其中启动 ComfyUI，服务就绪后会自动连接。": "The selected entry has started. If it opens a launcher, start ComfyUI there; this panel will connect when ready.",
-  "启动进程已退出，请检查启动日志或选择其他启动入口。": "The process exited. Check the launch log or choose another entry.",
+  "正在启动 ComfyUI…": "Starting ComfyUI…",
+  "正在等待 ComfyUI。如已打开启动器，请在其中点击启动。": "Waiting for ComfyUI. If a launcher opened, click Start there.",
+  "启动未完成，请重试或选择其他启动文件。": "Startup did not complete. Try again or choose another launch file.",
   "自动检测": "Auto-detect",
   "选择文件夹…": "Choose folder…",
   "选择启动文件…": "Choose launch file…",
@@ -84,24 +100,24 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
   "检测此路径": "Inspect path",
   "请选择启动方式": "Choose how to launch",
   "直接启动 ComfyUI": "Start ComfyUI directly",
-  "运行所选启动入口": "Run selected launch entry",
+  "使用启动器或脚本": "Use a launcher or script",
   "启动方式": "Launch target",
   "未找到安装目录，可选择文件夹或填写路径。": "No installation found. Choose a folder or enter its path.",
-  "选择启动器、脚本、快捷方式（exe / bat / cmd / ps1 / lnk），或 ComfyUI 目录 / main.py。检测不会启动程序。": "Choose a launcher, script, shortcut (exe / bat / cmd / ps1 / lnk), or ComfyUI directory / main.py. Detection does not start anything.",
-  "直接启动使用该目录的 Python；如需原有启动参数，请选择自己的启动器、脚本或快捷方式，并确保服务地址与面板一致。": "Direct launch uses this installation's Python. To keep custom settings, select your launcher, script or shortcut, and match its server URL to this panel.",
+  "选择平时使用的启动器，或查找已安装的 ComfyUI。": "Choose your usual launcher or find an installed copy of ComfyUI.",
+  "需要沿用原来的启动设置？请选择平时使用的启动器或脚本。": "To keep your existing launch settings, choose your usual launcher or script.",
   "正在处理…": "Working…",
   "启动日志：": "Launch log: ",
   "本机启动目前仅支持 Windows": "Local launch currently supports Windows only",
   "保存中…": "Saving…",
-  "开启 MCP": "Enable MCP",
-  "MCP 已开启，当前对话的 AI 可直接读取、修改和运行画布。": "MCP is enabled. The AI in this conversation can read, edit and run the workflow.",
-  "MCP 已开启，等待桥接扩展连接后可操作画布。": "MCP is enabled. Waiting for the bridge to connect before the AI can operate the canvas.",
-  "MCP 已关闭，仍可手动编辑和生成。": "MCP is off. You can still edit and generate manually.",
+  "允许 AI 操作": "Allow AI control",
+  "AI 可读取、修改并运行当前工作流。": "AI can read, edit and run the current workflow.",
+  "连接后，AI 即可操作工作流。": "AI can operate the workflow once connected.",
+  "已关闭 AI 操作，仍可手动编辑和生成。": "AI control is off. You can still edit and generate manually.",
   "ComfyUI 地址": "ComfyUI URL",
   "连接中…": "Connecting…",
   "保存并连接": "Save and connect",
   "MCP 地址：": "MCP endpoint: ",
-  "其他 AI 客户端的 MCP 配置": "MCP configuration for other AI clients",
+  "连接其他 AI 应用": "Connect other AI apps",
   "MCP 客户端配置": "MCP client configuration",
   "已复制": "Copied",
   "复制配置": "Copy configuration",
@@ -129,6 +145,24 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     return params ? message.replace(/\{(\w+)\}/g, (match, name) => String(params[name] ?? match)) : message;
   }
   const localizedMessage = message => typeof message === 'string' && message in EN ? t(message) : message;
+  function userMessage(message, fallback = '操作未完成，请重试。') {
+    const value = String(message || '');
+    if (/同步代码已更新/.test(value)) return t('页面已更新，请刷新后继续。');
+    if (/重新连接.*桥接/.test(value)) return t('正在重新连接，请稍候。');
+    if (/另一页也修改/.test(value)) return t('另一页面也修改了工作流，已保留本页修改。请确认同步结果。');
+    if (/当前工作流.*(载入|就绪)/.test(value)) return t('ComfyUI 当前工作流正在载入，请稍后再试');
+    if (/ENOENT|绝对路径|所选路径|启动路径|未找到启动入口|启动文件类型/.test(value)) return t('无法使用此路径，请重新选择文件或文件夹。');
+    if (/fetch|ECONN|连接失败/i.test(value)) return t('连接失败，请确认 ComfyUI 已启动且地址正确。');
+    if (/out of memory|显存不足/i.test(value)) return t('显存不足，请减小图片尺寸或批量后重试。');
+    if (value === '复制失败，请选中下方配置手动复制。') return t(value);
+    return t(fallback);
+  }
+  function diagnostics(message, logPath) {
+    return message || logPath ? h('details', { className: 'dsh-comfy-diagnostics' },
+      h('summary', null, t('诊断信息')),
+      message ? h('pre', null, localizedMessage(message)) : null,
+      logPath ? h('p', null, t('启动日志：'), h('code', null, logPath)) : null) : null;
+  }
   const PRIVACY_KEY = 'dsh.comfyui.blurOutputImages';
   const privacyListeners = new Set();
   let blurOutputImages = false;
@@ -211,6 +245,9 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     .dsh-comfy-launch button { padding:7px 12px; border:1px solid #80808070; border-radius:6px; background:transparent; color:inherit; cursor:pointer; }
     .dsh-comfy-launch button:disabled { opacity:.6; cursor:default; }
     .dsh-comfy-launch :focus-visible { outline:2px solid currentColor; outline-offset:2px; }
+    .dsh-comfy details > summary { cursor:pointer; }
+    .dsh-comfy-diagnostics { font-size:12px; overflow-wrap:anywhere; }
+    .dsh-comfy-diagnostics pre { white-space:pre-wrap; overflow-wrap:anywhere; margin:8px 0; }
     .dsh-comfy-images { display:flex; flex-wrap:wrap; align-items:flex-start; gap:16px; max-width:100%; min-width:0; }
     .dsh-comfy-images[data-align=end] { justify-content:flex-end; }
     .dsh-comfy-image-card { position:relative; flex:none; max-width:100%; min-width:0; }
@@ -371,7 +408,9 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
         h('span', { role: 'status' }, !settled ? t('读取中…') : block.isError ? t('读取失败') : images.length ? t('已读取') : t('已完成')),
         inspect ? h('button', { type: 'button', onClick: inspect }, t('查看调用')) : null),
       images.length ? h('span', { className: 'dsh-comfy-image-info' }, (video ? t('视频') : t('图片')) + t('将在本次回复正文的结果区显示。')) : null,
-      !images.length && text ? h('pre', { className: 'dsh-comfy-output-text', role: block.isError ? 'alert' : undefined }, text) : null);
+      !images.length && text ? h(React.Fragment, null,
+        block.isError ? h('p', { role: 'alert' }, userMessage(text, '未能读取结果，请重试。')) : null,
+        diagnostics(text)) : null);
   }
   function resultVideos(block) {
     if (block.kind !== 'tool-result' || block.isError) return [];
@@ -436,9 +475,11 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     return h('section', { className: 'dsh-comfy-output', 'aria-label': t('ComfyUI 生成结果') },
       h('style', null, CSS),
       h('div', { className: 'dsh-comfy-output-head' }, h('strong', null, t('ComfyUI 生成结果'))),
-      ownedTasks.map(task => h('div', { key: task.promptId, className: 'dsh-comfy-image-info', role: 'status' },
-        labels[task.status] || task.status, task.progress?.max > 0 ? ' · ' + Math.round(task.progress.value / task.progress.max * 100) + '%' : '',
-        task.result?.error?.message ? ' · ' + localizedMessage(task.result.error.message) : task.result?.message ? ' · ' + localizedMessage(task.result.message) : '')),
+      ownedTasks.map(task => h('div', { key: task.promptId, className: 'dsh-comfy-image-info' },
+        h('span', { role: 'status' }, labels[task.status] || t('等待重新连接'),
+          task.progress?.max > 0 ? ' · ' + Math.round(task.progress.value / task.progress.max * 100) + '%' : ''),
+        task.result?.error?.message ? h('p', { role: 'alert' }, userMessage(task.result.error.message, '生成未完成，请检查工作流后重试。')) : null,
+        diagnostics(task.result?.error?.message || task.result?.message))),
       h(MessageImages, { images, loadImage, align: 'start' }));
   }
   async function api(body, token, signal) {
@@ -487,28 +528,29 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     useEffect(() => () => controller.current?.abort(), []);
     const launching = status.phase === 'starting' && !status.connected;
     const message = status.connected ? 'ComfyUI 已就绪' : status.phase === 'launcher-opened'
-      ? '已运行所选入口；如启动器需要操作，请在其中启动 ComfyUI，服务就绪后会自动连接。'
-      : launching ? '正在启动 ComfyUI，服务就绪后会自动连接。'
-      : ['failed', 'stopped'].includes(status.phase) ? '启动进程已退出，请检查启动日志或选择其他启动入口。' : 'ComfyUI 未运行';
+      ? '正在等待 ComfyUI。如已打开启动器，请在其中点击启动。'
+      : launching ? '正在启动 ComfyUI…'
+      : ['failed', 'stopped'].includes(status.phase) ? '启动未完成，请重试或选择其他启动文件。' : 'ComfyUI 未运行';
     return h('div', { className: 'dsh-comfy-launch', 'aria-label': t('本机启动'), 'aria-busy': busy },
       h('strong', { role: 'status' }, t(message)),
-      !status.supported ? h('p', null, localizedMessage(status.unavailable || '本机启动目前仅支持 Windows')) : h(React.Fragment, null,
-        h('p', null, t('选择启动器、脚本、快捷方式（exe / bat / cmd / ps1 / lnk），或 ComfyUI 目录 / main.py。检测不会启动程序。')),
+      !status.supported ? h('p', null, t(status.unavailable === '本机启动目前仅支持 Windows' ? status.unavailable : '此地址不支持本机启动，请在对应设备上打开 ComfyUI。')) : h(React.Fragment, null,
+        h('p', null, t('选择平时使用的启动器，或查找已安装的 ComfyUI。')),
         h('div', { className: 'dsh-comfy-launch-actions' },
           h('button', { type: 'button', disabled: busy, onClick: () => action('launcherDetect') }, t('自动检测')),
           h('button', { type: 'button', disabled: busy, onClick: () => action('launcherPick', { kind: 'folder' }) }, t('选择文件夹…')),
           h('button', { type: 'button', disabled: busy, onClick: () => action('launcherPick', { kind: 'file' }) }, t('选择启动文件…'))),
-        h('form', { onSubmit: event => { event.preventDefault(); action('launcherInspect', { path }); } },
+        h('details', null, h('summary', null, t('手动填写路径')),
+          h('form', { onSubmit: event => { event.preventDefault(); action('launcherInspect', { path }); } },
           h('label', null, t('安装路径'), h('input', { type: 'text', value: path, required: true, onChange: e => setPath(e.target.value), disabled: busy })),
-          h('button', { type: 'submit', disabled: busy || !path.trim() }, t('检测此路径'))),
+          h('button', { type: 'submit', disabled: busy || !path.trim() }, t('检测此路径')))),
         targets.length ? h('label', null, t('启动方式'), h('select', { value: selectedKey, disabled: busy || launching, onChange: e => setChoice(e.target.value) },
-          targets.map(target => h('option', { key: keyOf(target), value: keyOf(target) }, t(target.kind !== 'comfyui' ? '运行所选启动入口' : '直接启动 ComfyUI') + ' · ' + target.path))))
+          targets.map(target => h('option', { key: keyOf(target), value: keyOf(target) }, t(target.kind !== 'comfyui' ? '使用启动器或脚本' : '直接启动 ComfyUI') + ' · ' + target.path))))
           : h('p', null, t('未找到安装目录，可选择文件夹或填写路径。')),
-        h('p', null, t('直接启动使用该目录的 Python；如需原有启动参数，请选择自己的启动器、脚本或快捷方式，并确保服务地址与面板一致。')),
+        selected?.kind === 'comfyui' ? h('p', null, t('需要沿用原来的启动设置？请选择平时使用的启动器或脚本。')) : null,
         h('div', { className: 'dsh-comfy-launch-actions' }, h('button', { type: 'button', disabled: busy || !selected || status.connected || launching,
-          onClick: () => action('launcherStart') }, busy ? t('正在处理…') : t(selected?.kind !== 'comfyui' ? '运行所选启动入口' : '直接启动 ComfyUI')))),
-      status.logPath ? h('p', null, t('启动日志：'), h('code', null, status.logPath)) : null,
-      error || status.error ? h('p', { role: 'alert' }, localizedMessage(error || status.error)) : null);
+          onClick: () => action('launcherStart') }, busy ? t('正在处理…') : t('启动')))),
+      error || status.error ? h('p', { role: 'alert' }, userMessage(error || status.error)) : null,
+      error || status.error || ['failed', 'stopped'].includes(status.phase) ? diagnostics(error || status.error, status.logPath) : null);
   }
   function Body({ sessionId, useTabInfo }) {
     useTranslations();
@@ -595,11 +637,11 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     const installation = connection?.extensionInstallation;
     const installationHelp = installation?.status === 'failed' || installation?.status === 'unconfigured'
       ? (readLocale().active.startsWith('zh') ? installation.message : installation.messageEn || installation.message) : t('尚未收到 AI 桥接扩展连接。请确认 ComfyUI 可访问、已安装扩展；首次安装后重启 ComfyUI 并刷新面板。Docker 用户需确认扩展所在目录已持久化挂载。');
-    const setupLink = () => h('a', { href: readLocale().active.startsWith('zh') ? 'https://github.com/mangfufu/dsh-comfyui-web#comfyui-extension-install' : 'https://github.com/mangfufu/dsh-comfyui-web/blob/main/README.en.md#comfyui-extension-install', target: '_blank', rel: 'noopener noreferrer' }, t('扩展安装说明'));
+    const setupLink = () => h('a', { href: readLocale().active.startsWith('zh') ? 'https://github.com/mangfufu/dsh-comfyui-web#comfyui-extension-install' : 'https://github.com/mangfufu/dsh-comfyui-web/blob/main/README.en.md#comfyui-extension-install', target: '_blank', rel: 'noopener noreferrer' }, t('安装说明'));
     return h('section', { className: 'dsh-comfy', 'aria-label': t('ComfyUI 工作台') },
       h('style', null, CSS),
       h('div', { className: 'dsh-comfy-bar' },
-        h('span', { className: 'dsh-comfy-state', role: 'status' }, h('i', { className: 'dsh-comfy-dot' + (!mcpEnabled ? ' off' : ready ? ' ready' : '') }), !mcpEnabled ? t('MCP 已关闭') : ready ? t('MCP · 共享画布已连接') : bridgeMissing ? t('AI 桥接扩展未连接') : t('等待 ComfyUI')),
+        h('span', { className: 'dsh-comfy-state', role: 'status' }, h('i', { className: 'dsh-comfy-dot' + (!mcpEnabled ? ' off' : ready ? ' ready' : '') }), !mcpEnabled ? t('AI 操作已关闭') : ready ? t('AI 已连接') : bridgeMissing ? t('AI 尚未连接') : t('等待 ComfyUI')),
         h('div', { className: 'dsh-comfy-zoom', role: 'group', 'aria-label': t('ComfyUI 界面缩放') },
           h('button', { type: 'button', onClick: () => changeZoom(-0.05), disabled: zoom <= 0.5, 'aria-label': t('缩小 ComfyUI 界面') }, '−'),
           h('button', { type: 'button', onClick: () => setZoom(1), title: t('恢复 100% 大小'), 'aria-label': t('当前缩放 {percent}%，点击恢复 100%', { percent: Math.round(zoom * 100) }) }, Math.round(zoom * 100) + '%'),
@@ -610,27 +652,28 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
           h('span', { className: 'dsh-comfy-privacy-state', 'aria-hidden': true }, imagePrivacy ? t('开') : t('关'))),
         h('button', { type: 'button', onClick: () => { setReady(false); setEpoch(v => v + 1); }, title: t('刷新 ComfyUI 页面') }, t('刷新')),
         h('button', { type: 'button', onClick: () => setLaunchSettings(v => !v), 'aria-expanded': launchSettings || connection?.launcher?.connected === false }, t('启动设置')),
-        h('button', { type: 'button', onClick: () => { setSettings(v => !v); setCopied(false); }, 'aria-expanded': settings }, t('MCP 设置'))),
+        h('button', { type: 'button', onClick: () => { setSettings(v => !v); setCopied(false); }, 'aria-expanded': settings }, t('连接设置'))),
       connection?.launcher && (launchSettings || !connection.launcher.connected) ? h(LauncherControls, { connection,
         onChange: launcher => setConnection(previous => ({ ...previous, launcher })) }) : null,
-      settings ? h('div', { className: 'dsh-comfy-settings', 'aria-label': t('MCP 设置') },
-        h('div', { className: 'dsh-comfy-settings-head' }, h('strong', null, 'ComfyUI MCP'),
+      settings ? h('div', { className: 'dsh-comfy-settings', 'aria-label': t('连接设置') },
+        h('div', { className: 'dsh-comfy-settings-head' }, h('strong', null, t('连接与 AI 操作')),
           h('label', { className: 'dsh-comfy-switch' }, h('input', { type: 'checkbox', role: 'switch', checked: mcpEnabled, disabled: !connection || switching,
-            onChange: e => toggleMcp(e.target.checked) }), switching ? t('保存中…') : t('开启 MCP'))),
-        h('p', null, mcpEnabled ? bridgeSeen ? t('MCP 已开启，当前对话的 AI 可直接读取、修改和运行画布。') : t('MCP 已开启，等待桥接扩展连接后可操作画布。') : t('MCP 已关闭，仍可手动编辑和生成。')),
-        h('p', null, !bridgeSeen && installation?.status !== 'installed' ? installationHelp + ' ' : '', setupLink()),
+            onChange: e => toggleMcp(e.target.checked) }), switching ? t('保存中…') : t('允许 AI 操作'))),
+        h('p', null, mcpEnabled ? bridgeSeen ? t('AI 可读取、修改并运行当前工作流。') : t('连接后，AI 即可操作工作流。') : t('已关闭 AI 操作，仍可手动编辑和生成。')),
+        !bridgeSeen && installation?.status !== 'installed' ? h(React.Fragment, null,
+          h('p', null, t('请按照安装说明完成连接设置。'), ' ', setupLink()), diagnostics(installationHelp)) : null,
         h('form', { onSubmit: connect },
           h('label', { htmlFor: 'comfy-url-' + clientId.current }, t('ComfyUI 地址')),
           h('input', { id: 'comfy-url-' + clientId.current, type: 'url', required: true, value: url, onChange: e => setUrl(e.target.value) }),
           h('button', { type: 'submit', disabled: saving || !connection }, saving ? t('连接中…') : t('保存并连接'))),
-        connection?.mcp ? h(React.Fragment, null,
-          h('p', null, t('MCP 地址：'), h('code', null, connection.mcp.endpoint)),
-          h('details', null, h('summary', null, t('其他 AI 客户端的 MCP 配置')),
+        connection?.mcp ? h('details', null, h('summary', null, t('连接其他 AI 应用')),
+            h('p', null, t('MCP 地址：'), h('code', null, connection.mcp.endpoint)),
             h('textarea', { readOnly: true, rows: 7, value: JSON.stringify(connection.mcp.clientConfig, null, 2), 'aria-label': t('MCP 客户端配置') }),
             h('button', { type: 'button', onClick: copyConfig }, copied ? t('已复制') : t('复制配置')),
-            h('p', null, t('dsh 已自动接入；这份配置可用于本机其他支持 MCP 的客户端。')))) : null) : null,
-      error ? h('div', { className: 'dsh-comfy-note', role: 'alert' }, localizedMessage(error)) : null,
-      bridgeMissing && connection?.launcher?.connected !== false ? h('div', { className: 'dsh-comfy-note', role: 'alert' }, installationHelp, ' ', setupLink()) : null,
+            h('p', null, t('dsh 已自动接入；这份配置可用于本机其他支持 MCP 的客户端。'))) : null) : null,
+      error ? h('div', { className: 'dsh-comfy-note' }, h('p', { role: 'alert' }, userMessage(error)), diagnostics(error)) : null,
+      bridgeMissing && connection?.launcher?.connected !== false ? h('div', { className: 'dsh-comfy-note' },
+        h('p', { role: 'alert' }, t('AI 暂时无法操作，请刷新页面；仍未连接时查看连接设置。'), ' ', setupLink()), diagnostics(installationHelp)) : null,
       src && (connection?.launcher?.connected !== false || loadedFrameUrl.current === connection.url) ? h('div', { className: 'dsh-comfy-viewport' }, h('iframe', { key: epoch, ref: frame, className: 'dsh-comfy-frame', src,
         style: { width: (100 / zoom) + '%', height: (100 / zoom) + '%', transform: 'scale(' + zoom + ')' },
         title: t('ComfyUI 节点编辑与实时生成预览'), allow: 'clipboard-read; clipboard-write; fullscreen', allowFullScreen: true,

@@ -10,7 +10,7 @@ Requires [dsh](https://github.com/deepseek-ai/deepseek-harness), pnpm, a local C
 
 | Plugin version | Supported dsh versions |
 | --- | --- |
-| `0.5.13`–`0.5.16` | `0.2.0-rc.2`, `0.2.1-rc.2` |
+| `0.5.13`–`0.5.17` | `0.2.0-rc.2`, `0.2.1-rc.2` |
 | `0.5.12` | `0.2.0-rc.2` |
 
 Both `engines.dsh` and the DSH peer dependencies declare the verified host versions, supporting compatibility checks in both host releases. Other DSH versions need separate validation. If a host upgrade reports an incompatibility, update the plugin first.
@@ -24,7 +24,7 @@ dsh plugin --profile web add github:mangfufu/dsh-comfyui-web
 When only DSH is running, the ComfyUI panel shows local launch controls. Use **Auto-detect**, **Choose folder / Choose launch file** to open the Windows file picker, or enter an absolute path. Supported entries include any named `.exe` launcher, `.bat` / `.cmd` / `.ps1` script, `.lnk` shortcut, and a ComfyUI directory / `main.py`. No launcher brand or adjacent ComfyUI source tree is required.
 
 - **Start ComfyUI directly** uses the installation's own Python (AKi, Windows portable bundles, or a local `.venv` / `venv`), with the panel's loopback address and port. The panel connects when the server is ready.
-- **Run selected launch entry** uses your own launcher, script or shortcut. If it opens a launcher window, click Start there. Shortcuts retain their target arguments and working directory. Match the server address and port to the panel settings; DSH connects when ComfyUI is ready.
+- **Use a launcher or script** uses your own launcher, script or shortcut. If it opens a launcher window, click Start there. Shortcuts retain their target arguments and working directory. Match the server address and port to the panel settings; DSH connects when ComfyUI is ready.
 
 Auto-detection checks configured paths, common installation locations and likely launch filenames. Manually selected files can have any name; selecting a folder lists its launch files. Detection never runs programs. Starting saves the entry and configures the bridge only when a ComfyUI installation is identified; standalone launchers preserve existing bridge settings. An already running or starting service is not started again. Logs go to `~/.dsh/comfyui/launch.log`; shortcut targets manage their own logs. PowerShell scripts follow the machine's execution policy; check the log if they fail. Direct launch does not read third-party launcher arguments. Remote and Docker services must be started in their own environment.
 
@@ -44,7 +44,7 @@ Create or edit `~/.dsh/comfyui/config.json`. Replace the example frontend direct
 
 After installation or an update, save your workflows, then refresh both the original ComfyUI page and the panel inside dsh.
 
-If the directory is missing or not writable, **MCP settings** and the dsh startup log explain the problem. Seeing the ComfyUI page is not enough: wait for **MCP · Shared canvas connected** before asking AI to operate it.
+If the directory is missing or not writable, **Connection settings** and the dsh startup log explain the problem. Seeing the ComfyUI page is not enough: wait for **AI connected** before asking AI to operate it.
 
 </details>
 
@@ -100,7 +100,7 @@ The plugin follows dsh's interface language and supports Chinese and English. Ch
 
 ### 2. Check the connection URL
 
-The default URL is `http://127.0.0.1:8188`. If you use another port, open **MCP settings**, update the URL and click **Save and connect**.
+The default URL is `http://127.0.0.1:8188`. If you use another port, open **Connection settings**, update the URL and click **Save and connect**.
 
 ![Connection URL and MCP switch](docs/images/comfyui-settings.png)
 

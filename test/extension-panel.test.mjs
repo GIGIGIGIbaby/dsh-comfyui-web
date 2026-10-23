@@ -6,6 +6,7 @@ import { readFile } from 'node:fs/promises';
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
 
 function find(tree, predicate) {
+  if (Array.isArray(tree)) { for (const item of tree) { const found = find(item, predicate); if (found) return found; } return; }
   if (!tree || typeof tree !== 'object') return;
   if (predicate(tree)) return tree;
   for (const child of tree.props?.children || []) {
@@ -13,10 +14,12 @@ function find(tree, predicate) {
     if (result) return result;
   }
 }
-function text(tree) {
+function text(tree, includeClosed = false) {
+  if (Array.isArray(tree)) return tree.map(item => text(item, includeClosed)).join(' ');
   if (typeof tree === 'string' || typeof tree === 'number') return String(tree);
   if (!tree || tree.type === 'style') return '';
-  return (tree.props?.children || []).map(text).join(' ');
+  if (tree.type === 'details' && !tree.props.open && !includeClosed) return text(tree.props.children.find(item => item?.type === 'summary'));
+  return (tree.props?.children || []).map(item => text(item, includeClosed)).join(' ');
 }
 
 async function panel(installation, language = 'zh', launcher) {
@@ -65,6 +68,7 @@ async function panel(installation, language = 'zh', launcher) {
     fetch: async (_path, options) => {
       const body = options?.body ? JSON.parse(options.body) : {};
       if (body.op === 'setMcpEnabled') settings.mcp = { ...settings.mcp, enabled: body.enabled };
+      if (body.op === 'launcherDetect') return { ok: true, json: async () => structuredClone(settings.launcher) };
       return { ok: true, json: async () => structuredClone(settings) };
     }
   });
@@ -81,6 +85,14 @@ async function panel(installation, language = 'zh', launcher) {
   }
   render(); await flush(); render(); render();
   return { render, get tree() { return rendered; }, get dictionaries() { return dictionaries; },
+    renderLauncher() {
+      const component = find(rendered, node => node.type?.name === 'LauncherControls');
+      assert.ok(component);
+      index = 1000;
+      const tree = component.type(component.props);
+      for (const effect of effects.splice(0)) effect();
+      return tree;
+    },
     component(key) { return registrations.find(row => row.def.key === key)?.component; },
     language(active) {
       localeRenderRequested = false; localeSnapshot = { active, revision: localeSnapshot.revision + 1 };
@@ -99,18 +111,20 @@ test('missing extension has a useful timeout notice, clears after a valid manual
   t.after(() => page.close());
   assert.equal(find(page.tree, node => node.props?.role === 'alert'), undefined);
   page.expire();
-  assert.match(text(page.tree), /AI 桥接扩展未连接/);
-  assert.match(text(find(page.tree, node => node.props?.role === 'alert')), /customNodesDir/);
+  assert.match(text(page.tree), /AI 尚未连接/);
+  assert.match(text(find(page.tree, node => node.props?.role === 'alert')), /刷新页面/);
+  assert.doesNotMatch(text(page.tree), /customNodesDir|frontendExtensionsDir|桥接/);
+  assert.match(text(find(page.tree, node => node.type === 'details'), true), /customNodesDir/);
   page.receive('https://unrelated.example');
-  assert.match(text(page.tree), /AI 桥接扩展未连接/, 'an unrelated window cannot clear installation warnings');
+  assert.match(text(page.tree), /AI 尚未连接/, 'an unrelated window cannot clear installation warnings');
   page.receive();
-  assert.match(text(page.tree), /MCP · 共享画布已连接/);
+  assert.match(text(page.tree), /AI 已连接/);
   assert.equal(find(page.tree, node => node.props?.role === 'alert'), undefined,
     'a manually installed remote extension must not keep showing unconfigured warnings');
   find(page.tree, node => node.type === 'button' && text(node) === '刷新').props.onClick();
   page.render(); page.render();
   assert.match(text(page.tree), /等待 ComfyUI/);
-  page.expire(); assert.match(text(page.tree), /AI 桥接扩展未连接/);
+  page.expire(); assert.match(text(page.tree), /AI 尚未连接/);
 });
 
 test('offline ComfyUI shows launch controls instead of a broken iframe or misleading bridge warning', async t => {
@@ -119,7 +133,7 @@ test('offline ComfyUI shows launch controls instead of a broken iframe or mislea
   assert.ok(find(page.tree, node => node.type?.name === 'LauncherControls'));
   assert.equal(find(page.tree, node => node.type === 'iframe'), undefined);
   page.expire();
-  assert.doesNotMatch(text(page.tree), /AI 桥接扩展未连接/);
+  assert.doesNotMatch(text(page.tree), /AI 尚未连接/);
   assert.equal(find(page.tree, node => node.props?.role === 'alert'), undefined);
 });
 
@@ -149,17 +163,42 @@ test('an opened canvas survives a health failure and recovery without reloading'
   }
 });
 
-test('failed writes appear in MCP settings and disabling MCP removes the missing-bridge alarm', async t => {
+test('launch controls show actions while keeping implementation details out of the normal flow', async t => {
+  const page = await panel({ status: 'installed' }, 'zh', { connected: false, supported: true, phase: 'idle',
+    logPath: 'C:/private/launch.log', targets: [{ kind: 'launcher', path: 'D:/Apps/MyLauncher.exe' }] });
+  t.after(() => page.close());
+  const controls = page.renderLauncher();
+  assert.ok(find(controls, node => node.type === 'button' && text(node) === '启动'));
+  assert.match(text(controls), /选择平时使用的启动器/);
+  assert.doesNotMatch(text(controls), /Python|main\.py|\.log|exe \/ bat|启动入口|协议/);
+  assert.equal(find(controls, node => node.type === 'form') !== undefined, true, 'manual path entry remains available');
+  assert.match(text(controls), /手动填写路径/);
+});
+
+test('launch failure explains the next action and retains raw errors only in collapsed diagnostics', async t => {
+  const page = await panel({ status: 'installed' }, 'en', { connected: false, supported: true, phase: 'failed',
+    error: 'spawn EACCES at child_process.js:123', logPath: 'C:/private/launch.log', targets: [] });
+  t.after(() => page.close());
+  const controls = page.renderLauncher();
+  assert.match(text(controls), /Try again or choose another launch file/);
+  assert.doesNotMatch(text(controls), /EACCES|child_process|private/);
+  assert.match(text(controls, true), /spawn EACCES/);
+  assert.match(text(controls, true), /C:\/private\/launch.log/);
+});
+
+test('setup failures stay available in diagnostics and disabling AI control removes the connection alarm', async t => {
   const page = await panel({ status: 'failed', message: '安装失败：目录不可写，请检查挂载。' });
   t.after(() => page.close());
-  find(page.tree, node => node.type === 'button' && text(node) === 'MCP 设置').props.onClick(); page.render();
-  assert.match(text(page.tree), /目录不可写/);
+  find(page.tree, node => node.type === 'button' && text(node) === '连接设置').props.onClick(); page.render();
+  assert.match(text(page.tree), /安装说明/);
+  assert.doesNotMatch(text(page.tree), /目录不可写/);
+  assert.match(text(find(page.tree, node => node.type === 'details'), true), /目录不可写/);
   const help = find(page.tree, node => node.type === 'a');
   assert.match(help.props.href, /#comfyui-extension-install$/);
   page.expire();
   await find(page.tree, node => node.type === 'input' && node.props?.role === 'switch').props.onChange({ target: { checked: false } });
   page.render();
-  assert.match(text(page.tree), /MCP 已关闭/);
+  assert.match(text(page.tree), /AI 操作已关闭/);
   assert.equal(find(page.tree, node => node.props?.role === 'alert'), undefined);
 });
 
@@ -172,9 +211,11 @@ test('English panel follows dsh language changes without refreshing the iframe o
   const privacy = () => find(page.tree, node => node.props?.role === 'switch' && node.type === 'button');
   privacy().props.onClick(); page.render();
   assert.equal(privacy().props['aria-checked'], true);
-  find(page.tree, node => node.type === 'button' && text(node) === 'MCP settings').props.onClick(); page.render();
+  find(page.tree, node => node.type === 'button' && text(node) === 'Connection settings').props.onClick(); page.render();
   assert.match(text(page.tree), /Save and connect/);
-  assert.match(text(page.tree), /MCP configuration for other AI clients/);
+  assert.match(text(page.tree), /Connect other AI apps/);
+  assert.doesNotMatch(text(page.tree), /MCP|19000|bridge|clientConfig/);
+  assert.match(text(page.tree, true), /MCP endpoint/);
   assert.equal(/\p{Script=Han}/u.test(text(page.tree)), false);
   page.language('zh');
   assert.match(text(page.tree), /保存并连接/);
@@ -190,7 +231,9 @@ test('English panel follows dsh language changes without refreshing the iframe o
 test('English setup diagnostics, result cards and accessibility labels use the same bilingual catalog', async t => {
   const page = await panel({ status: 'failed', message: '目录不可写', messageEn: 'The directory is not writable.' }, 'en');
   t.after(() => page.close()); page.expire();
-  assert.match(text(page.tree), /The directory is not writable/);
+  assert.match(text(page.tree), /Refresh the page/);
+  assert.doesNotMatch(text(page.tree), /The directory is not writable/);
+  assert.match(text(page.tree, true), /The directory is not writable/);
   const guide = find(page.tree, node => node.type === 'a');
   assert.match(guide.props.href, /README\.en\.md#comfyui-extension-install$/);
   assert.deepEqual(Object.keys(page.dictionaries.zh).sort(), Object.keys(page.dictionaries.en).sort());
