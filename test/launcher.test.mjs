@@ -126,3 +126,20 @@ test('missing interpreters and spawn failures report failure rather than readine
   await assert.rejects(launcher.start(), /失效/);
   assert.equal(fake.calls.length, 1);
 });
+
+test('transient health failures neither mark a running service offline nor launch a duplicate', async () => {
+  let online = true, now = 100000;
+  const runtime = { url: 'http://127.0.0.1:8188' }, fake = processDouble();
+  const launcher = new ComfyLauncher(runtime, { platform: 'win32', spawn: fake.spawn, probe: async () => online, now: () => now });
+  assert.equal((await launcher.status()).connected, true);
+  online = false; now += 3000;
+  assert.equal((await launcher.status()).connected, true, 'a brief busy interval preserves readiness');
+  assert.equal((await launcher.start()).alreadyRunning, true);
+  assert.equal(fake.calls.length, 0);
+  now += 30000;
+  assert.equal((await launcher.status()).connected, false, 'a sustained outage is still reported');
+  online = true; now += 3000;
+  assert.equal((await launcher.status()).connected, true);
+  runtime.url = 'http://127.0.0.1:8190'; online = false;
+  assert.equal((await launcher.status()).connected, false, 'another URL cannot inherit the grace period');
+});

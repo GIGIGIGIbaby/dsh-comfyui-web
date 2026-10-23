@@ -523,7 +523,7 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     const [error, setError] = useState('');
     const [settings, setSettings] = useState(false);
     const [launchSettings, setLaunchSettings] = useState(false);
-    const wasOnline = useRef(null);
+    const loadedFrameUrl = useRef(null);
     const [epoch, setEpoch] = useState(0);
     const [saving, setSaving] = useState(false);
     const [switching, setSwitching] = useState(false);
@@ -548,11 +548,6 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
       }).catch(() => {}), 3000);
       return () => { controller.abort(); clearInterval(refresh); };
     }, []);
-    useEffect(() => {
-      const online = connection?.launcher?.connected;
-      if (online === true && wasOnline.current === false) setEpoch(value => value + 1);
-      if (typeof online === 'boolean') wasOnline.current = online;
-    }, [connection?.launcher?.connected]);
     useEffect(() => {
       if (!connection) return;
       const receive = event => {
@@ -595,6 +590,7 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
       catch { setError('复制失败，请选中下方配置手动复制。'); }
     }
     const src = connection ? connection.url + '/?dsh_client=' + encodeURIComponent(clientId.current) + '&dsh_session=' + encodeURIComponent(sessionId) + '&dsh_bridge=' + encodeURIComponent(connection.frameOrigin) : null;
+    if (connection?.launcher?.connected) loadedFrameUrl.current = connection.url;
     const bridgeMissing = connection && connection.launcher?.connected !== false && mcpEnabled && !bridgeSeen && bridgeWaitExpired;
     const installation = connection?.extensionInstallation;
     const installationHelp = installation?.status === 'failed' || installation?.status === 'unconfigured'
@@ -635,7 +631,7 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
             h('p', null, t('dsh 已自动接入；这份配置可用于本机其他支持 MCP 的客户端。')))) : null) : null,
       error ? h('div', { className: 'dsh-comfy-note', role: 'alert' }, localizedMessage(error)) : null,
       bridgeMissing && connection?.launcher?.connected !== false ? h('div', { className: 'dsh-comfy-note', role: 'alert' }, installationHelp, ' ', setupLink()) : null,
-      src && connection?.launcher?.connected !== false ? h('div', { className: 'dsh-comfy-viewport' }, h('iframe', { key: epoch, ref: frame, className: 'dsh-comfy-frame', src,
+      src && (connection?.launcher?.connected !== false || loadedFrameUrl.current === connection.url) ? h('div', { className: 'dsh-comfy-viewport' }, h('iframe', { key: epoch, ref: frame, className: 'dsh-comfy-frame', src,
         style: { width: (100 / zoom) + '%', height: (100 / zoom) + '%', transform: 'scale(' + zoom + ')' },
         title: t('ComfyUI 节点编辑与实时生成预览'), allow: 'clipboard-read; clipboard-write; fullscreen', allowFullScreen: true,
         onLoad: sendState, referrerPolicy: 'origin' })) : connection?.launcher?.connected === false ? null : h('div', { className: 'dsh-comfy-empty' }, t('正在连接本机 ComfyUI…')));

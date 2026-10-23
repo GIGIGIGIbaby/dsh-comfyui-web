@@ -133,6 +133,22 @@ test('an online ComfyUI loads normally with launch settings available on demand'
   assert.ok(find(page.tree, node => node.type?.name === 'LauncherControls'));
 });
 
+test('an opened canvas survives a health failure and recovery without reloading', async t => {
+  const page = await panel({ status: 'installed' }, 'en', { connected: true, supported: true, targets: [] });
+  t.after(() => page.close());
+  const initial = find(page.tree, node => node.type === 'iframe');
+  find(page.tree, node => node.type === 'button' && text(node) === 'Launch settings').props.onClick();
+  page.render();
+  for (const connected of [false, true]) {
+    find(page.tree, node => node.type?.name === 'LauncherControls').props.onChange({ connected, supported: true, targets: [] });
+    page.render(); page.render();
+    const frame = find(page.tree, node => node.type === 'iframe');
+    assert.ok(frame, 'a failed health probe must not discard the mounted canvas');
+    assert.equal(frame.props.src, initial.props.src);
+    assert.equal(frame.props.key, initial.props.key, 'recovery must not refresh the canvas');
+  }
+});
+
 test('failed writes appear in MCP settings and disabling MCP removes the missing-bridge alarm', async t => {
   const page = await panel({ status: 'failed', message: '安装失败：目录不可写，请检查挂载。' });
   t.after(() => page.close());
