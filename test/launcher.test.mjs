@@ -147,6 +147,12 @@ test('automatic discovery includes portable launch scripts and shortcuts, while 
   }
   assert.equal(automatic.some(target => /uninstall|custom entry/i.test(target.path)), false);
   assert.ok((await inspectInstallation(data.root)).some(target => target.path === join(data.root, 'custom entry.ps1')));
+  const menu = join(data.root, '..', 'Start Menu');
+  await mkdir(menu);
+  for (const name of ['Other Game Launcher.lnk', 'ComfyUI Desktop.lnk']) await writeFile(join(menu, name), 'fixture');
+  const shortcuts = await detectInstallations({}, { roots: [menu] });
+  assert.deepEqual(shortcuts.map(item => item.path), [join(menu, 'ComfyUI Desktop.lnk')]);
+  assert.equal((await inspectInstallation(join(menu, 'Other Game Launcher.lnk')))[0].kind, 'launcher', 'explicit choices remain unrestricted');
   const exe = join(data.root, '绘世启动器.exe');
   await writeFile(data.configFile, JSON.stringify({ launcher: { path: exe, kind: 'aki' } }));
   const restored = await new ComfyLauncher(data, { probe: async () => false }).init();
