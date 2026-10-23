@@ -28,18 +28,6 @@ dsh plugin --profile web add github:mangfufu/dsh-comfyui-web
 
 自动检测只检查已配置路径、常见安装位置和带启动特征的文件名；手动选择文件不限制名称，选择文件夹会列出其中的启动文件。检测不会运行程序。点击启动后会保存入口；仅在识别出 ComfyUI 安装目录时配置桥接扩展，独立启动器沿用已有桥接配置。已运行或正在启动时不会重复启动。启动日志位于 `~/.dsh/comfyui/launch.log`，快捷方式目标程序的日志由目标程序管理。PowerShell 脚本遵循本机执行策略，失败时可查看日志。直接启动不会读取第三方启动器的自定义参数。远程 / Docker 地址仍需在对应环境中启动服务。
 
-如果 `dsh web` 提示 `webserver` 的 `$.host missing required value`，检查 `~/.dsh/profiles/web/cordis.patch.yml` 中覆盖的 `webserver.config` 是否同时包含 `host` 和 `port`，例如：
-
-```yaml
-- id: webserver
-  name: '@deepseek-ai/dsh-host-webserver'
-  config:
-    host: 127.0.0.1
-    port: 33080
-```
-
-只写 `port` 的覆盖配置会丢失必填的 `host`；临时在命令行传 `--host` 能掩盖问题，但不会补全配置文件。
-
 <a id="comfyui-extension-install"></a>
 
 <details>

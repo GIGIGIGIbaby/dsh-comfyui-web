@@ -28,18 +28,6 @@ When only DSH is running, the ComfyUI panel shows local launch controls. Use **A
 
 Auto-detection checks configured paths, common installation locations and likely launch filenames. Manually selected files can have any name; selecting a folder lists its launch files. Detection never runs programs. Starting saves the entry and configures the bridge only when a ComfyUI installation is identified; standalone launchers preserve existing bridge settings. An already running or starting service is not started again. Logs go to `~/.dsh/comfyui/launch.log`; shortcut targets manage their own logs. PowerShell scripts follow the machine's execution policy; check the log if they fail. Direct launch does not read third-party launcher arguments. Remote and Docker services must be started in their own environment.
 
-If `dsh web` reports `$.host missing required value` for `webserver`, include both `host` and `port` in the `webserver.config` override in `~/.dsh/profiles/web/cordis.patch.yml`:
-
-```yaml
-- id: webserver
-  name: '@deepseek-ai/dsh-host-webserver'
-  config:
-    host: 127.0.0.1
-    port: 33080
-```
-
-A port-only config override loses the required host. Passing `--host` on the command line temporarily masks this; it does not repair the configuration file.
-
 <a id="comfyui-extension-install"></a>
 
 <details>
