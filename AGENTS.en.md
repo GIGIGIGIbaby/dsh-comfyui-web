@@ -8,16 +8,13 @@ For AI agents working in this repository. Requirements only, no backstory.
 
 ## How this file relates to the accompanying PRs
 
-This file documents the following changes, and ships as a **separate PR so it can be reviewed on its own**:
+This guide and the runtime changes in #10 have been merged together. It applies to version 0.5.13 and later.
 
 | Companion PR | What it adds |
 | --- | --- |
 | #10 `feat/tool-face-hardening` | the consolidated runtime PR -- the review path for what #6/#7/#8 each opened separately (those were closed as superseded, not merged): `update_nodes` writes through the widget's own setter and reports `via` / `verified` to prove the write stuck; a canvas write lease, so two conversations cannot stomp the live canvas; `doctor` decides in one call whether the environment is usable and errors carry the next step; `audit(op=graph\|params\|writes)` -- can this graph run, will the server reject my values, and which controls can this plugin write at all |
 
-**Merge advice:**
-
-- If #10 gets merged, **this PR is worth merging together with it** -- §2's criteria should then move to `doctor` (see the appendix), which is stronger than the `server_info` criteria described here.
-- If it does not get merged, **treat this PR as reference only**: the body is written against the tool face that actually exists on `main`, and never sends an agent after a tool `main` does not have.
+Check the environment with `doctor` first; use the detailed `server_info` fields to diagnose connection failures.
 
 ---
 
@@ -41,6 +38,8 @@ Read the matching `*.test.mjs` under `test/` before you change anything: those t
 
 All three must hold. Until then, do not tell the user it is installed or fixed.
 
+Call `doctor` first and require `kind === "ok"` with no failed checks (`failedChecks` may be absent). The connection fields below help diagnose failures.
+
 **1. The server and a panel are both connected.** Call `server_info` and require: `connected: true`; at least one entry in `clients` with `ready: true`, `allowAI: true` and `connected: true`; `heartbeatAgeMs` in the low seconds (that is the page still polling).
 
 **2. The script in the page matches the plugin.** `server_info.bridgeVersion` / `bridgeProtocol` are what the host read from `package.json` and `bridge.js` at startup; `syncClients[]` is what each panel reports. Take the entry whose `clientId` matches the `clients[]` entry for this conversation and require its `bridgeVersion` to equal `server_info.bridgeVersion` and its `refreshRequired` to be `false`. `refreshRequired` lives on `syncClients[]` only (`clients[]` has no such field) and compares the page's reported `bridgeProtocol` with the host's; when it is `true` the page is still running the old script and **the ComfyUI page has to be reloaded** (the panel's Refresh button does it); restarting dsh is not enough. It does not look at the version string, so compare versions yourself.
@@ -50,7 +49,7 @@ All three must hold. Until then, do not tell the user it is installed or fixed.
 ```text
 list_nodes { filter: "<node type>", detail: "values" }   -> widgets for that node (name, type, current value)
 update_nodes { changes: [{ nodeId: "<id>", widget: "<name>", value: <new value> }] }
-  -> returns changed[], where after equals the value you sent
+  -> returns changed[] with verified=true; after equals the requested value or the explicitly reported quantized value
 list_nodes { filter: "<node type>", detail: "values" }   -> read back; the value really changed
 ```
 
@@ -71,7 +70,8 @@ Find the layer the change lives in before touching anything. Each layer loads on
 
 The panel's Refresh button only remounts the embedded ComfyUI iframe; ComfyUI tabs opened in a normal browser must each reload the page, or they keep reporting the old script.
 
-- **A version bump touches three places**: `package.json`'s `version`, `bridgeVersion` in `bridge.js`, and the protocol number (`bridgeProtocol` in `bridge.js` plus `BRIDGE_PROTOCOL` in `lib/runtime.js`). Criterion 2 only sees it after the reload and page refresh above; miss one and criterion 2 never passes.
+- **Check version and protocol in three places**: change only `package.json`'s `version` for a version bump. The host injects it into the version placeholder in `bridge.js` or bootstrap; the page no longer hardcodes a version. Only an incompatible bridge protocol change needs a matching bump to `bridgeProtocol` in `bridge.js` and `BRIDGE_PROTOCOL` in `lib/runtime.js`. Reload the plugin and page, then verify the handshake.
+- **A timeout does not cancel execution**: until the old body finishes or rolls back, the bridge refuses subsequent mutations and pauses cross-page synchronization. `list_nodes`, `list_workflows` and `list_edits` remain available. Wait for completion, then read the state again; if it never settles, refresh the page and check requests already sent to the server. Do not edit the canvas manually while waiting.
 - **Do not judge "old code is still running" from a byte difference between the served `bridge.js` and the one on disk**: `lib/runtime.js` substitutes a placeholder token with the real one when it serves that script, so the difference is expected. Read the version from `server_info`'s `bridgeVersion`, or from `GET /__dsh_comfyui/bootstrap` (`bridgeVersion` / `bridgeProtocol`).
 - **The bridge token changes on every dsh restart**: the token in `<DSH_HOME>/comfyui/connection.json` is replaced, so do not reuse the previous token when calling MCP.
 - **Run the tests after a change**: `npm test` (= `node --test test/*.test.mjs`) has to be green. Edit an assertion only when it is genuinely stale, and say why in the commit.
@@ -87,13 +87,13 @@ Paste this into a fresh session as-is:
 
 ```text
 You are maintaining the dsh-comfyui-web plugin. Before touching anything:
-1. Call server_info and confirm three things: connected=true; one entry in clients has ready/allowAI/connected
+1. Call doctor and require kind=ok; on failure, use server_info to confirm: connected=true; one entry in clients has ready/allowAI/connected
    all true; the syncClients entry with the same clientId has refreshRequired=false (clients has no such field).
    If any of them fails, fix the environment first (restart dsh, reload the ComfyUI page, check the MCP switch
    in the panel) -- do not start editing the canvas.
 2. Read and write node parameters with list_nodes (filter takes the node type) and update_nodes only;
    when a node is missing, get the real nodeId with list_nodes first. Never reuse an id from an earlier turn.
-3. After writing, read the value back with list_nodes detail="values" and confirm it really changed before
+3. After writing, require changed[].verified=true, read back with list_nodes detail="values", and confirm it changed before
    reporting the result to the user.
 
 Changing client.js only needs a dsh page refresh; changing lib/*.js or package.json means loading the plugin
@@ -105,7 +105,7 @@ page reload.
 
 ## Appendix: what changes once the companion PRs land
 
-Once #10 is merged, the tool face gains the following. Update this file's criteria accordingly at that point:
+The following capabilities have shipped with #10; the criteria above now use these receipts:
 
 - **`doctor`**: decides "can I work right now" in one call, returning `kind: "ok" | "fail"` plus every criterion as a value (MCP switch, ComfyUI reachable, bridge page alive, heartbeat, version, AI permission, write lease, graph executable, disk output node, active workflow, queue). **§2 criteria 1-2 should then switch to `doctor`'s `kind === "ok"` with an empty `failedChecks`**, which is cheaper than reading `server_info` field by field.
 - **`update_nodes` returns `via` / `verified`**: `verified: true` means the value was read back after writing; `verified: false` means the widget holds its own state in a front-end component and the write did not land, and the receipt's `hint` gives the alternative (write its shadow source, use the pack's own write entry point, or edit the JSON on disk and `load_workflow`). **§2 criterion 3 should then use `verified`, and state plainly that `verified: false` or a missing `verified` may not be reported as "changed".**

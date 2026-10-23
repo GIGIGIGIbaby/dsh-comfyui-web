@@ -6,7 +6,14 @@
 
 ## 安装
 
-需要已安装的 [dsh](https://github.com/deepseek-ai/deepseek-harness)、pnpm 和本机 ComfyUI。当前适配 dsh `0.2.0-rc.2`，Node.js 22 及以上。
+需要已安装的 [dsh](https://github.com/deepseek-ai/deepseek-harness)、pnpm 和本机 ComfyUI，Node.js 22 及以上。
+
+| 插件版本 | 支持的 dsh 版本 |
+| --- | --- |
+| `0.5.13` | `0.2.0-rc.2`、`0.2.1-rc.2` |
+| `0.5.12` | `0.2.0-rc.2` |
+
+插件通过 `engines.dsh` 和 DSH peer dependencies 同时声明已验证的宿主版本，兼容新旧宿主的检查方式。其他 DSH 版本需要另行验证；升级后若提示版本不兼容，请先更新插件。
 
 ```sh
 dsh plugin --profile web add github:mangfufu/dsh-comfyui-web

@@ -80,10 +80,11 @@ async function boot(nodes, options = {}) {
     document: { referrer: 'http://dsh.test/', visibilityState: options.visibility || 'visible', addEventListener() {} },
     localStorage: options.localStorage || { getItem: () => null, setItem() {} },
     setTimeout: schedule, clearTimeout: unschedule,
-    fetch: async (url, options) => {
-      const body = options?.body ? JSON.parse(options.body) : {};
+    fetch: async (url, requestOptions) => {
+      const body = requestOptions?.body ? JSON.parse(requestOptions.body) : {};
       requests.push(String(url).replace(/^.*\/__dsh_comfyui\//, ''));
       if (String(url).includes('/result')) replies.push(body);
+      if (options.beforeResponse) await options.beforeResponse(String(url), body);
       return { ok: true, status: 200, json: async () => String(url).includes('/poll') ? { commands: commands.splice(0) } : { revision: 1 } };
     }
   }));
@@ -1365,6 +1366,59 @@ test('a command that never returns is written off, the heartbeat keeps beating, 
   for (let turn = 0; turn < 4; turn += 1) await new Promise(resolve => setImmediate(resolve));
   assert.equal(results(), beforeLate, 'no second reply is posted for a command that was already written off');
   assert.ok((await late('list_nodes')).nodes.length >= 1, 'and the page is still taking work');
+});
+
+for (const fails of [false, true]) test('a timed-out load holds off later writes until ' + (fails ? 'rollback' : 'completion'), async () => {
+  const command = await boot([plainNode()]);
+  const load = command.app.loadGraphData.bind(command.app);
+  let release;
+  let loads = 0;
+  command.app.loadGraphData = async (...args) => {
+    loads += 1;
+    if (loads === 1) {
+      await new Promise(resolve => { release = resolve; });
+      await load(...args);
+      if (fails) throw new Error('late loader failure');
+      return true;
+    }
+    return load(...args);
+  };
+  const incoming = structuredClone(command.graph.serialize());
+  incoming.nodes[0].widgets_values[0] = 99;
+  await assert.rejects(command('load_workflow', { workflow: incoming }), /没有返回/);
+  const syncs = command.requests.filter(path => path === 'sync').length;
+  const inspected = await command('list_nodes');
+  assert.equal(inspected.nodes[0].widgets[0].value, 20, 'diagnostics remain usable');
+  const change = { changes: [{ nodeId: '1', widget: 'steps', value: 30 }] };
+  for (const [action, args] of [['update_nodes', change], ['save_workflow', {}], ['run', {}]]) {
+    await assert.rejects(command(action, args), /上一条超时操作仍在执行或回滚/);
+  }
+  assert.equal(command.graph._nodes[0].widgets[0].value, 20, 'a rejected write has no effect');
+  assert.equal(command.requests.filter(path => path === 'sync').length, syncs, 'no cross-page reconciliation races the old body');
+  const replies = command.requests.filter(path => path === 'result').length;
+  release();
+  await flush();
+  assert.equal(command.graph._nodes[0].widgets[0].value, fails ? 20 : 99, 'the old body settles before another write');
+  assert.equal(command.requests.filter(path => path === 'result').length, replies, 'no late success replaces the timeout');
+  await command('update_nodes', change);
+  assert.equal(command.graph._nodes[0].widgets[0].value, 30, 'writes resume after completion or rollback');
+});
+
+test('an action that times out during initial sync never starts after the response arrives', async () => {
+  let armed = false, hold = false, release;
+  const command = await boot([plainNode()], { beforeResponse: async url => {
+    if (armed && url.endsWith('/poll')) hold = true;
+    if (hold && url.endsWith('/sync')) await new Promise(resolve => { release = resolve; });
+  } });
+  armed = true;
+  await assert.rejects(command('update_nodes', { changes: [{ nodeId: '1', widget: 'steps', value: 99 }] }), /没有返回/);
+  assert.equal((await command('list_nodes')).nodes[0].widgets[0].value, 20);
+  armed = false; hold = false;
+  release();
+  await flush();
+  assert.equal(command.graph._nodes[0].widgets[0].value, 20, 'expiry cancels an action which has not started');
+  await command('update_nodes', { changes: [{ nodeId: '1', widget: 'steps', value: 30 }] });
+  assert.equal(command.graph._nodes[0].widgets[0].value, 30);
 });
 
 test('a canvas that serializes but cannot produce a prompt reports it as a fact, not a silence', async () => {

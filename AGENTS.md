@@ -8,16 +8,13 @@
 
 ## 这份文件与伴随 PR 的关系
 
-本文件是下面几项功能改动的配套文档，**单独成一个 PR 便于评审**：
+本文件与 #10 的功能改动已一起合并，适用于 0.5.13 及以后的版本。
 
 | 伴随 PR | 内容 |
 | --- | --- |
 | #10 `feat/tool-face-hardening` | 运行时改动的归并总入口（#6/#7/#8 各自开过的分支已作为「被取代」关闭，并入此处）：`update_nodes` 通过控件自己的 setter 写入并回 `via` / `verified` 证明写进去了；画布写租约——同一时刻只让一个对话写共享画布；`doctor` 一次判定环境可用、错误信息带下一步；`audit(op=graph\|params\|writes)`——这张图能不能跑、我的值服务器会不会拒、以及这台画布上到底有哪些控件是本插件写得动的 |
 
-**合并建议**：
-
-- 如果 #10 被合并了，**本 PR 推荐一起合并**——此时 §2 的判据应改用 `doctor`（见文末附录），比本文描述的 `server_info` 判据更强。
-- 如果它没有被合并，**本 PR 只作为参考**：正文按当前 `main` 的实际工具面写，不会引用 `main` 上还不存在的工具。
+环境检查先用 `doctor`；需要定位连接问题时，再查 `server_info` 的具体字段。
 
 ---
 
@@ -41,6 +38,8 @@
 
 三条同时满足才算装好，缺一条都不能对用户说「已安装 / 已修好」。
 
+先调 `doctor`，要求 `kind === "ok"`，且没有失败项（`failedChecks` 可以缺省）。下面的连接字段用于排查失败原因。
+
 **1. 服务与面板都连上了。** 调 `server_info`，要求：`connected: true`；`clients` 至少一项，且该项 `ready: true`、`allowAI: true`、`connected: true`；`heartbeatAgeMs` 是秒级数字（几秒以内说明页面还在轮询）。
 
 **2. 页面里的脚本与插件同版本。** `server_info.bridgeVersion` / `bridgeProtocol` 是宿主启动时从 `package.json` 和 `bridge.js` 读进来的；`syncClients[]` 是各面板上报的实况。取与本对话 `clients[]` 同一 `clientId` 的那一项，要求 `bridgeVersion` 等于 `server_info.bridgeVersion`、`refreshRequired` 为 `false`。`refreshRequired` 只挂在 `syncClients[]` 上（`clients[]` 没有这个字段），判定的是页面汇报的 `bridgeProtocol` 与宿主不一致；它为 `true` 说明页面还跑着旧脚本，**必须刷新 ComfyUI 页面**（面板里的「刷新」即可），只重启 dsh 不够。它不看版本号，版本要自己比。
@@ -50,7 +49,7 @@
 ```text
 list_nodes { filter: "<节点类型>", detail: "values" }   → 能拿到该节点的 widgets（名称、类型、当前值）
 update_nodes { changes: [{ nodeId: "<id>", widget: "<name>", value: <新值> }] }
-  → 回 changed[]，其中 after 等于提交值
+  → 回 changed[]，其中 verified 为 true；after 等于提交值或回执明确说明的量化值
 list_nodes { filter: "<节点类型>", detail: "values" }   → 回读，值确实变了
 ```
 
@@ -71,7 +70,8 @@ list_nodes { filter: "<节点类型>", detail: "values" }   → 回读，值确�
 
 面板里的「刷新」只重载内嵌的 ComfyUI iframe；在普通浏览器里另开的 ComfyUI 标签页要各自刷新页面，否则它们上报的还是旧脚本。
 
-- **改版本号要三处同步**：`package.json` 的 `version`、`bridge.js` 里的 `bridgeVersion`、以及协议号（`bridge.js` 的 `bridgeProtocol` 与 `lib/runtime.js` 的 `BRIDGE_PROTOCOL`）。按上表重新加载并刷新页面对判据 2 才生效；任何一处漏掉，判据 2 永远不过。
+- **版本与协议的三处同步校验**：版本只修改 `package.json` 的 `version`，宿主把它注入 `bridge.js` 的版本占位符或 bootstrap，页面不再硬编码版本。只有桥接协议发生不兼容变化时，才同时更新 `bridge.js` 的 `bridgeProtocol` 与 `lib/runtime.js` 的 `BRIDGE_PROTOCOL`。按上表重新加载并刷新页面后检查握手。
+- **超时不等于取消**：旧操作未结束或回滚完成前，桥接会拒绝后续写入并暂停跨页同步，`list_nodes` / `list_workflows` / `list_edits` 仍可检查。等待结束后重新读取状态；一直不结束则刷新页面，并核对已发送到服务端的请求。不要在等待期间手动修改画布。
 - **不要用「服务端下发的 bridge.js 与磁盘文件不一致」判定跑的是旧代码**：`lib/runtime.js` 在提供该脚本时会把占位 token 替换成真实 token，字节差是正常的。判断版本请看 `server_info` 的 `bridgeVersion`，或 `GET /__dsh_comfyui/bootstrap` 返回的 `bridgeVersion` / `bridgeProtocol`。
 - **每次重启 dsh，桥接 token 都会变**：`<DSH_HOME>/comfyui/connection.json` 里的 token 随之更新，不要复用上一次的 token 调 MCP。
 - **改完跑测试**：`npm test`（= `node --test test/*.test.mjs`）必须全绿。只在某条测试确实过时、且 commit 里写清理由时改断言。
@@ -87,12 +87,12 @@ list_nodes { filter: "<节点类型>", detail: "values" }   → 回读，值确�
 
 ```text
 你在维护 dsh-comfyui-web 插件。动手前先做三件事：
-1. 调 server_info 确认三件事：connected=true、clients 里有一项 ready/allowAI/connected 都为 true、
+1. 先调 doctor，要求 kind=ok；失败时用 server_info 确认三件事：connected=true、clients 里有一项 ready/allowAI/connected 都为 true、
    同一 clientId 在 syncClients 里那一项的 refreshRequired=false（clients 上没有这个字段）。
    任一不满足就先修环境（重启 dsh、刷新 ComfyUI 页面、检查面板 MCP 开关），别急着改画布。
 2. 读写节点参数一律用 list_nodes（filter 填节点类型）和 update_nodes；
    找不到节点就先用 list_nodes 取真实 nodeId，不要复用上一轮调用里的 id。
-3. 写完用 list_nodes detail="values" 回读确认值真的变了，再向用户报告结果。
+3. 写完检查 changed[].verified=true，再用 list_nodes detail="values" 回读确认，之后向用户报告结果。
 
 改 client.js 刷新 dsh 网页即可；改 lib/*.js 或 package.json 要重新加载插件（没有重载入口就重启 dsh）；
 改 bridge.js 要重启 dsh 再刷新 ComfyUI 页面。
@@ -102,7 +102,7 @@ list_nodes { filter: "<节点类型>", detail: "values" }   → 回读，值确�
 
 ## 附录：合并伴随 PR 之后的差异
 
-合并上表的 #10 之后，工具面会多出以下能力，届时本文的判据应相应升级：
+以下能力已随 #10 合并，正文的判据已采用这些回执：
 
 - **`doctor`**：一次调用判定「现在能不能用」，返回 `kind: "ok" | "fail"`，并逐项列出判据（MCP 开关、ComfyUI 是否可达、桥接页面是否活着、心跳、版本、AI 权限、写租约、画布能否执行、有无落盘节点、当前工作流、队列）。**§2 的判据 1～2 应改用 `doctor` 的 `kind === "ok"` 且 `failedChecks` 为空**，比逐字段读 `server_info` 便宜。
 - **`update_nodes` 回 `via` / `verified`**：`verified: true` 表示写入后回读确认过；`verified: false` 表示该控件由前端组件自己持有状态、写控件没生效，回执里的 `hint` 会给出替代路径（写 shadow 源 / 用该包自带的写入入口 / 改磁盘 JSON 再 `load_workflow`）。**此时 §2 的判据 3 应改用 `verified`，并明确：`verified` 为 false 或缺失时不得报告「已改好」。**

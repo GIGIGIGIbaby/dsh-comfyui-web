@@ -65,6 +65,12 @@
   // How many commands this page has had to write off as unreturnable. Reported with the heartbeat so a
   // stuck pack setter is visible from the server side instead of only felt as a timeout (R7-7).
   let stalledCommands = 0;
+  // A timeout answers the caller; it cannot cancel a third-party loader or setter.
+  // Keep its execution slot until the body (including rollback) actually settles.
+  const unsettledCommands = new Set();
+  const diagnosticActions = new Set(['list_nodes', 'list_workflows', 'list_edits', 'graph_fingerprint', 'audit_writes']);
+  const canInspectWhileUnsettled = command => diagnosticActions.has(command.action)
+    || (command.action === 'audit_graph' && command.args?.op !== 'params');
   const appOf = () => window.comfyAPI?.app?.app;
   const apiOf = () => window.comfyAPI?.api?.api;
   const activeWorkflowOf = app => {
@@ -202,6 +208,7 @@
     localAuthority = true; editSequence++; forceSync = true;
   }
   async function syncWorkflow(app, { check = true } = {}) {
+    if (unsettledCommands.size) return;
     const owner = selectSyncWorkflow(app);
     if (!owner) return;
     const path = owner.path;
@@ -235,6 +242,7 @@
     catch (error) { forceSync = true; throw error; }
     // A manual workflow switch can finish while the network request is pending.
     // Defer the response rather than applying it to the new tab or a loading graph.
+    if (unsettledCommands.size) { forceSync = true; return; }
     if (!graphReady(app) || activeWorkflowOf(app)?.path !== path) return;
     let loadedRemote = false;
     if (update.workflow) {
@@ -2090,19 +2098,20 @@
     } catch {}
     return { versioned, tracked };
   }
-  // One command must never own the queue. Round 7 froze the whole bridge for 11.6 minutes on a single
-  // await that could not be woken (R7-7), and the loop's only defence had been "this code never hangs".
-  // It does not need to be a hang to hurt: a pack setter that spins, or a `loadGraphData` that never
-  // resolves, produces the same dead tab. So: race the body against a watchdog, answer the caller with
-  // what is actually known ("it may still have completed — re-read before repeating it"), and keep the
-  // queue moving. A body that finishes after its deadline is discarded rather than published, because
-  // the caller already moved on and a surprise sync is how a late save would overwrite the user's graph.
+  // Keep diagnostics responsive after a timeout, but never overlap a new mutation with
+  // an unfinished body. Promise.race does not cancel execute(), including its rollback.
   const COMMAND_TIMEOUT_MS = 25000;
   const STALLED = Symbol('stalled');
   async function runCommandBody(command) {
     let previousAuthority, commandEditSequence;
     try {
+      if (unsettledCommands.size && !canInspectWhileUnsettled(command)) {
+        throw new Error('上一条超时操作仍在执行或回滚，本次操作未执行。可以用 list_nodes / list_workflows / list_edits 检查；'
+          + '请等待它结束并重新读取状态后再修改，或刷新 ComfyUI 页面（F5）终止页面中的旧操作。期间不要手动修改画布。');
+      }
       if (graphReady(appOf())) await syncWorkflow(appOf());
+      // The initial synchronization can itself time out. Do not start the action later.
+      if (command.abandoned) return { id: command.id, abandoned: true };
       const writesCanvas = ['update_nodes', 'bind_image', 'load_workflow', 'undo', 'redo', 'restore_edit', 'edit_graph', 'save_workflow', 'save_as_workflow', 'switch_workflow', 'new_workflow', 'run'].includes(command.action);
       if (writesCanvas && allowAI && graphReady(appOf())) {
         previousAuthority = localAuthority; localEdit(true); commandEditSequence = editSequence;
@@ -2146,10 +2155,13 @@
     if (outcome !== STALLED) return outcome;
     command.abandoned = true;
     stalledCommands += 1;
-    work.then(late => { if (late?.result !== undefined) completed.set(command.id, late); }).catch(() => {});
+    unsettledCommands.add(command);
+    // Keep the cached timeout receipt: a duplicate id must not turn into a late success.
+    work.finally(() => { unsettledCommands.delete(command); forceSync = true; }).catch(() => {});
     return commandError(command, new Error('这条 ' + command.action + ' 在 ' + Math.round(COMMAND_TIMEOUT_MS / 1000)
       + ' 秒内没有返回，已按超时收尾。注意它可能仍在页面里执行完（保存类动作尤其可能已经落盘），所以不要立刻重发同一个动作：'
-      + '先 list_workflows / get_workflow / list_edits 复核当前状态。反复卡在同一条通常是页面里有等不到的浏览器回调（后台标签页的 requestAnimationFrame 不触发），F5 刷新该页面即可恢复；本桥接的其余命令不会被它堵住。'));
+      + '先 list_nodes / list_workflows / list_edits 复核当前状态。旧操作结束前暂停后续写入和跨页同步，诊断读取仍可用；期间不要手动修改画布。'
+      + '若一直不结束，F5 刷新 ComfyUI 页面终止页面中的旧操作后再检查，已发送到服务端的请求仍需核对结果。'));
   }
   async function handleCommands() {
     if (busy || handlingCommands) return;
