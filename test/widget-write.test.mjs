@@ -104,7 +104,8 @@ async function boot(nodes, options = {}) {
     // Failures carry the same tab-state field successes do (round 7, observation 2), so the harness has
     // to expose it on the thrown error or the test can only see the message.
     if (reply?.error) throw Object.assign(new Error(reply.error), { bridgeError: reply.error, hint: reply.hint, stackTrace: reply.stack,
-      dirtyMarked: reply.dirtyMarked, stage: reply.stage, widgetKind: reply.widgetKind });
+      dirtyMarked: reply.dirtyMarked, stage: reply.stage, widgetKind: reply.widgetKind,
+      nodeId: reply.nodeId, widget: reply.widget });
     return reply.result;
   };
   // Callable as before, plus the page handles a test needs to move the graph under the bridge's feet.
@@ -1391,6 +1392,79 @@ test('a canvas that serializes but cannot produce a prompt reports it as a fact,
   assert.equal(okPage.serializedError, undefined);
 });
 
+test('a batch failure names the change that failed, not the first one in the batch', async () => {
+  // R8-K: the receipt took nodeId/widget from changes[0], so a batch whose second item failed reported
+  // the first item's target (measured: 「resolution 必须是文本」 came back as widget "fps").
+  const command = await boot([plainNode()]);
+  const refused = await command('update_nodes', { changes: [
+    { nodeId: 1, widget: 'steps', value: 30 },
+    { nodeId: 1, widget: 'mode', value: { bad: 1 } }
+  ] }).catch(error => error);
+  assert.match(refused.bridgeError, /必须是文本/, 'the page still refuses the malformed change');
+  assert.equal(refused.widget, 'mode', 'and the receipt points at the widget that actually failed');
+  assert.equal(refused.nodeId, '1');
+});
+
+test('load_workflow says the tab still points at the file it no longer matches', async () => {
+  // R8-G: the canvas was replaced but the tab kept its path, so the next ordinary save wrote the new
+  // graph into the old file while the receipt said canvasMatchesSaved:true.
+  const command = await boot([plainNode()]);
+  const target = 'workflows/H3.json';
+  const replacement = { nodes: [{ id: 5, type: 'KSampler', widgets_values: [12, 'T2VA 文生视频'] }], links: [] };
+  const loaded = await command('load_workflow', { workflow: replacement });
+  assert.equal(loaded.loaded, true);
+  assert.equal(loaded.pathUnchanged, true);
+  assert.equal(loaded.workflowPath, target, 'the tab still says it is the old file');
+  assert.ok(loaded.contentReplaced, 'and the receipt says the content is not');
+  assert.equal(loaded.contentReplaced.previouslyNodes, 1);
+  assert.match(loaded.pathNote, /save_as_workflow/);
+
+  // The save that follows names what it overwrote instead of looking ordinary.
+  const canvasState = JSON.parse(JSON.stringify(command.graph.serialize()));
+  attachStore(command, { activeState: canvasState, initialState: canvasState, prepareForSave() {} });
+  const saved = await command('save_workflow');
+  assert.equal(saved.saved, true);
+  assert.ok(saved.saveReplacedContent, 'the overwrite is reported, not left for the user to notice');
+  assert.equal(saved.saveReplacedContent.previouslyNodes, 1);
+  assert.match(saved.saveReplacedContent.note, /load_workflow/);
+});
+
+test('a node whose value survives but whose control never came back is named in the save receipt', async () => {
+  // R8-L: the file keeps the value (R8-A's fix) while the canvas has no control to reach it. Nothing
+  // used to say that, so a 533-character prompt went quietly uneditable.
+  const node = showTextNode();
+  const command = await boot([node], { requestAnimationFrame: fn => fn() });
+  const remembered = JSON.parse(JSON.stringify(command.graph.serialize()));
+  node.widgets = [];
+  const staleCache = JSON.parse(JSON.stringify(command.graph.serialize()));
+  const { written } = attachStore(command, { activeState: staleCache, initialState: remembered, prepareForSave() {} });
+  const reply = await command('save_workflow');
+  assert.equal(written[0].nodes[0].widgets_values[0], 'x'.repeat(533), 'the value is in the file');
+  assert.equal(reply.uneditableNodes.length, 1, 'and the receipt admits the canvas cannot reach it');
+  assert.equal(reply.uneditableNodes[0].nodeId, '111');
+  assert.match(reply.uneditableNote, /切到前台|刷新/);
+});
+
+test('a save recovers the value from the file the tab was opened from, not only from its memory', async () => {
+  // R8-A: on the tab-switch path the tracker has already captured the devalued canvas, so every
+  // in-memory source is empty and the hole was written anyway. The workflow object still holds the text
+  // it was opened from — that is the witness the save has to consult.
+  const node = showTextNode();
+  const command = await boot([node], { requestAnimationFrame: fn => fn() });
+  const opened = JSON.parse(JSON.stringify(command.graph.serialize()));
+  node.widgets = [];
+  const devalued = JSON.parse(JSON.stringify(command.graph.serialize()));
+  const { written } = attachStore(command, { activeState: devalued, initialState: devalued, prepareForSave() {} });
+  const active = command.app.extensionManager.workflow.activeWorkflow;
+  active.originalContent = JSON.stringify(opened);
+
+  const reply = await command('save_workflow');
+  assert.equal(written[0].nodes[0].widgets_values[0], 'x'.repeat(533),
+    'the file content is the witness the memory no longer is');
+  assert.equal(reply.saveStatePreserved.length, 1);
+  assert.equal(reply.saveStatePreserved[0].nodeId, '111');
+});
+
 const SUBGRAPH_ID = 'a67caa28-5f85-4917-8396-36004960dd30';
 const subgraphDefinitions = (seed = 432262096973490) => ({ subgraphs: [{
   id: SUBGRAPH_ID, name: 'Text to Image (Flux.2 Klein 4B)',
@@ -1526,6 +1600,64 @@ test('a save reports which moment reached the disk, and the page can be asked ag
   active.isModified = true;
   const failed2 = await command('update_nodes', { changes: [{ nodeId: 999, widget: 'x', value: 1 }] }).catch(error => error);
   assert.equal(failed2.dirtyMarked, true, 'and it is the front-end answer, not a guess from this call');
+});
+
+
+test('save_as keeps a value whose widget the copy never rebuilt, and says so', async () => {
+  // Round 9 (R9-A), reproduced on the live panel three times: `save_as_workflow` wrote a 41,356-byte
+  // file where node 111's 533-character ShowText value was simply absent, while the receipt still
+  // carried `saveStatePreserved:[{nodeId:"111",chars:537}]`. The save itself refreshes the tab's state,
+  // then `saveAs` copies that state and `openWorkflow` rebuilds the canvas from it -- and on that
+  // rebuild the display widget (built in a later animation frame) does not come back, so the copy's
+  // `prepareForSave()` froze a hole into the very object `save()` serialized.
+  const node = showTextNode();
+  const command = await boot([node]);
+  const store = command.app.extensionManager.workflow, active = store.activeWorkflow;
+  const remembered = JSON.parse(JSON.stringify(command.graph.serialize()));
+  assert.equal(remembered.nodes[0].widgets_values[0], 'x'.repeat(533), 'fixture: the tab once knew the value');
+  // The tab-switch path (round 7, R7-4): the widget never came back, so the live canvas has no key.
+  node.widgets = [];
+  const stale = JSON.parse(JSON.stringify(command.graph.serialize()));
+  assert.equal('widgets_values' in stale.nodes[0], false, 'fixture: the canvas really lost the key');
+  active.directory = 'workflows';
+  active.content = active.originalContent = JSON.stringify(remembered);
+  active.changeTracker = { activeState: stale, initialState: remembered, prepareForSave() {} };
+  Object.defineProperty(active, 'activeState', { configurable: true, get() { return this.changeTracker?.activeState ?? null; } });
+  store.getWorkflowByPath = path => store.openWorkflows.find(item => item.path === path);
+  store.createNewTemporary = () => { throw new Error('unused in this test'); };
+  const written = [];
+  store.saveWorkflow = async workflow => { written.push({ path: workflow.path, state: JSON.parse(JSON.stringify(workflow.activeState)) }); };
+  store.saveAs = (source, path) => {
+    const copy = { path, filename: '_probe', isPersisted: false, isModified: false, directory: 'workflows',
+      content: JSON.stringify(source.activeState), isLoaded: false };
+    copy.originalContent = copy.content;
+    copy.changeTracker = { activeState: JSON.parse(copy.content) };
+    // A fresh saveAs object is not loaded yet; the real front-end answers load() with itself because its
+    // UserFile base already has the content saveAs just froze.
+    copy.load = async () => copy;
+    Object.defineProperty(copy, 'activeState', { configurable: true, get() { return this.changeTracker?.activeState ?? null; } });
+    copy.changeTracker.prepareForSave = () => { copy.changeTracker.activeState = JSON.parse(JSON.stringify(command.graph.serialize())); };
+    store.openWorkflows.push(copy);
+    return copy;
+  };
+  const load = command.app.loadGraphData.bind(command.app);
+  command.app.loadGraphData = async (data, ...rest) => {
+    const ok = await load(data, ...rest);
+    const target = rest[2];
+    if (target) store.activeWorkflow = target;
+    // What the page really does on a rebuild: `onConfigure` runs, the widget that a pack builds a frame
+    // later does not, and the node serializes with no values.
+    for (const live of command.nodes) if (live.type === 'ShowText|pysssss') live.widgets = [];
+    return ok;
+  };
+
+  const reply = await command('save_as_workflow', { name: '_probe' });
+  assert.equal(reply.saved, true);
+  assert.equal(written.length, 1, 'one file, written from the copy');
+  assert.equal(written[0].state.nodes[0].widgets_values?.[0], 'x'.repeat(533),
+    'the copy carries the value the tab knew, instead of a hole the caller never hears about');
+  assert.deepEqual((reply.saveStatePreserved || []).map(item => item.nodeId), ['111'],
+    'and the receipt names the node whose value it had to restore');
 });
 
 test('save_as reports the fingerprints of the copy it wrote, not of the tab it left behind', async () => {

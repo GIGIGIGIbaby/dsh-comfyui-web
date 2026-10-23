@@ -1316,8 +1316,36 @@
   // same tab's own history: the node had non-empty `widgets_values` and now has none, and with no widget
   // on screen there is nothing the user could have edited. Keep the last value the tab itself knew
   // instead of writing a hole, and say which nodes were kept.
-  function preserveDroppedWidgets(canvas, tracker) {
-    const sources = [tracker?.activeState, tracker?.initialState, ...(((tracker?.undoQueue || []).slice()).reverse())]
+  // Round 8, R8-A/R8-L: the three in-memory states are all the *current tab's* memory, and on the
+  // tab-switch path they are already the devalued copy — the tracker captured the canvas after the
+  // widget was gone, so `preserveDroppedWidgets` found nothing and still wrote the hole (measured:
+  // node 111 `ShowText|pysssss` went from a 533-character prompt to no `widgets_values` key at all,
+  // 44,167 B → 41,358 B, and the receipt said `{saved:true}` with no `saveStatePreserved` field).
+  // The workflow object itself still holds the text it was opened from (`originalContent`, which
+  // `save()` never touches) and the text it last wrote (`content`), so the file is its own witness.
+  // Keyed by the workflow object in a WeakMap, not by a property on it: the tab object is a reactive
+  // proxy and adding fields to it invites a render loop for no benefit.
+  const contentStateCache = new WeakMap();
+  function contentState(workflow, field) {
+    if (!workflow || typeof workflow !== 'object') return null;
+    const text = workflow[field];
+    if (typeof text !== 'string' || text.length < 2) return null;
+    let cache = contentStateCache.get(workflow);
+    if (!cache) { cache = new Map(); contentStateCache.set(workflow, cache); }
+    // Keyed by the text, not by the field: right after a load `content` and `originalContent` are the
+    // same string, and parsing a 126 KB workflow twice per save buys nothing. A save changes `content`
+    // and leaves `originalContent` alone, so both stay reachable and only the new string is parsed.
+    if (cache.has(text)) return cache.get(text);
+    let state = null;
+    try { state = JSON.parse(text); } catch { state = null; }
+    if (cache.size > 4) cache.clear();
+    cache.set(text, state);
+    return state;
+  }
+
+  function preserveDroppedWidgets(canvas, tracker, workflow) {
+    const sources = [tracker?.activeState, tracker?.initialState, ...(((tracker?.undoQueue || []).slice()).reverse()),
+      contentState(workflow, 'content'), contentState(workflow, 'originalContent')]
       .filter(state => Array.isArray(state?.nodes));
     if (!sources.length || !Array.isArray(canvas?.nodes)) return [];
     const kept = [];
@@ -1333,6 +1361,18 @@
     }
     return kept;
   }
+  // Round 8, R8-L: preserving the value in the file is only half an answer -- the node can be sitting
+  // on the canvas with a non-empty widgets_values and no control to reach it (measured: ShowText's
+  // widget is built in a requestAnimationFrame that the tab-switch path never re-runs, and a hidden
+  // page never runs it at all). Silence here is what let a 533-character prompt quietly become
+  // uneditable, so the receipt names those nodes instead of leaving the caller to notice.
+  function missingControls(canvas, app) {
+    const live = new Map();
+    for (const node of (app?.graph?._nodes || [])) live.set(String(node.id), (node.widgets || []).filter(w => w.type !== 'button').length);
+    return ((canvas?.nodes) || []).filter(node => Array.isArray(node.widgets_values) && node.widgets_values.length
+      && live.get(String(node.id)) === 0)
+      .map(node => ({ nodeId: String(node.id), type: node.type || null, values: node.widgets_values.length }));
+  }
   // Settle the deferred widgets and make sure the state a save is about to serialize IS the canvas
   // before anything hits the disk (R6-1: `save_as_workflow` wrote a file where ShowText's
   // `widgets_values` had vanished; R6-2: switching tabs lost it the same way).
@@ -1340,16 +1380,21 @@
     const frame = await waitOneFrame();
     let canvas = null;
     try { canvas = rootGraphOf(app).serialize(); } catch { return { ok: false, frame, reason: '画布当前无法序列化，保存的是标签页自己持有的状态' }; }
-    const tracker = activeWorkflowOf(app)?.changeTracker;
-    if (!tracker) return { ok: false, frame, reason: '该前端的工作流没有 changeTracker，保存走的是它自己缓存的内容' };
+    const active = activeWorkflowOf(app);
+    const tracker = active?.changeTracker;
+    // A front-end without a changeTracker saves its own cached content, which never lost the value: that is
+    // a different thing from a state we failed to reconcile, so it is marked skipped and produces no warning.
+    if (!tracker) return { ok: false, skipped: true, frame, reason: '该前端的工作流没有 changeTracker，保存走的是它自己缓存的内容' };
     try { tracker.prepareForSave?.(); } catch {}
-    const preserved = preserveDroppedWidgets(canvas, tracker);
+    const preserved = preserveDroppedWidgets(canvas, tracker, active);
+    const uneditable = missingControls(canvas, app);
+    const extras = { ...(preserved.length ? { preserved } : {}), ...(uneditable.length ? { uneditable } : {}) };
     let matches = false;
     try { matches = JSON.stringify(tracker.activeState ?? null) === JSON.stringify(canvas); } catch {}
-    if (matches) return { ok: true, frame, ...(preserved.length ? { preserved } : {}) };
+    if (matches) return { ok: true, frame, ...extras };
     try { tracker.activeState = clone(canvas); }
-    catch { return { ok: false, frame, reason: '标签页缓存的图状态无法更新，保存的内容可能比画布旧', ...(preserved.length ? { preserved } : {}) }; }
-    return { ok: true, frame, takenFromCanvas: true, ...(preserved.length ? { preserved } : {}) };
+    catch { return { ok: false, frame, reason: '标签页缓存的图状态无法更新，保存的内容可能比画布旧', ...extras }; }
+    return { ok: true, frame, takenFromCanvas: true, ...extras };
   }
   // Round 7 (R7-8) and round 6 (R6-3): a subgraph proxy node and the copy of that subgraph in
   // `definitions.subgraphs[].nodes[]` are two stores of the same widget values. Writing the proxy updates
@@ -1383,6 +1428,11 @@
     }
     return found;
   }
+  // Round 8, R8-G: a tab keeps its own path when `load_workflow` swaps its contents, so the next
+  // ordinary save writes a graph into a file that graph did not come from. Remember the substitution
+  // at the place that causes it, and let the save say what it overwrote.
+  const foreignContent = new Map();
+  function rememberForeignContent(path, previous) { try { foreignContent.set(path, previous); } catch {} }
   async function executeAction(command) {
     const app = appOf(); const args = command.args || {};
     if (!allowAI) throw new Error('此面板已关闭 AI 操作');
@@ -1403,6 +1453,7 @@
         // taken — pairing the old tab's cached state with the new tab's canvas reported `canvasMatchesSaved:
         // false` on a save that had just written that exact canvas (round 8, caught live).
         let savedWorkflow = active;
+        let copyRefresh = null;
         if (targetPath === active.path) {
           if (command.action === 'save_as_workflow') throw new Error('另存时请使用一个新的文件名称');
           await store.saveWorkflow(active);
@@ -1417,7 +1468,16 @@
           } else {
             const target = store.saveAs(active, targetPath);
             savedWorkflow = target;
-            try { await openWorkflow(app, target, await workflowData(app, target)); target.changeTracker?.prepareForSave(); await store.saveWorkflow(target); }
+            try {
+              await openWorkflow(app, target, await workflowData(app, target));
+              // R9-A: opening the copy rebuilds its canvas, and a widget that a pack builds a frame later
+              // (ShowText's display widget) never comes back on a background tab or after a tab switch. The
+              // copy's own content still holds the value (saveAs froze it), so ask the same question again
+              // against the copy: a bare prepareForSave() would freeze the hole into the copy's state and
+              // the file would be written without the value while the receipt still claimed it was kept.
+              copyRefresh = await refreshActiveState(app);
+              await store.saveWorkflow(target);
+            }
             catch (error) {
               if (activeWorkflowOf(app) !== active) await openWorkflow(app, active, await workflowData(app, active));
               if (!target.isPersisted) await store.closeWorkflow?.(target); throw error;
@@ -1430,20 +1490,41 @@
         let savedStateHash = null, canvasHash = null;
         try { savedStateHash = hashText(fingerprint(savedWorkflow.changeTracker?.activeState ?? null)); } catch {}
         try { canvasHash = hashText(fingerprint(readGraph(app))); } catch {}
+        // Two refreshes can speak here: the tab we saved (before saveAs moved it) and the copy that
+        // saveAs created and then loaded (R9-A). The caller cares about one file, so merge them by node.
+        const mergeByNode = (left, right) => {
+          const out = [], seen = new Set();
+          for (const item of [...(left || []), ...(right || [])]) { const key = String(item.nodeId); if (seen.has(key)) continue; seen.add(key); out.push(item); }
+          return out;
+        };
+        const preservedAll = mergeByNode(stateRefresh.preserved, copyRefresh?.preserved);
+        const uneditableAll = mergeByNode(stateRefresh.uneditable, copyRefresh?.uneditable);
+        const frameStalled = stateRefresh.frame === 'stalled' || copyRefresh?.frame === 'stalled';
+        const copyWarning = copyRefresh && copyRefresh.ok === false && copyRefresh.skipped !== true ? copyRefresh.reason : null;
+        const stateWarning = stateRefresh.ok ? copyWarning : stateRefresh.reason;
+        // R8-G: name the case where this save just overwrote a file the tab no longer matches.
+        const replaced = foreignContent.get(targetPath) || null;
+        if (replaced) foreignContent.delete(targetPath);
         return { saved: true, workflow: describeWorkflow(store, store.activeWorkflow),
+          ...(replaced ? { saveReplacedContent: { path: targetPath, nodes: (readGraphOrNull(app)?.nodes || []).length, previouslyNodes: replaced.nodes,
+            note: '这个标签页的内容是被 load_workflow 换过的（换之前是 ' + (replaced.nodes ?? '?') + ' 个节点），本次保存把当前内容写进了 ' + targetPath + '。原图若需要保留，请从它的来源文件重新 load。' } } : {}),
           savedStateHash, canvasHash, canvasMatchesSaved: savedStateHash !== null && savedStateHash === canvasHash,
           // Three separate facts, each with its own wording: the value the tab could not see on screen
           // was kept (R7-6), the page was in the background so deferred widgets never built (R7-4/R7-7),
           // and the state could not be reconciled at all (R6-1).
-          ...(stateRefresh.preserved ? {
-            saveStatePreserved: stateRefresh.preserved,
+          ...(preservedAll.length ? {
+            saveStatePreserved: preservedAll,
             saveStatePreservedNote: '这些节点在画布上一个控件都没有（前端延迟重建的控件在切标签路径上不会重跑），但本标签页自己记得它们的值——已按记得的值写进文件，没有留成空洞（R7-6）。要让画布真的显示出来，把这个标签切到前台或刷新页面。'
           } : {}),
-          ...(stateRefresh.frame === 'stalled' ? {
+          ...(uneditableAll.length ? {
+            uneditableNodes: uneditableAll,
+            uneditableNote: '这些节点在文件里有值，但画布上一个控件都没有：值已经在文件里，只是此刻改不了（延迟重建的控件在切标签路径与后台标签页上都不会跑）。要改它们就把该标签切到前台或刷新页面，再 list_nodes 确认控件出现。'
+          } : {}),
+          ...(frameStalled ? {
             deferredFrame: 'stalled',
             deferredNote: '页面此刻在后台：requestAnimationFrame 在 ' + FRAME_WAIT_MS + 'ms 内没跑，延迟重建的控件本次没有机会建出来。把该标签切到前台再保存更稳。'
           } : {}),
-          ...(stateRefresh.ok ? {} : { saveStateWarning: '落盘的内容取自标签页缓存的图状态而非实时画布（' + stateRefresh.reason + '）：如果画布上有节点把自己的值存在延迟重建的组件里，这类值可能没进文件。' }) };
+          ...(stateWarning ? { saveStateWarning: '落盘的内容取自标签页缓存的图状态而非实时画布（' + stateWarning + '）：如果画布上有节点把自己的值存在延迟重建的组件里，这类值可能没进文件。' } : {}) };
       }
       case 'edit_graph': {
         if (!Array.isArray(args.operations) || args.operations.length < 1 || args.operations.length > 100) throw new Error('operations 必须包含 1–100 项');
@@ -1607,7 +1688,20 @@
         if (!Array.isArray(changes) || !changes.length || changes.length > 500) throw fail('changes 必须是包含 1–500 项的数组' + argNameHint(args, ['changes']),
           '参数名是 changes，每项结构 {nodeId, widget, value}（nodeId 用 list_nodes 取到的 id）：改好参数名后整批重发，画布尚未改动。');
         const ids = (app.graph._nodes || []).map(n => n.id);
+        // Round 8, R8-K: every throw below is caused by *one* change, but the receipt's nodeId/widget
+        // came from changes[0], so a batch whose second item failed reported the first item's target
+        // (measured: 「resolution 必须是文本」 attributed to widget "fps"). Tag the error with the change
+        // that raised it — the MCP layer already forwards nodeId/widget verbatim (lib/runtime.js).
         const edits = changes.map(change => {
+          try { return planEdit(change); }
+          catch (error) {
+            if (error && typeof error === 'object' && error.nodeId === undefined) {
+              error.nodeId = String(change.nodeId); error.widget = change.widget;
+            }
+            throw error;
+          }
+        });
+        function planEdit(change) {
           const node = app.graph.getNodeById(change.nodeId);
           if (!node) throw fail('节点不存在：' + change.nodeId,
             '当前画布只有 ' + ids.length + ' 个节点，id 是 [' + ids.slice(0, 20).join(', ') + (ids.length > 20 ? ' …' : '') + ']：先用 list_nodes（可带 filter 按类型/标题过滤）取真实 id，不要复用上一次或别的页面的 nodeId。');
@@ -1645,7 +1739,7 @@
           const outOfRange = typeof change.value === 'number'
             && ((widget.options?.min != null && change.value < widget.options.min) || (widget.options?.max != null && change.value > widget.options.max));
           return { node, widget, reroutedFrom, sameName, value: change.value, before: clone(current), outsideOptions, outOfRange };
-        });
+        }
         // Snapshot the wired-down nodes before the first write, then read the canvas again once
         // the pack's autofill debounce has landed. A batch of pure parameters touches nothing
         // below it, and the wait is skipped entirely.
@@ -1771,8 +1865,26 @@
       }
       case 'load_workflow': {
         if (!args.workflow || !Array.isArray(args.workflow.nodes) || !Array.isArray(args.workflow.links)) throw new Error('请提供普通 ComfyUI 工作流 JSON（包含 nodes、links），不是 API prompt');
+        // Round 8, R8-G: this call replaces the canvas and nothing else. The tab keeps pointing at the
+        // path it was opened from, so a later ordinary save writes this graph into that file — measured:
+        // a 6-node FLUX2 graph was saved over a 21-node H3 tab and the receipt said
+        // canvasMatchesSaved:true, because that field compares the tab's cache with the canvas, never
+        // the canvas with the file. Say the two facts instead of letting the save discover them.
+        const active = activeWorkflowOf(app);
+        const previous = { path: active?.path ?? null, nodes: (app.graph?._nodes || []).length };
+        let before = null;
+        try { before = hashText(fingerprint(readGraph(app))); } catch {}
         await replaceCurrentWorkflow(app, args.workflow);
-        return { loaded: true, nodes: nodes(app) };
+        let after = null;
+        try { after = hashText(fingerprint(readGraph(app))); } catch {}
+        const changed = before !== null && after !== null && before !== after;
+        if (changed && active?.path) rememberForeignContent(active.path, previous);
+        return { loaded: true, nodes: nodes(app), workflowPath: previous.path, pathUnchanged: true,
+          ...(changed && previous.path ? {
+            contentReplaced: { path: previous.path, nodes: args.workflow.nodes.length, previouslyNodes: previous.nodes },
+            pathNote: '画布内容已换成传入的图，但标签页仍指向 ' + previous.path + '：它现在和磁盘上的那张图不是同一张图了。'
+              + '普通 save_workflow 会把当前内容写进该文件（回执会给 saveReplacedContent）；要保住原文件请用 save_as_workflow 另存，或先 switch_workflow 切到别的标签页。'
+          } : {}) };
       }
       case 'undo':
       case 'redo': {
@@ -1927,6 +2039,10 @@
   function commandError(command, error) {
     const e = error instanceof Error ? error : new Error(String(error));
     const reply = { id: command.id, error: e.message || String(e), ...commandTarget(command) };
+    // Round 8, R8-K: a batch failure belongs to the change that raised it, not to changes[0]. The
+    // page tags each throw with its own nodeId/widget; the error wins over the guessed target.
+    if (e.nodeId !== undefined) reply.nodeId = e.nodeId;
+    if (e.widget !== undefined) reply.widget = e.widget;
     if (e.stack) reply.stack = String(e.stack).slice(0, 4000);
     if (e.stage) reply.stage = e.stage;
     if (e.widgetKind) reply.widgetKind = e.widgetKind;
