@@ -10,7 +10,7 @@ Requires [dsh](https://github.com/deepseek-ai/deepseek-harness), pnpm, a local C
 
 | Plugin version | Supported dsh versions |
 | --- | --- |
-| `0.5.13`–`0.5.15` | `0.2.0-rc.2`, `0.2.1-rc.2` |
+| `0.5.13`–`0.5.16` | `0.2.0-rc.2`, `0.2.1-rc.2` |
 | `0.5.12` | `0.2.0-rc.2` |
 
 Both `engines.dsh` and the DSH peer dependencies declare the verified host versions, supporting compatibility checks in both host releases. Other DSH versions need separate validation. If a host upgrade reports an incompatibility, update the plugin first.
@@ -21,12 +21,12 @@ dsh plugin --profile web add github:mangfufu/dsh-comfyui-web
 
 ### Launch local ComfyUI from DSH (Windows)
 
-When only DSH is running, the ComfyUI panel shows local launch controls. Use **Auto-detect**, **Choose folder / Choose launch file** to open Explorer, or enter an absolute path. Select an AKi bundle directory, launcher exe, or ComfyUI `main.py`.
+When only DSH is running, the ComfyUI panel shows local launch controls. Use **Auto-detect**, **Choose folder / Choose launch file** to open the Windows file picker, or enter an absolute path. Supported entries include any named `.exe` launcher, `.bat` / `.cmd` / `.ps1` script, `.lnk` shortcut, and a ComfyUI directory / `main.py`. No launcher brand or adjacent ComfyUI source tree is required.
 
 - **Start ComfyUI directly** uses the installation's own Python (AKi, Windows portable bundles, or a local `.venv` / `venv`), with the panel's loopback address and port. The panel connects when the server is ready.
-- **Open AKi launcher** opens the original launcher. Click Start there to retain AKi's custom launch settings; DSH connects when ComfyUI is ready.
+- **Run selected launch entry** uses your own launcher, script or shortcut. If it opens a launcher window, click Start there. Shortcuts retain their target arguments and working directory. Match the server address and port to the panel settings; DSH connects when ComfyUI is ready.
 
-Detection only checks configured paths and common installation locations; it never starts a program. Starting saves the selected target and configures its bridge extension when needed. An already running or starting service is not started again. Logs go to `~/.dsh/comfyui/launch.log`. Direct launch does not read AKi's custom launch arguments. Remote and Docker services must be started in their own environment.
+Auto-detection checks configured paths, common installation locations and likely launch filenames. Manually selected files can have any name; selecting a folder lists its launch files. Detection never runs programs. Starting saves the entry and configures the bridge only when a ComfyUI installation is identified; standalone launchers preserve existing bridge settings. An already running or starting service is not started again. Logs go to `~/.dsh/comfyui/launch.log`; shortcut targets manage their own logs. PowerShell scripts follow the machine's execution policy; check the log if they fail. Direct launch does not read third-party launcher arguments. Remote and Docker services must be started in their own environment.
 
 If `dsh web` reports `$.host missing required value` for `webserver`, include both `host` and `port` in the `webserver.config` override in `~/.dsh/profiles/web/cordis.patch.yml`:
 

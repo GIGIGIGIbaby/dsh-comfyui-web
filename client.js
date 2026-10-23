@@ -75,8 +75,8 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
   "ComfyUI 未运行": "ComfyUI is offline",
   "ComfyUI 已就绪": "ComfyUI is ready",
   "正在启动 ComfyUI，服务就绪后会自动连接。": "Starting ComfyUI. The panel will connect when it is ready.",
-  "AKi 启动器已打开，请在启动器中点击启动；服务就绪后会自动连接。": "AKi is open. Start ComfyUI in the launcher; this panel will connect when ready.",
-  "启动进程已退出，请检查启动日志或使用 AKi 启动器。": "The process exited. Check the launch log or use the AKi launcher.",
+  "已运行所选入口；如启动器需要操作，请在其中启动 ComfyUI，服务就绪后会自动连接。": "The selected entry has started. If it opens a launcher, start ComfyUI there; this panel will connect when ready.",
+  "启动进程已退出，请检查启动日志或选择其他启动入口。": "The process exited. Check the launch log or choose another entry.",
   "自动检测": "Auto-detect",
   "选择文件夹…": "Choose folder…",
   "选择启动文件…": "Choose launch file…",
@@ -84,11 +84,11 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
   "检测此路径": "Inspect path",
   "请选择启动方式": "Choose how to launch",
   "直接启动 ComfyUI": "Start ComfyUI directly",
-  "打开 AKi 启动器": "Open AKi launcher",
+  "运行所选启动入口": "Run selected launch entry",
   "启动方式": "Launch target",
   "未找到安装目录，可选择文件夹或填写路径。": "No installation found. Choose a folder or enter its path.",
-  "选择 AKi 整合包目录、启动器 exe 或 ComfyUI 的 main.py。检测不会启动程序。": "Choose an AKi bundle folder, launcher exe, or ComfyUI main.py. Detection does not start anything.",
-  "直接启动使用该目录的 Python；需要 AKi 的启动参数时，请打开 AKi 启动器。": "Direct launch uses this installation's Python. Open AKi to use its launch settings.",
+  "选择启动器、脚本、快捷方式（exe / bat / cmd / ps1 / lnk），或 ComfyUI 目录 / main.py。检测不会启动程序。": "Choose a launcher, script, shortcut (exe / bat / cmd / ps1 / lnk), or ComfyUI directory / main.py. Detection does not start anything.",
+  "直接启动使用该目录的 Python；如需原有启动参数，请选择自己的启动器、脚本或快捷方式，并确保服务地址与面板一致。": "Direct launch uses this installation's Python. To keep custom settings, select your launcher, script or shortcut, and match its server URL to this panel.",
   "正在处理…": "Working…",
   "启动日志：": "Launch log: ",
   "本机启动目前仅支持 Windows": "Local launch currently supports Windows only",
@@ -487,13 +487,13 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
     useEffect(() => () => controller.current?.abort(), []);
     const launching = status.phase === 'starting' && !status.connected;
     const message = status.connected ? 'ComfyUI 已就绪' : status.phase === 'launcher-opened'
-      ? 'AKi 启动器已打开，请在启动器中点击启动；服务就绪后会自动连接。'
+      ? '已运行所选入口；如启动器需要操作，请在其中启动 ComfyUI，服务就绪后会自动连接。'
       : launching ? '正在启动 ComfyUI，服务就绪后会自动连接。'
-      : ['failed', 'stopped'].includes(status.phase) ? '启动进程已退出，请检查启动日志或使用 AKi 启动器。' : 'ComfyUI 未运行';
+      : ['failed', 'stopped'].includes(status.phase) ? '启动进程已退出，请检查启动日志或选择其他启动入口。' : 'ComfyUI 未运行';
     return h('div', { className: 'dsh-comfy-launch', 'aria-label': t('本机启动'), 'aria-busy': busy },
       h('strong', { role: 'status' }, t(message)),
       !status.supported ? h('p', null, localizedMessage(status.unavailable || '本机启动目前仅支持 Windows')) : h(React.Fragment, null,
-        h('p', null, t('选择 AKi 整合包目录、启动器 exe 或 ComfyUI 的 main.py。检测不会启动程序。')),
+        h('p', null, t('选择启动器、脚本、快捷方式（exe / bat / cmd / ps1 / lnk），或 ComfyUI 目录 / main.py。检测不会启动程序。')),
         h('div', { className: 'dsh-comfy-launch-actions' },
           h('button', { type: 'button', disabled: busy, onClick: () => action('launcherDetect') }, t('自动检测')),
           h('button', { type: 'button', disabled: busy, onClick: () => action('launcherPick', { kind: 'folder' }) }, t('选择文件夹…')),
@@ -502,11 +502,11 @@ window.__ModuleLoader__.load({ id: 'dsh-comfyui-web', factory: require => {
           h('label', null, t('安装路径'), h('input', { type: 'text', value: path, required: true, onChange: e => setPath(e.target.value), disabled: busy })),
           h('button', { type: 'submit', disabled: busy || !path.trim() }, t('检测此路径'))),
         targets.length ? h('label', null, t('启动方式'), h('select', { value: selectedKey, disabled: busy || launching, onChange: e => setChoice(e.target.value) },
-          targets.map(target => h('option', { key: keyOf(target), value: keyOf(target) }, t(target.kind === 'aki' ? '打开 AKi 启动器' : '直接启动 ComfyUI') + ' · ' + target.path))))
+          targets.map(target => h('option', { key: keyOf(target), value: keyOf(target) }, t(target.kind !== 'comfyui' ? '运行所选启动入口' : '直接启动 ComfyUI') + ' · ' + target.path))))
           : h('p', null, t('未找到安装目录，可选择文件夹或填写路径。')),
-        h('p', null, t('直接启动使用该目录的 Python；需要 AKi 的启动参数时，请打开 AKi 启动器。')),
+        h('p', null, t('直接启动使用该目录的 Python；如需原有启动参数，请选择自己的启动器、脚本或快捷方式，并确保服务地址与面板一致。')),
         h('div', { className: 'dsh-comfy-launch-actions' }, h('button', { type: 'button', disabled: busy || !selected || status.connected || launching,
-          onClick: () => action('launcherStart') }, busy ? t('正在处理…') : t(selected?.kind === 'aki' ? '打开 AKi 启动器' : '直接启动 ComfyUI')))),
+          onClick: () => action('launcherStart') }, busy ? t('正在处理…') : t(selected?.kind !== 'comfyui' ? '运行所选启动入口' : '直接启动 ComfyUI')))),
       status.logPath ? h('p', null, t('启动日志：'), h('code', null, status.logPath)) : null,
       error || status.error ? h('p', { role: 'alert' }, localizedMessage(error || status.error)) : null);
   }

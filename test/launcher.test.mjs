@@ -4,6 +4,8 @@ import { EventEmitter } from 'node:events';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { ComfyLauncher, detectInstallations, inspectInstallation, localLaunchAddress } from '../lib/launcher.js';
 
 async function fixture(t) {
@@ -39,8 +41,8 @@ test('detects both AKi and its bundled ComfyUI without executing any files', asy
   assert.equal(targets.find(item => item.kind === 'comfyui').path, fixtureData.comfy);
   assert.equal(targets.find(item => item.kind === 'comfyui').python, join(fixtureData.root, 'python', 'python.exe'));
   const detected = await detectInstallations({ customNodesDir: join(fixtureData.comfy, 'custom_nodes') }, { roots: [] });
-  assert.deepEqual(detected.map(item => item.kind).sort(), ['aki', 'comfyui']);
-  assert.equal((await inspectInstallation(join(fixtureData.comfy, 'main.py'))).length, 2);
+  assert.deepEqual(detected.map(item => item.kind).sort(), ['comfyui', 'launcher']);
+  assert.equal((await inspectInstallation(join(fixtureData.comfy, 'main.py'))).length, 1);
   await assert.rejects(inspectInstallation('relative/path'), /绝对路径/);
   await assert.rejects(inspectInstallation(join(fixtureData.root, 'missing')), /不存在/);
 });
@@ -94,6 +96,7 @@ test('AKi opens its selected launcher without assuming an unsupported auto-start
   const launcher = await new ComfyLauncher(data, { platform: 'win32', spawn: fake.spawn, probe: async () => false }).init();
   const exe = join(data.root, '绘世启动器.exe');
   await launcher.select(exe, 'aki');
+  assert.equal(launcher.selected.kind, 'launcher', 'old AKi selections remain compatible with the generic entry');
   assert.equal((await launcher.start()).phase, 'launcher-opened');
   assert.equal(fake.calls[0].file, exe);
   assert.deepEqual(fake.calls[0].args, []);
@@ -101,6 +104,103 @@ test('AKi opens its selected launcher without assuming an unsupported auto-start
   fake.calls[0].child.emit('exit', 0, null);
   await launcher.start();
   assert.equal(fake.calls.length, 1, 'launcher handoff does not trigger a second instance');
+});
+
+test('any named launcher or script can be selected without a ComfyUI source tree', async t => {
+  const data = await fixture(t), fake = processDouble();
+  const folder = join(data.root, 'separate launcher');
+  await mkdir(folder);
+  let prepared = false;
+  const launcher = await new ComfyLauncher(data, { platform: 'win32', spawn: fake.spawn,
+    probe: async () => false, prepare: async () => { prepared = true; } }).init();
+  for (const extension of ['exe', 'bat', 'cmd', 'ps1', 'lnk']) {
+    const path = join(folder, '我的入口.' + extension);
+    await writeFile(path, 'fixture, never executed');
+    const targets = await inspectInstallation(path);
+    assert.equal(targets.length, 1);
+    assert.equal(targets[0].path, path);
+    assert.equal(targets[0].kind, 'launcher');
+    assert.equal(targets[0].comfyRoot, undefined);
+  }
+  const path = join(folder, '我的入口.exe');
+  await launcher.select(path, 'launcher');
+  await launcher.start();
+  assert.equal(fake.calls[0].file, path);
+  assert.equal(fake.calls[0].options.cwd, folder);
+  assert.equal(prepared, false, 'standalone launchers must not rewrite bridge installation paths');
+  const config = JSON.parse(await readFile(data.configFile, 'utf8'));
+  assert.equal(config.customNodesDir, join(data.comfy, 'custom_nodes'));
+  const unknown = join(folder, 'notes.txt');
+  await writeFile(unknown, 'not executable');
+  await assert.rejects(inspectInstallation(unknown), /启动文件/);
+  assert.equal((await inspectInstallation(folder)).filter(item => item.kind === 'launcher' && item.root === folder).length, 5);
+});
+
+test('automatic discovery includes portable launch scripts and shortcuts, while manual folders accept arbitrary names', async t => {
+  const data = await fixture(t);
+  for (const name of ['run_nvidia_gpu.bat', 'start_cpu.cmd', 'ComfyUI Desktop.lnk', 'custom entry.ps1', 'Uninstall ComfyUI.exe']) {
+    await writeFile(join(data.root, name), 'fixture, never executed');
+  }
+  const automatic = await detectInstallations({}, { roots: [data.root] });
+  for (const name of ['run_nvidia_gpu.bat', 'start_cpu.cmd', 'ComfyUI Desktop.lnk']) {
+    assert.ok(automatic.some(target => target.path === join(data.root, name)));
+  }
+  assert.equal(automatic.some(target => /uninstall|custom entry/i.test(target.path)), false);
+  assert.ok((await inspectInstallation(data.root)).some(target => target.path === join(data.root, 'custom entry.ps1')));
+  const exe = join(data.root, '绘世启动器.exe');
+  await writeFile(data.configFile, JSON.stringify({ launcher: { path: exe, kind: 'aki' } }));
+  const restored = await new ComfyLauncher(data, { probe: async () => false }).init();
+  assert.deepEqual(restored.selected, { path: exe, kind: 'launcher' });
+});
+
+test('Windows launches batch and PowerShell files with literal special-character paths', { skip: process.platform !== 'win32' }, async t => {
+  const data = await fixture(t);
+  const folder = join(data.root, 'scripts ! & (test) ^');
+  await mkdir(folder);
+  for (const extension of ['bat', 'cmd', 'ps1']) {
+    const path = join(folder, 'custom %PATH% ! & 中文.' + extension);
+    await writeFile(path, extension === 'ps1' ? "Set-Content -LiteralPath 'started.txt' -Value 'launched'\n"
+      : '@echo off\r\n> started.txt echo launched\r\nexit /b 0\r\n');
+    const launcher = await new ComfyLauncher(data, { probe: async () => false }).init();
+    await launcher.select(path, 'launcher');
+    await launcher.start();
+    const child = launcher.child;
+    const code = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { child.kill(); reject(new Error('fixture launch timed out')); }, 10000);
+      child.once('exit', code => { clearTimeout(timer); resolve(code); });
+    });
+    assert.equal(code, 0, await readFile(join(data.root, '..', 'launch.log'), 'utf8'));
+    const output = await readFile(join(folder, 'started.txt'), 'utf8').catch(() => null);
+    assert.equal(output?.trim(), 'launched', extension + ': ' + await readFile(join(data.root, '..', 'launch.log'), 'utf8'));
+    await rm(join(folder, 'started.txt'));
+  }
+});
+
+test('Windows shortcuts preserve their target arguments and working directory', { skip: process.platform !== 'win32' }, async t => {
+  const data = await fixture(t);
+  const folder = join(data.root, 'shortcut ! & 中文');
+  await mkdir(folder);
+  const script = join(folder, 'target.ps1'), shortcut = join(folder, 'custom %PATH%.lnk');
+  await writeFile(script, "Set-Content -LiteralPath 'shortcut-result.txt' -Value 'launched'\n");
+  const create = '$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:TEST_LAUNCH_LINK); '
+    + '$s.TargetPath = (Get-Command powershell.exe).Source; $s.Arguments = \'-NoProfile -File "\' + $env:TEST_LAUNCH_SCRIPT + \'"\'; '
+    + '$s.WorkingDirectory = $env:TEST_LAUNCH_FOLDER; $s.WindowStyle = 7; $s.Save()';
+  await promisify(execFile)('powershell.exe', ['-NoProfile', '-EncodedCommand', Buffer.from(create, 'utf16le').toString('base64')],
+    { windowsHide: true, env: { ...process.env, TEST_LAUNCH_LINK: shortcut, TEST_LAUNCH_SCRIPT: script, TEST_LAUNCH_FOLDER: folder } });
+  const launcher = await new ComfyLauncher(data, { probe: async () => false }).init();
+  await launcher.select(shortcut, 'launcher');
+  await launcher.start();
+  const child = launcher.child;
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { child.kill(); reject(new Error('shortcut launch timed out')); }, 10000);
+    child.once('exit', code => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error('shortcut failed: ' + code)); });
+  });
+  let result;
+  for (let i = 0; i < 50 && !result; i++) {
+    result = await readFile(join(folder, 'shortcut-result.txt'), 'utf8').catch(() => null);
+    if (!result) await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.equal(result?.trim(), 'launched');
 });
 
 test('running services, remote URLs and unsupported hosts never spawn a local process', async t => {
