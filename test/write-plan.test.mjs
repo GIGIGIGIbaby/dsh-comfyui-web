@@ -94,6 +94,51 @@ test('a numeric string is refused before it reaches a setter', () => {
   assert.match(plan.blocked[0].nextSteps, /裸值/);
 });
 
+test('a non-string sent to a combo is a type error, not an unfriendly option list', () => {
+  // R8-J: the combo branch compared the value against the option list and never asked what type it
+  // was, so an object answered "value-not-in-server-options" — a semantic lie — and because `force`
+  // is allowed to relax that code, the batch then reached the page and came back as a bare throw
+  // instead of the structured refusal the two-phase plan promises.
+  const plain = planWrites({ defs, nodes, changes: [{ nodeId: 78, widget: 'mode', value: { a: 1 } }] });
+  assert.equal(plain.status, 'needs_input');
+  assert.equal(plain.blocked[0].code, 'wrong-type', 'the code names the real problem');
+  assert.equal(plain.blocked[0].expected, 'string');
+  assert.equal(plain.blocked[0].got, 'object');
+  assert.match(plain.blocked[0].nextSteps, /按 string 传裸值|原文/);
+
+  const forced = planWrites({ defs, nodes, force: true, changes: [{ nodeId: 78, widget: 'mode', value: [1, 2] }] });
+  assert.equal(forced.status, 'needs_input', 'force relaxes the option list, never the JSON type');
+  assert.equal(forced.blocked[0].code, 'wrong-type', 'an array stays a type error even under force');
+  assert.equal(forced.forceUsed, undefined, 'nothing here was merely out-of-domain');
+});
+
+test('a refused batch still reports which items only force would have allowed', () => {
+  // R8-F: the needs_input path returned before any force count existed, so a batch that mixed a
+  // malformed change with one that `force` would have carried answered with no forceUsed at all.
+  const plan = planWrites({ defs, nodes, force: true, changes: [
+    { nodeId: 78, widget: 'mode', value: '12345P' },
+    { nodeId: 78, widget: 'steps', value: 'abc' }
+  ] });
+  assert.equal(plan.status, 'needs_input');
+  assert.equal(plan.blocked.length, 1);
+  assert.equal(plan.blocked[0].code, 'wrong-type');
+  assert.equal(plan.forceUsed, true, 'the force-relaxed candidate is named even though nothing was written');
+  assert.equal(plan.forcedCount, 1);
+  assert.match(plan.summary, /另有 1 项只有传 force:true 才允许写入/);
+  assert.match(plan.note, /画布没有被修改/);
+
+  // Without force the same batch has no candidates at all: the enum value is simply blocked, so
+  // nothing may advertise force as a way to get it through.
+  const strict = planWrites({ defs, nodes, changes: [
+    { nodeId: 78, widget: 'mode', value: '12345P' },
+    { nodeId: 78, widget: 'steps', value: 'abc' }
+  ] });
+  assert.equal(strict.status, 'needs_input');
+  assert.equal(strict.forceUsed, undefined);
+  assert.equal(strict.forcedCount, undefined);
+  assert.doesNotMatch(strict.summary, /force:true 才允许写入/);
+});
+
 test('an unreadable canvas plans nothing and refuses nothing', () => {
   // An empty node list means "could not see", not "you are wrong": the page stays the judge.
   const plan = planWrites({ defs, nodes: [], changes: [{ nodeId: 1, widget: 'seed', value: 3 }] });
@@ -333,6 +378,18 @@ test('force relaxes the domain judgments at the tool surface too', async t => {
   const strict = await callComfyTool(rt, 'update_nodes', { changes: [{ nodeId: 78, widget: 'steps', value: 500 }] }, { dshSessionId: 'A' });
   assert.equal(strict.structuredContent.status, 'needs_input', 'without force the batch is still refused before the canvas');
   assert.equal(strict.structuredContent.blocked[0].code, 'out-of-range');
+
+  // R8-F: the refusal answer must still name the force-relaxed candidates, or a caller cannot tell
+  // that part of what it asked for was an out-of-domain value that force would have carried.
+  const mixed = await callComfyTool(rt, 'update_nodes', { force: true, changes: [
+    { nodeId: 78, widget: 'steps', value: 500 },
+    { nodeId: 78, widget: 'mode', value: { bad: 1 } }
+  ] }, { dshSessionId: 'A' });
+  assert.equal(mixed.structuredContent.status, 'needs_input');
+  assert.equal(mixed.structuredContent.written, false);
+  assert.equal(mixed.structuredContent.blocked[0].code, 'wrong-type', 'the malformed change is named as a type error');
+  assert.equal(mixed.structuredContent.forceUsed, true, 'and the force-only candidate survives the early return');
+  assert.equal(mixed.structuredContent.forcedCount, 1);
 
   const forced = await callComfyTool(rt, 'update_nodes', { changes: [{ nodeId: 78, widget: 'steps', value: 500 }], force: true }, { dshSessionId: 'A' });
   assert.equal(forced.structuredContent.status, 'written', 'with force the write goes through');
