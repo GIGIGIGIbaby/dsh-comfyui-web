@@ -128,7 +128,11 @@ test('MCP endpoint authenticates, lists real tools, accepts calls, interoperates
   const noAuth = await fetch(runtime.frameOrigin + '/mcp', { method: 'POST', body: '{}' }); assert.equal(noAuth.status, 401);
   const foreign = await fetch(runtime.frameOrigin + '/mcp', { method: 'POST', headers: { Origin: 'https://example.com', Authorization: 'Bearer ' + runtime.token }, body: '{}' }); assert.equal(foreign.status, 403);
   const client = await connectMcp(runtime.frameOrigin + '/mcp', runtime.token);
-  assert.equal(client.initialized, true); assert.equal(client.tools.length, 27);
+  assert.equal(client.initialized, true);
+  // 31 = 29 pre-doctor tools + the doctor verdict entry + usage notes. Pinning the exact count keeps a
+  // silently dropped registration from passing as "still lists tools".
+  assert.equal(client.tools.length, 31);
+  assert.ok(client.tools.some(tool => tool.name === 'doctor'), 'doctor 必须注册成 MCP 工具');
   const failure = await client.rpc('tools/call', { name: 'get_workflow', arguments: {} }); assert.equal(failure.isError, true);
   const require = createRequire(import.meta.resolve('@deepseek-ai/dsh-mcp-client'));
   const { Client, StreamableHTTPClientTransport } = await import(pathToFileURL(require.resolve('@modelcontextprotocol/client')));
@@ -211,6 +215,15 @@ test('native reference tools fence attachment IDs to their session and protect t
   await apply(ctx);
   const reference = { attachmentId: 'own-image', mediaType: 'image/png', width: 1, height: 1, bytes: 7 };
   const exec = { agent: { session: { id: 'own', deriveMessages: () => [{ role: 'user', content: [{ type: 'image', attachment: reference }] }] } } };
+  // Claiming the write lease now requires a conversation with a connected panel. This test is
+  // about attachment fencing and the event stream, so hand every session a page rather than
+  // pretending the upload path should work without one.
+  const originalAcquire = ComfyRuntime.prototype.acquireLease;
+  ComfyRuntime.prototype.acquireLease = function (sessionId, force) {
+    this.clients.set('panel-' + sessionId, { id: 'panel-' + sessionId, sessionId, ready: true, allowAI: true, visible: true, seen: Date.now(), queue: [] });
+    return originalAcquire.call(this, sessionId, force);
+  };
+  t.after(() => { ComfyRuntime.prototype.acquireLease = originalAcquire; });
   const listing = await tools.find(tool => tool.name === 'mcp__comfyui__list_reference_images').execute({}, exec);
   assert.equal(listing.structuredContent.images[0].attachmentId, 'own-image');
   const upload = tools.find(tool => tool.name === 'mcp__comfyui__upload_image');

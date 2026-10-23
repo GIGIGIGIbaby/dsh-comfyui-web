@@ -41,8 +41,11 @@ async function bootBridge({ stream, counter = true, isModified = false, nodes = 
     location: { origin: 'http://comfy.test', search: external ? '' : '?dsh_client=' + clientId + '&dsh_session=own', href: 'http://comfy.test/' },
     document,
     localStorage: { getItem: () => null, setItem() {} },
-    setTimeout: (fn, ms) => { timers.push({ fn, ms: Number(ms) }); return timers.length - 1; },
-    clearTimeout() {},
+    // Handles, not indices: the bridge clears its per-command watchdog on the normal path, and a
+    // `clearTimeout` that ignored the handle would leave 25-second timers in the queue for the next
+    // `tick()` to pop instead of the poll tick that actually picks up the command.
+    setTimeout: (fn, ms) => { const entry = { fn, ms: Number(ms) }; timers.push(entry); return entry; },
+    clearTimeout: handle => { const index = timers.indexOf(handle); if (index >= 0) timers.splice(index, 1); },
     Date: class extends Date { static now() { return now; } },
     EventSource: stream ? Object.assign(class {
       constructor(url) { this.url = url; this.readyState = 1; sources.push(this); queueMicrotask(() => this.onopen?.()); }

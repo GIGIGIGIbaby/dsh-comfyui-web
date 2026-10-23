@@ -162,7 +162,10 @@ test('list_nodes drops parameter values above the budget and restores them on de
 });
 
 test('tool surface keeps its size and gains only optional projection modes', () => {
-  assert.equal(MCP_TOOLS.length, 27, 'no tools added or removed');
+  // 31 = the 27 tools the projection change measured, plus the write-lease control, audit,
+  // environment doctor and usage notes. Pinning the exact number keeps a silently dropped
+  // registration from passing as "still lists tools".
+  assert.equal(MCP_TOOLS.length, 31, 'no tools added or removed');
   for (const name of ['get_workflow', 'queue', 'history']) {
     const tool = MCP_TOOLS.find(item => item.name === name);
     assert.deepEqual(tool.inputSchema.properties.mode.enum, name === 'get_workflow' ? ['auto', 'full', 'summary'] : ['auto', 'full']);
@@ -173,4 +176,19 @@ test('tool surface keeps its size and gains only optional projection modes', () 
   assert.deepEqual(listed.inputSchema.properties.detail.enum, ['auto', 'values', 'skeleton']);
   assert.equal((listed.inputSchema.required || []).includes('detail'), false);
   assert.ok(listed.annotations.readOnlyHint);
+});
+
+test('a plugin-side fallback says which budget fired, not that the page is old', async () => {
+  // R7-3: the note used to read 「本页桥接代码较旧…刷新 ComfyUI 页面可在源头省掉这次传输」 on every
+  // fallback, so following it meant refreshing a page that was never the problem. The trigger is the
+  // size budget, and the projection already carries that number.
+  const fat = { workflow: { nodes: Array.from({ length: 400 }, (_, i) => ({ id: i, type: 'Note', widgets_values: ['x'.repeat(60)] })), links: [] }, prompt: {} };
+  const result = await callComfyTool({ mcpEnabled: true, command: async () => fat }, 'get_workflow', {}, { dshSessionId: 'own' });
+  const text = JSON.stringify(result.structuredContent ?? result);
+  assert.match(text, /projection/, 'the reply is projected');
+  assert.doesNotMatch(text, /本页桥接代码较旧/, 'and it no longer blames the page build');
+  assert.match(text, /原因：返回体/, 'the measured reason travels with the note');
+  const note = result.structuredContent?.fallbackNote || '';
+  assert.match(note, /mode="full"/, 'plus the one argument that gets the full payload back');
+  assert.match(note, /不是页面故障/);
 });

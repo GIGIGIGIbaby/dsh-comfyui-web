@@ -69,10 +69,13 @@ function loadBridgeForUuidTest({ cryptoValue, randomImpl }) {
 
   context.Math.random = randomImpl;
 
-  const patchedSource = bridgeSource.replace(
-    '})();',
-    'window.__test_randomUUID = randomUUID; window.__test_randomUUID_state = { warnedWeakUUID };})();'
-  );
+  // Inject before the *last* `})();` — the outer IIFE's own closer. The file contains smaller
+  // `(() => …)()` expressions too, and replacing the first match dropped the export in the middle of
+  // a switch statement, which only showed up as "window.__test_randomUUID is not a function".
+  const cut = bridgeSource.lastIndexOf('})();');
+  const patchedSource = bridgeSource.slice(0, cut)
+    + 'window.__test_randomUUID = randomUUID; window.__test_randomUUID_state = { warnedWeakUUID };'
+    + bridgeSource.slice(cut);
 
   vm.runInNewContext(patchedSource, context, { filename: 'bridge.js' });
   window.__test_warnings = warnings;
