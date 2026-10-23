@@ -74,6 +74,18 @@ test('extension installation failure does not prevent host settings and MCP tool
   await routes.find(route => route.path === '/dsh-comfyui/api').handler({ method: 'GET', headers: {} }, response);
   assert.equal(settings.extensionInstallation.status, 'failed');
   assert.ok(settings.mcp.endpoint);
+  // A developer may have a real ComfyUI listening on the default port.
+  assert.equal(typeof settings.launcher.connected, 'boolean');
+  const route = routes.find(route => route.path === '/dsh-comfyui/api');
+  for (const headers of [
+    { host: '127.0.0.1:33080', origin: 'http://127.0.0.1:33080' },
+    { host: '127.0.0.1:33080', origin: 'https://foreign.test', 'x-dsh-comfy-token': settings.token },
+  ]) {
+    let denied;
+    await route.handler({ method: 'POST', headers, async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ op: 'launcherStart' })); } },
+      { writeHead(code) { denied = code; }, end() {} });
+    assert.equal(denied, 403, 'launching requires both same-origin and the bridge token');
+  }
 });
 
 function loaderPage(source, search = '') {

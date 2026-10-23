@@ -19,7 +19,7 @@ function text(tree) {
   return (tree.props?.children || []).map(text).join(' ');
 }
 
-async function panel(installation, language = 'zh') {
+async function panel(installation, language = 'zh', launcher) {
   let plugin, index = 0, nextTimer = 0, rendered;
   const hooks = [], effects = [], registrations = [], timers = new Map(), listeners = new Map();
   const frameWindow = { postMessage() {} };
@@ -33,7 +33,7 @@ async function panel(installation, language = 'zh') {
       .replace(/\{(\w+)\}/g, (match, name) => String(params[name] ?? match)); }
   };
   const settings = { url: 'http://127.0.0.1:8188', frameOrigin: 'http://127.0.0.1:19000', token: 'fixture',
-    mcp: { enabled: true, endpoint: 'http://127.0.0.1:19000/mcp', clientConfig: {} }, extensionInstallation: installation };
+    mcp: { enabled: true, endpoint: 'http://127.0.0.1:19000/mcp', clientConfig: {} }, extensionInstallation: installation, launcher };
   const React = {
     createElement(type, props, ...children) { return { type, props: { ...props, children } }; },
     useState(initial) {
@@ -111,6 +111,26 @@ test('missing extension has a useful timeout notice, clears after a valid manual
   page.render(); page.render();
   assert.match(text(page.tree), /等待 ComfyUI/);
   page.expire(); assert.match(text(page.tree), /AI 桥接扩展未连接/);
+});
+
+test('offline ComfyUI shows launch controls instead of a broken iframe or misleading bridge warning', async t => {
+  const page = await panel({ status: 'installed' }, 'zh', { connected: false, supported: true, targets: [] });
+  t.after(() => page.close());
+  assert.ok(find(page.tree, node => node.type?.name === 'LauncherControls'));
+  assert.equal(find(page.tree, node => node.type === 'iframe'), undefined);
+  page.expire();
+  assert.doesNotMatch(text(page.tree), /AI 桥接扩展未连接/);
+  assert.equal(find(page.tree, node => node.props?.role === 'alert'), undefined);
+});
+
+test('an online ComfyUI loads normally with launch settings available on demand', async t => {
+  const page = await panel({ status: 'installed' }, 'en', { connected: true, supported: true, targets: [] });
+  t.after(() => page.close());
+  assert.ok(find(page.tree, node => node.type === 'iframe'));
+  assert.equal(find(page.tree, node => node.type?.name === 'LauncherControls'), undefined);
+  find(page.tree, node => node.type === 'button' && text(node) === 'Launch settings').props.onClick();
+  page.render();
+  assert.ok(find(page.tree, node => node.type?.name === 'LauncherControls'));
 });
 
 test('failed writes appear in MCP settings and disabling MCP removes the missing-bridge alarm', async t => {

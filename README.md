@@ -10,7 +10,7 @@
 
 | 插件版本 | 支持的 dsh 版本 |
 | --- | --- |
-| `0.5.13` | `0.2.0-rc.2`、`0.2.1-rc.2` |
+| `0.5.13`、`0.5.14` | `0.2.0-rc.2`、`0.2.1-rc.2` |
 | `0.5.12` | `0.2.0-rc.2` |
 
 插件通过 `engines.dsh` 和 DSH peer dependencies 同时声明已验证的宿主版本，兼容新旧宿主的检查方式。其他 DSH 版本需要另行验证；升级后若提示版本不兼容，请先更新插件。
@@ -18,6 +18,27 @@
 ```sh
 dsh plugin --profile web add github:mangfufu/dsh-comfyui-web
 ```
+
+### 从 DSH 启动本机 ComfyUI（Windows）
+
+只打开 DSH 时，ComfyUI 面板会显示本机启动入口。点击 **自动检测**，或用 **选择文件夹 / 选择启动文件** 打开资源管理器，选择 AKi 整合包目录、启动器 exe 或 ComfyUI 的 `main.py`；也可以手动填写绝对路径。
+
+- **直接启动 ComfyUI**：使用安装目录里的 Python（支持 AKi、Windows 便携包和本地 `.venv` / `venv`），按面板配置的本机地址和端口启动。服务就绪后面板自动连接。
+- **打开 AKi 启动器**：打开原启动器，保留其配置习惯；在 AKi 中点击启动后，DSH 会自动连接。需要 AKi 的自定义启动参数时使用此方式。
+
+检测只检查已配置路径和常见安装位置，不会启动程序；点击启动后会保存所选入口，并在需要时为该安装目录配置桥接扩展。已运行或正在启动时不会重复启动。启动日志位于 `~/.dsh/comfyui/launch.log`。直接启动不会读取 AKi 的自定义启动参数。远程 / Docker 地址仍需在对应环境中启动服务。
+
+如果 `dsh web` 提示 `webserver` 的 `$.host missing required value`，检查 `~/.dsh/profiles/web/cordis.patch.yml` 中覆盖的 `webserver.config` 是否同时包含 `host` 和 `port`，例如：
+
+```yaml
+- id: webserver
+  name: '@deepseek-ai/dsh-host-webserver'
+  config:
+    host: 127.0.0.1
+    port: 33080
+```
+
+只写 `port` 的覆盖配置会丢失必填的 `host`；临时在命令行传 `--host` 能掩盖问题，但不会补全配置文件。
 
 <a id="comfyui-extension-install"></a>
 

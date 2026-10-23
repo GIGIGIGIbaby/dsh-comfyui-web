@@ -10,7 +10,7 @@ Requires [dsh](https://github.com/deepseek-ai/deepseek-harness), pnpm, a local C
 
 | Plugin version | Supported dsh versions |
 | --- | --- |
-| `0.5.13` | `0.2.0-rc.2`, `0.2.1-rc.2` |
+| `0.5.13`, `0.5.14` | `0.2.0-rc.2`, `0.2.1-rc.2` |
 | `0.5.12` | `0.2.0-rc.2` |
 
 Both `engines.dsh` and the DSH peer dependencies declare the verified host versions, supporting compatibility checks in both host releases. Other DSH versions need separate validation. If a host upgrade reports an incompatibility, update the plugin first.
@@ -18,6 +18,27 @@ Both `engines.dsh` and the DSH peer dependencies declare the verified host versi
 ```sh
 dsh plugin --profile web add github:mangfufu/dsh-comfyui-web
 ```
+
+### Launch local ComfyUI from DSH (Windows)
+
+When only DSH is running, the ComfyUI panel shows local launch controls. Use **Auto-detect**, **Choose folder / Choose launch file** to open Explorer, or enter an absolute path. Select an AKi bundle directory, launcher exe, or ComfyUI `main.py`.
+
+- **Start ComfyUI directly** uses the installation's own Python (AKi, Windows portable bundles, or a local `.venv` / `venv`), with the panel's loopback address and port. The panel connects when the server is ready.
+- **Open AKi launcher** opens the original launcher. Click Start there to retain AKi's custom launch settings; DSH connects when ComfyUI is ready.
+
+Detection only checks configured paths and common installation locations; it never starts a program. Starting saves the selected target and configures its bridge extension when needed. An already running or starting service is not started again. Logs go to `~/.dsh/comfyui/launch.log`. Direct launch does not read AKi's custom launch arguments. Remote and Docker services must be started in their own environment.
+
+If `dsh web` reports `$.host missing required value` for `webserver`, include both `host` and `port` in the `webserver.config` override in `~/.dsh/profiles/web/cordis.patch.yml`:
+
+```yaml
+- id: webserver
+  name: '@deepseek-ai/dsh-host-webserver'
+  config:
+    host: 127.0.0.1
+    port: 33080
+```
+
+A port-only config override loses the required host. Passing `--host` on the command line temporarily masks this; it does not repair the configuration file.
 
 <a id="comfyui-extension-install"></a>
 
